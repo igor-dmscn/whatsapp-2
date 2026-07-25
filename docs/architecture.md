@@ -108,6 +108,6 @@ This is **CQRS without event sourcing**. Entries are real rows and the log is qu
 | `messaging.entries` | conversation id | entry appended, entry revised |
 | `messaging.receipts` | conversation id | delivered, read |
 | `media.attachments` | attachment id | upload accepted, variants ready, processing failed |
-| `identity.accounts` | account id | account created, device revoked |
+| `identity.accounts` | account id | account registered, credential added, device registered, device revoked, session started, session rotated (from phase 3 — until then these events are recorded by aggregates and written to the log) |
 
 Keying entry and receipt topics by conversation gives per-conversation ordering, which is the only ordering that means anything — sequence numbers are meaningless across conversations.

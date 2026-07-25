@@ -18,4 +18,12 @@ _Avoid_: password, auth method, login
 
 **Device**:
 One client installation connected on behalf of an account. Devices acknowledge delivery, but they hold no read state — that belongs to a membership.
-_Avoid_: session, client, connection, installation
+_Avoid_: client, connection, installation
+
+**Session**:
+A device's current authenticated state, holding the access and refresh tokens valid for it. Rotating a session replaces both at once, so the previous pair stops working the instant a new one is issued.
+_Avoid_: token pair, login, auth state
+
+**Passphrase**:
+A secret long enough to be accepted as the basis of a password credential. Length is the only rule; composition requirements produce weaker secrets than length alone.
+_Avoid_: password, secret, PIN

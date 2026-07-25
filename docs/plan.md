@@ -29,7 +29,7 @@ Requirement IDs (`MS-3`, `NF-7`, …) refer to [requirements.md](./requirements.
 
 ---
 
-## Phase 1 — Identity
+## Phase 1 — Identity — **complete**
 
 **Goal:** accounts exist, prove themselves, and connect devices.
 
@@ -38,6 +38,7 @@ Requirement IDs (`MS-3`, `NF-7`, …) refer to [requirements.md](./requirements.
 - Registration, login, token issue and refresh, device registration and revocation.
 - Argon2id password credentials, stored so that adding a passkey kind later is an insert (ID-2).
 - Exact-handle lookup, rate limited (ID-5).
+- Aggregates record domain events; an interim publisher writes them to the log. Phase 3 swaps that implementation for the transactional outbox without changing the port.
 
 **Verify:** integration tests for register → login → refresh → revoke. Revocation invalidates tokens within 30 seconds (ID-4). A second account cannot claim a taken handle. Credential storage is exercised by a test that adds a second credential kind to an existing account without touching the first.
 
@@ -70,6 +71,7 @@ Scope is deliberately narrowed to **direct conversations only**. Groups and chan
 
 **Deliverables**
 - Outbox table written in the send transaction; a relay that publishes and marks sent.
+- Identity's interim logging event publisher replaced by the outbox publisher, so `identity.device_revoked` reaches Messaging over Kafka.
 - `messaging.entries` and `messaging.receipts` topics, keyed by conversation.
 - Projections: cursor, unread count, delivery state. Idempotent consumers (NF-8).
 - Cursor advance, forward-only (MS-11, MS-12). Three-state delivery (MS-13).
