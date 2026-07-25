@@ -14,12 +14,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	identityapp "comms/internal/identity/application"
 	identityinfra "comms/internal/identity/infrastructure"
 	identityhttp "comms/internal/identity/transport"
+	messagingapp "comms/internal/messaging/application"
+	messaginginfra "comms/internal/messaging/infrastructure"
+	messaginghttp "comms/internal/messaging/transport"
 	"comms/internal/platform/config"
 	"comms/internal/platform/database"
 	"comms/internal/platform/httpx"
@@ -29,6 +33,18 @@ import (
 // shutdownGrace is how long in-flight requests get to finish. Long enough for a
 // normal request, short enough that a deploy is not held up by a stuck one.
 const shutdownGrace = 15 * time.Second
+
+// allowedOrigins is which origins may open a WebSocket.
+//
+// Same-origin by default. A permissive policy here would let any page a user visits
+// open an authenticated socket on their behalf, so the development origin is opt-in
+// through configuration rather than a built-in exception.
+func allowedOrigins() []string {
+	if configured := config.EnvOr("ALLOWED_ORIGINS", ""); configured != "" {
+		return strings.Split(configured, ",")
+	}
+	return nil
+}
 
 func main() {
 	logger := logging.New("api")
@@ -80,11 +96,46 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		time.Now,
 	)
 
+	redisClient, err := messaginginfra.OpenRedis(ctx, config.EnvOr("REDIS_URL", "redis://localhost:6379"))
+	if err != nil {
+		return err
+	}
+	defer redisClient.Close()
+
+	messagingService := messagingapp.NewService(
+		messaginginfra.NewConversationRepository(db),
+		messaginginfra.NewMembershipRepository(db),
+		messaginginfra.NewEntryRepository(db),
+		messaginginfra.NewRedisBroadcaster(redisClient),
+		messaginginfra.NewLoggingPublisher(logger),
+		messaginginfra.IDs{},
+		time.Now,
+		logger,
+	)
+
+	// One goroutine reads from Redis for the whole node, however many sockets it
+	// holds.
+	hub := messaginghttp.NewHub(redisClient, logger)
+	go hub.Run(ctx)
+
+	identityHandler := identityhttp.NewHandler(identityService, logger)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		httpx.WriteJSON(w, logger, http.StatusOK, map[string]string{"status": "ok"})
+		httpx.WriteJSON(w, logger, http.StatusOK, map[string]any{
+			"status":      "ok",
+			"connections": hub.ConnectionCount(),
+		})
 	})
-	identityhttp.NewHandler(identityService, logger).Routes(mux)
+	identityHandler.Routes(mux)
+	messaginghttp.NewHandler(
+		messagingService,
+		hub,
+		identityAuthenticator{authenticate: identityService.Authenticate},
+		callerFromRequest,
+		allowedOrigins(),
+		logger,
+	).Routes(mux, identityHandler.Authenticated)
 
 	server := &http.Server{
 		Addr:              config.EnvOr("API_ADDR", ":8080"),
