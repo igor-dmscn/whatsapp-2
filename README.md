@@ -2,7 +2,7 @@
 
 Real-time messaging, media sharing, and live audio/video calling. A Go backend with React and CLI clients, built as a reference implementation — the codebase is meant to be read, so the reasoning is committed alongside the code.
 
-**Status: phase 0 complete — scaffold builds, lints and runs.** Phase 1 is Identity. See [the plan](./docs/plan.md).
+**Status: phases 0–2 complete** — accounts, conversations, the entry log, WebSocket sync and cross-node delivery. Phase 2's React increment is next. See [the plan](./docs/plan.md).
 
 ## Running it
 
@@ -51,7 +51,7 @@ Three binaries, split by resource profile rather than by bounded context ([ADR-0
 | `worker` | Read-model projections and media processing |
 | `sfu` | Call media forwarding |
 
-Contexts are packages inside `api`, with boundaries enforced by an architecture test — a violation is a build failure, not a code-review note. Package names carry their context (`identitypg`, `messagingapi`) so no import needs an alias ([ADR-0011](./docs/adr/0011-context-prefixed-package-names.md)).
+Contexts are packages inside `api`. Each exposes exactly one package and hides its layers behind a nested `internal/`, so **the compiler refuses cross-context access to a model** — not a linter, not a review convention ([ADR-0011](./docs/adr/0011-context-prefixed-package-names.md)). `cmd/api` imports two packages and wires them; each context composes itself.
 
 ## Decisions worth knowing up front
 

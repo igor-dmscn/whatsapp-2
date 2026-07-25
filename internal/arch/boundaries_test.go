@@ -27,29 +27,31 @@ const (
 // platform is shared plumbing; arch is this test.
 var notContexts = map[string]bool{"platform": true, "arch": true}
 
-// Package naming is deliberate and is what keeps this test from needing a
-// third rule. Layer names would be identical across contexts — four packages
-// called domain, four called transport — so anything importing two contexts would
-// have to alias them, and generic names collide by design. Prefixing with the
-// context (identityapp, messagingpg) makes every package name unique across the
-// repository, so no import anywhere needs an alias. See ADR-0011.
+// modelDirectory is where a context keeps its model, relative to the context root.
+//
+// Each context hides its layers behind its own internal/ fence, so the Go compiler
+// refuses any import of internal/<context>/internal/... from outside that context —
+// including from cmd/. That is why the layer packages can carry short, conventional
+// names: two contexts may both have a package called domain and never collide,
+// because no single file is permitted to import both. See ADR-0011.
+//
+// What the compiler cannot enforce is the remaining case below: one context
+// importing another's *public* facade. That is what TestContextsDoNotImportEachOther
+// is still here for.
+const modelDirectory = "internal/domain/"
 
 // TestDomainDependsOnNothing asserts that every context's model imports only the
 // standard library.
 //
-// The model lives in files directly inside the context directory —
-// internal/messaging/*.go is package messaging — while adapters live in
-// subdirectories. Depth is therefore the rule: a file at the context root is the
-// model, and a file below it is an adapter.
-//
-// This is the property the whole layering exists to protect. A model that imports
-// a driver, a framework or a transport has stopped describing the business and
-// started describing the plumbing.
+// This is the property the whole layering exists to protect. A model that imports a
+// driver, a framework or a transport has stopped describing the business and started
+// describing the plumbing — and it is the one rule the compiler cannot express,
+// because "imports nothing outside the standard library" is not something Go can be
+// told.
 func TestDomainDependsOnNothing(t *testing.T) {
 	eachGoFile(t, filepath.Join(repoRoot, "internal"), func(path string, imports []string) {
 		context, rest, ok := splitContext(path)
-		if !ok || strings.Contains(rest, "/") {
-			// Below the context root, so an adapter rather than the model.
+		if !ok || !strings.HasPrefix(rest, modelDirectory) {
 			return
 		}
 		for _, imported := range imports {
@@ -64,13 +66,17 @@ func TestDomainDependsOnNothing(t *testing.T) {
 	})
 }
 
-// TestContextsDoNotImportEachOther asserts that no bounded context imports
-// another, at any depth.
+// TestContextsDoNotImportEachOther asserts that no bounded context imports another,
+// including its public facade.
 //
-// Cross-context collaboration goes one of two ways: an event over Kafka, or a
-// port the consuming context defines and the wiring in cmd/ satisfies. Neither
-// requires an import, so any import here is a boundary being crossed silently.
-// Cross-context references are IDs, never types.
+// The compiler already refuses the dangerous half of this — reaching into
+// internal/<other>/internal/... fails to build, from anywhere. What remains is a
+// context importing another's facade, which compiles fine and is still wrong:
+// cross-context collaboration goes through an event, or through a port the consumer
+// declares and cmd/ satisfies. Cross-context references are identifiers, never types.
+//
+// To see the compiler half working, add an import of another context's internal
+// package to any file here and build.
 func TestContextsDoNotImportEachOther(t *testing.T) {
 	eachGoFile(t, filepath.Join(repoRoot, "internal"), func(path string, imports []string) {
 		context, _, ok := splitContext(path)

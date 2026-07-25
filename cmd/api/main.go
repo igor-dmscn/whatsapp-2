@@ -18,14 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	"comms/internal/identity/identityapi"
-	"comms/internal/identity/identityapp"
-	"comms/internal/identity/identitycrypto"
-	"comms/internal/identity/identitypg"
-	"comms/internal/messaging/messagingapi"
-	"comms/internal/messaging/messagingapp"
-	"comms/internal/messaging/messagingpg"
-	"comms/internal/messaging/messagingredis"
+	"comms/internal/identity"
+	"comms/internal/messaging"
 	"comms/internal/platform/config"
 	"comms/internal/platform/database"
 	"comms/internal/platform/httpx"
@@ -88,56 +82,33 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	db.SetMaxIdleConns(config.EnvIntOr("DATABASE_IDLE_CONNS", 5))
 	db.SetConnMaxLifetime(time.Hour)
 
-	identityService := identityapp.NewService(
-		identitypg.NewAccountRepository(db),
-		identitypg.NewDeviceRepository(db),
-		identitypg.NewSessionRepository(db),
-		identitycrypto.NewArgon2Hasher(identitycrypto.DefaultArgon2Params()),
-		identityapp.NewLoggingPublisher(logger),
-		identityapp.IDs{},
-		time.Now,
-	)
-
-	redisClient, err := messagingredis.OpenRedis(ctx, config.EnvOr("REDIS_URL", "redis://localhost:6379"))
+	redisClient, err := messaging.OpenRedis(ctx, config.EnvOr("REDIS_URL", "redis://localhost:6379"))
 	if err != nil {
 		return err
 	}
 	defer redisClient.Close()
 
-	messagingService := messagingapp.NewService(
-		messagingpg.NewConversationRepository(db),
-		messagingpg.NewMembershipRepository(db),
-		messagingpg.NewEntryRepository(db),
-		messagingredis.NewRedisBroadcaster(redisClient),
-		messagingapp.NewLoggingPublisher(logger),
-		messagingapp.IDs{},
-		time.Now,
-		logger,
-	)
+	// Each context wires itself. cmd/api cannot see the packages being composed —
+	// they are behind a nested internal/ fence — so composition necessarily happens
+	// inside each context, and this file is left doing only what it should: choosing
+	// which contexts exist and how they are joined.
+	identityModule := identity.New(db, logger)
 
-	// One goroutine reads from Redis for the whole node, however many sockets it
-	// holds.
-	hub := messagingapi.NewHub(redisClient, logger)
-	go hub.Run(ctx)
+	messagingModule := messaging.New(db, redisClient, identityModule, identityModule.Caller,
+		messaging.Options{AllowedOrigins: allowedOrigins()}, logger)
 
-	identityHandler := identityapi.NewHandler(identityService, logger)
+	// One goroutine per process reads broadcasts for every socket this node holds.
+	go messagingModule.Run(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, logger, http.StatusOK, map[string]any{
 			"status":      "ok",
-			"connections": hub.ConnectionCount(),
+			"connections": messagingModule.ConnectionCount(),
 		})
 	})
-	identityHandler.Routes(mux)
-	messagingapi.NewHandler(
-		messagingService,
-		hub,
-		identityAuthenticator{authenticate: identityService.Authenticate},
-		callerFromRequest,
-		allowedOrigins(),
-		logger,
-	).Routes(mux, identityHandler.Authenticated)
+	identityModule.Routes(mux)
+	messagingModule.Routes(mux, identityModule.Authenticated)
 
 	server := &http.Server{
 		Addr:              config.EnvOr("API_ADDR", ":8080"),

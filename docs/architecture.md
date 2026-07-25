@@ -81,24 +81,36 @@ Calling needs to know whether an account may join a call, which is a Messaging q
 
 ## Layering inside a context
 
-Standard ports-and-adapters, one direction of dependency. Packages are named for
-their context rather than their layer, so no import in the repository needs an
-alias ([ADR-0011](./adr/0011-context-prefixed-package-names.md)):
+Standard ports-and-adapters, one direction of dependency. Each context exposes one
+package and hides its layers behind a nested `internal/`, which the compiler makes
+unreachable from outside — so the layer packages keep short names and no import in
+the repository needs an alias ([ADR-0011](./adr/0011-context-prefixed-package-names.md)):
 
 ```
-internal/messaging/                  package messaging       ← depends on nothing
-                                     aggregates, ports, domain services
-internal/messaging/messagingapp/     package messagingapp
-                                     use cases, clock, identifiers, event publishing
-internal/messaging/messagingpg/      package messagingpg      implements ports
-internal/messaging/messagingredis/   package messagingredis   implements ports
-internal/messaging/messagingapi/     package messagingapi     HTTP, WebSocket, hub
+internal/messaging/
+    messaging.go            package messaging   ← the only public surface
+    internal/
+        api/                package api         HTTP, WebSocket, hub
+            ↓
+        app/                package app         use cases, clock, identifiers, events
+            ↓
+        domain/             package domain      aggregates, ports  ← depends on nothing
+            ↑
+        postgres/  broadcast/                   implement domain ports
 ```
 
-The model — the files directly inside the context directory — imports no framework,
-no driver, and no other context. That is the property the whole structure exists to
-protect, and the one worth failing a build over. Depth is the rule the architecture
-test applies: a file at the context root is the model, a file below it is an adapter.
+The model imports no framework, no driver, and no other context. Two rules protect
+this, and only one of them is a test:
+
+- **The compiler** refuses any import of `internal/<context>/internal/...` from
+  outside that context, including from `cmd/`. Nothing outside Messaging can name a
+  Messaging aggregate, repository or table.
+- **The architecture test** covers what the compiler cannot say: the model imports
+  only the standard library, and no context imports another's public facade.
+
+Because `cmd/api` cannot name the packages a context is built from, each context
+owns its own composition root — `identity.New(db, logger)`. That leaves `cmd/api`
+doing only what it should: choosing which contexts exist and how they are joined.
 
 ## CQRS, precisely scoped
 

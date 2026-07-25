@@ -56,10 +56,10 @@ It owns the clock, identifier generation, transaction boundaries, and publishing
 
 ## Packages are named for their context
 
-See [ADR-0011](./0011-context-prefixed-package-names.md). Briefly: the model lives in
-files at the context root, adapters live in context-prefixed subpackages, and no
-package is called `domain`, `application`, `infrastructure` or `transport` — those
-names collide across contexts and force an alias at every composition root.
+See [ADR-0011](./0011-context-prefixed-package-names.md). Briefly: a context exposes
+one package and hides its layers behind a nested `internal/`, so the compiler — not a
+convention — stops anything outside from depending on its model, and the layer
+packages can keep short names like `domain` and `app` without colliding.
 
 ## Invariants are enforced twice where concurrency can defeat them
 
