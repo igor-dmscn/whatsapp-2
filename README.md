@@ -51,7 +51,7 @@ Three binaries, split by resource profile rather than by bounded context ([ADR-0
 | `worker` | Read-model projections and media processing |
 | `sfu` | Call media forwarding |
 
-Contexts are packages inside `api`. Each exposes exactly one package and hides its layers behind a nested `internal/`, so **the compiler refuses cross-context access to a model** — not a linter, not a review convention ([ADR-0011](./docs/adr/0011-context-prefixed-package-names.md)). `cmd/api` imports two packages and wires them; each context composes itself.
+Contexts are packages inside `api`. Each exposes exactly one package and hides its layers behind a nested `internal/`, so **the compiler refuses cross-context access to a model** — not a linter, not a review convention ([ADR-0011](./docs/adr/0011-nested-internal-fences.md)). `cmd/api` imports two packages and wires them; each context composes itself.
 
 ## Decisions worth knowing up front
 

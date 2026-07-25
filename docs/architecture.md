@@ -84,7 +84,7 @@ Calling needs to know whether an account may join a call, which is a Messaging q
 Standard ports-and-adapters, one direction of dependency. Each context exposes one
 package and hides its layers behind a nested `internal/`, which the compiler makes
 unreachable from outside — so the layer packages keep short names and no import in
-the repository needs an alias ([ADR-0011](./adr/0011-context-prefixed-package-names.md)):
+the repository needs an alias ([ADR-0011](./adr/0011-nested-internal-fences.md)):
 
 ```
 internal/messaging/

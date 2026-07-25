@@ -56,7 +56,7 @@ It owns the clock, identifier generation, transaction boundaries, and publishing
 
 ## Packages are named for their context
 
-See [ADR-0011](./0011-context-prefixed-package-names.md). Briefly: a context exposes
+See [ADR-0011](./0011-nested-internal-fences.md). Briefly: a context exposes
 one package and hides its layers behind a nested `internal/`, so the compiler — not a
 convention — stops anything outside from depending on its model, and the layer
 packages can keep short names like `domain` and `app` without colliding.
