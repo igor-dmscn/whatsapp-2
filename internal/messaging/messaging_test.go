@@ -27,9 +27,10 @@ import (
 	"github.com/coder/websocket"
 	"github.com/redis/go-redis/v9"
 
-	"comms/internal/messaging/application"
-	"comms/internal/messaging/infrastructure"
-	"comms/internal/messaging/transport"
+	"comms/internal/messaging/messagingapi"
+	"comms/internal/messaging/messagingapp"
+	"comms/internal/messaging/messagingpg"
+	"comms/internal/messaging/messagingredis"
 	"comms/internal/platform/database/testdb"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/id"
@@ -40,8 +41,8 @@ import (
 type node struct {
 	t       *testing.T
 	server  *httptest.Server
-	service *application.Service
-	hub     *transport.Hub
+	service *messagingapp.Service
+	hub     *messagingapi.Hub
 	tokens  *fakeAuthenticator
 }
 
@@ -105,7 +106,7 @@ func openRedis(t *testing.T) *redis.Client {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	client, err := infrastructure.OpenRedis(ctx, url)
+	client, err := messagingredis.OpenRedis(ctx, url)
 	if err != nil {
 		t.Fatalf("open redis: %v", err)
 	}
@@ -122,18 +123,18 @@ func newNode(t *testing.T, tokens *fakeAuthenticator) *node {
 	redisClient := openRedis(t)
 	logger := slog.New(slog.DiscardHandler)
 
-	service := application.NewService(
-		infrastructure.NewConversationRepository(db),
-		infrastructure.NewMembershipRepository(db),
-		infrastructure.NewEntryRepository(db),
-		infrastructure.NewRedisBroadcaster(redisClient),
-		infrastructure.NewLoggingPublisher(logger),
-		infrastructure.IDs{},
+	service := messagingapp.NewService(
+		messagingpg.NewConversationRepository(db),
+		messagingpg.NewMembershipRepository(db),
+		messagingpg.NewEntryRepository(db),
+		messagingredis.NewRedisBroadcaster(redisClient),
+		messagingapp.NewLoggingPublisher(logger),
+		messagingapp.IDs{},
 		time.Now,
 		logger,
 	)
 
-	hub := transport.NewHub(redisClient, logger)
+	hub := messagingapi.NewHub(redisClient, logger)
 	hubCtx, stopHub := context.WithCancel(context.Background())
 	go hub.Run(hubCtx)
 	t.Cleanup(stopHub)
@@ -159,7 +160,7 @@ func newNode(t *testing.T, tokens *fakeAuthenticator) *node {
 	}
 
 	mux := http.NewServeMux()
-	transport.NewHandler(service, hub, tokens, resolveCaller, []string{"*"}, logger).Routes(mux, authenticated)
+	messagingapi.NewHandler(service, hub, tokens, resolveCaller, []string{"*"}, logger).Routes(mux, authenticated)
 
 	server := httptest.NewServer(httpx.Chain(mux, httpx.Correlate))
 	t.Cleanup(server.Close)

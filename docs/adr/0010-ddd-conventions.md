@@ -54,6 +54,13 @@ It owns the clock, identifier generation, transaction boundaries, and publishing
 
 **Value objects at the boundary, not raw strings.** `Hasher.Hash` takes a `Passphrase`, so an unvalidated secret cannot reach storage down a path that forgot to check. But `Hasher.Verify` takes a plain string, deliberately: raising the minimum length must not lock out accounts whose credential was acceptable when they created it.
 
+## Packages are named for their context
+
+See [ADR-0011](./0011-context-prefixed-package-names.md). Briefly: the model lives in
+files at the context root, adapters live in context-prefixed subpackages, and no
+package is called `domain`, `application`, `infrastructure` or `transport` — those
+names collide across contexts and force an alias at every composition root.
+
 ## Invariants are enforced twice where concurrency can defeat them
 
 The aggregate enforces the one-password rule and gives a useful error. A partial unique index enforces it against two concurrent requests, which the aggregate cannot see. Both are needed, and neither is redundant.

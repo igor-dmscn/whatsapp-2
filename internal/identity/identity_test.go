@@ -16,12 +16,14 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"comms/internal/identity"
 	"time"
 
-	"comms/internal/identity/application"
-	"comms/internal/identity/domain"
-	"comms/internal/identity/infrastructure"
-	"comms/internal/identity/transport"
+	"comms/internal/identity/identityapi"
+	"comms/internal/identity/identityapp"
+	"comms/internal/identity/identitycrypto"
+	"comms/internal/identity/identitypg"
 	"comms/internal/platform/database/testdb"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/id"
@@ -31,7 +33,7 @@ import (
 type harness struct {
 	t       *testing.T
 	server  *httptest.Server
-	service *application.Service
+	service *identityapp.Service
 	now     func() time.Time
 	events  *recordingPublisher
 }
@@ -49,22 +51,22 @@ func newHarness(t *testing.T) (*harness, *clock) {
 	// Argon2 at production cost would make these tests take minutes. Cost is
 	// what the hasher is for, so it is turned down here and exercised at its
 	// real settings by TestArgon2AtProductionCost.
-	cheap := infrastructure.Argon2Params{Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32}
+	cheap := identitycrypto.Argon2Params{Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32}
 
 	testClock := &clock{at: time.Now()}
 	events := &recordingPublisher{}
-	service := application.NewService(
-		infrastructure.NewAccountRepository(db),
-		infrastructure.NewDeviceRepository(db),
-		infrastructure.NewSessionRepository(db),
-		infrastructure.NewArgon2Hasher(cheap),
+	service := identityapp.NewService(
+		identitypg.NewAccountRepository(db),
+		identitypg.NewDeviceRepository(db),
+		identitypg.NewSessionRepository(db),
+		identitycrypto.NewArgon2Hasher(cheap),
 		events,
-		infrastructure.IDs{},
+		identityapp.IDs{},
 		testClock.now,
 	)
 
 	mux := http.NewServeMux()
-	transport.NewHandler(service, slog.New(slog.DiscardHandler)).Routes(mux)
+	identityapi.NewHandler(service, slog.New(slog.DiscardHandler)).Routes(mux)
 	server := httptest.NewServer(httpx.Chain(mux, httpx.Correlate))
 	t.Cleanup(server.Close)
 
@@ -76,10 +78,10 @@ func newHarness(t *testing.T) (*harness, *clock) {
 // that only a test like this catches.
 type recordingPublisher struct {
 	mutex     sync.Mutex
-	published []domain.Event
+	published []identity.Event
 }
 
-func (p *recordingPublisher) Publish(_ context.Context, events []domain.Event) error {
+func (p *recordingPublisher) Publish(_ context.Context, events []identity.Event) error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	p.published = append(p.published, events...)
@@ -312,8 +314,8 @@ func TestSecondCredentialKindDoesNotDisturbTheFirst(t *testing.T) {
 	// ID-2: adding a passkey must not require altering the existing password.
 	err := h.service.AddCredential(
 		t.Context(),
-		domain.AccountID(created.Account.ID),
-		domain.KindPasskey,
+		identity.AccountID(created.Account.ID),
+		identity.KindPasskey,
 		"public-key-material-placeholder",
 	)
 	if err != nil {
@@ -334,8 +336,8 @@ func TestOnlyOnePasswordPerAccount(t *testing.T) {
 
 	// Enforced by a partial unique index rather than by application code, so
 	// concurrent writes cannot slip a second password through.
-	err := h.service.AddCredential(t.Context(), domain.AccountID(created.Account.ID), domain.KindPassword, "another passphrase entirely")
-	if !errors.Is(err, domain.ErrPasswordAlreadySet) {
+	err := h.service.AddCredential(t.Context(), identity.AccountID(created.Account.ID), identity.KindPassword, "another passphrase entirely")
+	if !errors.Is(err, identity.ErrPasswordAlreadySet) {
 		t.Errorf("got %v, want ErrPasswordAlreadySet", err)
 	}
 }
@@ -402,7 +404,7 @@ func TestExpiredAccessTokenIsRejected(t *testing.T) {
 		t.Fatalf("fresh token: status %d", status)
 	}
 
-	testClock.at = testClock.at.Add(domain.AccessTokenLifetime + time.Second)
+	testClock.at = testClock.at.Add(identity.AccessTokenLifetime + time.Second)
 
 	if status := h.do(http.MethodGet, "/v1/me", created.AccessToken, nil, nil); status != http.StatusUnauthorized {
 		t.Errorf("expired token: status %d, want %d", status, http.StatusUnauthorized)
@@ -547,7 +549,7 @@ func TestPurgeKeepsSessionsThatCanStillBeRefreshed(t *testing.T) {
 	created := h.register(uniqueHandle())
 
 	// Past every access token's expiry but well inside every refresh token's.
-	testClock.at = testClock.at.Add(domain.AccessTokenLifetime + time.Minute)
+	testClock.at = testClock.at.Add(identity.AccessTokenLifetime + time.Minute)
 	if _, err := h.service.PurgeExpiredSessions(t.Context()); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
@@ -567,7 +569,7 @@ func TestPurgeRemovesSessionsPastRefreshExpiry(t *testing.T) {
 	h, testClock := newHarness(t)
 	created := h.register(uniqueHandle())
 
-	testClock.at = testClock.at.Add(domain.RefreshTokenLifetime + time.Minute)
+	testClock.at = testClock.at.Add(identity.RefreshTokenLifetime + time.Minute)
 	deleted, err := h.service.PurgeExpiredSessions(t.Context())
 	if err != nil {
 		t.Fatalf("purge: %v", err)
@@ -587,9 +589,9 @@ func TestPurgeRemovesSessionsPastRefreshExpiry(t *testing.T) {
 func TestArgon2AtProductionCost(t *testing.T) {
 	// The rest of the suite runs a cheap hasher, so the real parameters are
 	// verified once, here, rather than never.
-	hasher := infrastructure.NewArgon2Hasher(infrastructure.DefaultArgon2Params())
+	hasher := identitycrypto.NewArgon2Hasher(identitycrypto.DefaultArgon2Params())
 
-	passphrase, err := domain.ParsePassphrase("correct horse battery staple")
+	passphrase, err := identity.ParsePassphrase("correct horse battery staple")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -622,12 +624,12 @@ func TestArgon2AtProductionCost(t *testing.T) {
 func TestVerifyUsesParametersFromStoredMaterial(t *testing.T) {
 	// Cost parameters live in the stored material, so raising them later must
 	// not invalidate credentials written at the old cost.
-	weak := infrastructure.NewArgon2Hasher(infrastructure.Argon2Params{
+	weak := identitycrypto.NewArgon2Hasher(identitycrypto.Argon2Params{
 		Memory: 8 * 1024, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 	})
-	strong := infrastructure.NewArgon2Hasher(infrastructure.DefaultArgon2Params())
+	strong := identitycrypto.NewArgon2Hasher(identitycrypto.DefaultArgon2Params())
 
-	passphrase, err := domain.ParsePassphrase("correct horse battery staple")
+	passphrase, err := identity.ParsePassphrase("correct horse battery staple")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,11 +649,11 @@ func TestVerifyUsesParametersFromStoredMaterial(t *testing.T) {
 }
 
 func TestVerifyRejectsUnparseableMaterial(t *testing.T) {
-	hasher := infrastructure.NewArgon2Hasher(infrastructure.DefaultArgon2Params())
+	hasher := identitycrypto.NewArgon2Hasher(identitycrypto.DefaultArgon2Params())
 
 	// A wrong passphrase is (false, nil); material that cannot be interpreted is
 	// a fault and must be reported as one rather than as a failed login.
-	if _, err := hasher.Verify("$bcrypt$whatever", "x"); !errors.Is(err, infrastructure.ErrUnsupportedHash) {
+	if _, err := hasher.Verify("$bcrypt$whatever", "x"); !errors.Is(err, identitycrypto.ErrUnsupportedHash) {
 		t.Errorf("got %v, want ErrUnsupportedHash", err)
 	}
 }

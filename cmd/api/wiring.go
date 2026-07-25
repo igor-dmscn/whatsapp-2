@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 
-	identitydomain "comms/internal/identity/domain"
-	identityhttp "comms/internal/identity/transport"
+	"comms/internal/identity"
+	"comms/internal/identity/identityapi"
 )
 
 // This file holds the adapters that let one context satisfy another's port.
@@ -21,7 +21,7 @@ import (
 // identifier types. A shared type would be a shared dependency, which is the thing
 // the boundary exists to prevent.
 type identityAuthenticator struct {
-	authenticate func(ctx context.Context, accessToken string) (identitydomain.AccountID, identitydomain.DeviceID, error)
+	authenticate func(ctx context.Context, accessToken string) (identity.AccountID, identity.DeviceID, error)
 }
 
 func (a identityAuthenticator) Authenticate(ctx context.Context, accessToken string) (string, string, error) {
@@ -37,6 +37,6 @@ func (a identityAuthenticator) Authenticate(ctx context.Context, accessToken str
 // authentication middleware, so the value is already on the context by the time a
 // messaging handler runs.
 func callerFromRequest(ctx context.Context) (string, string) {
-	accountID, deviceID := identityhttp.Caller(ctx)
+	accountID, deviceID := identityapi.Caller(ctx)
 	return string(accountID), string(deviceID)
 }

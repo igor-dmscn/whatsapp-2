@@ -18,12 +18,14 @@ import (
 	"syscall"
 	"time"
 
-	identityapp "comms/internal/identity/application"
-	identityinfra "comms/internal/identity/infrastructure"
-	identityhttp "comms/internal/identity/transport"
-	messagingapp "comms/internal/messaging/application"
-	messaginginfra "comms/internal/messaging/infrastructure"
-	messaginghttp "comms/internal/messaging/transport"
+	"comms/internal/identity/identityapi"
+	"comms/internal/identity/identityapp"
+	"comms/internal/identity/identitycrypto"
+	"comms/internal/identity/identitypg"
+	"comms/internal/messaging/messagingapi"
+	"comms/internal/messaging/messagingapp"
+	"comms/internal/messaging/messagingpg"
+	"comms/internal/messaging/messagingredis"
 	"comms/internal/platform/config"
 	"comms/internal/platform/database"
 	"comms/internal/platform/httpx"
@@ -87,38 +89,38 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	db.SetConnMaxLifetime(time.Hour)
 
 	identityService := identityapp.NewService(
-		identityinfra.NewAccountRepository(db),
-		identityinfra.NewDeviceRepository(db),
-		identityinfra.NewSessionRepository(db),
-		identityinfra.NewArgon2Hasher(identityinfra.DefaultArgon2Params()),
-		identityinfra.NewLoggingPublisher(logger),
-		identityinfra.IDs{},
+		identitypg.NewAccountRepository(db),
+		identitypg.NewDeviceRepository(db),
+		identitypg.NewSessionRepository(db),
+		identitycrypto.NewArgon2Hasher(identitycrypto.DefaultArgon2Params()),
+		identityapp.NewLoggingPublisher(logger),
+		identityapp.IDs{},
 		time.Now,
 	)
 
-	redisClient, err := messaginginfra.OpenRedis(ctx, config.EnvOr("REDIS_URL", "redis://localhost:6379"))
+	redisClient, err := messagingredis.OpenRedis(ctx, config.EnvOr("REDIS_URL", "redis://localhost:6379"))
 	if err != nil {
 		return err
 	}
 	defer redisClient.Close()
 
 	messagingService := messagingapp.NewService(
-		messaginginfra.NewConversationRepository(db),
-		messaginginfra.NewMembershipRepository(db),
-		messaginginfra.NewEntryRepository(db),
-		messaginginfra.NewRedisBroadcaster(redisClient),
-		messaginginfra.NewLoggingPublisher(logger),
-		messaginginfra.IDs{},
+		messagingpg.NewConversationRepository(db),
+		messagingpg.NewMembershipRepository(db),
+		messagingpg.NewEntryRepository(db),
+		messagingredis.NewRedisBroadcaster(redisClient),
+		messagingapp.NewLoggingPublisher(logger),
+		messagingapp.IDs{},
 		time.Now,
 		logger,
 	)
 
 	// One goroutine reads from Redis for the whole node, however many sockets it
 	// holds.
-	hub := messaginghttp.NewHub(redisClient, logger)
+	hub := messagingapi.NewHub(redisClient, logger)
 	go hub.Run(ctx)
 
-	identityHandler := identityhttp.NewHandler(identityService, logger)
+	identityHandler := identityapi.NewHandler(identityService, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
@@ -128,7 +130,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		})
 	})
 	identityHandler.Routes(mux)
-	messaginghttp.NewHandler(
+	messagingapi.NewHandler(
 		messagingService,
 		hub,
 		identityAuthenticator{authenticate: identityService.Authenticate},

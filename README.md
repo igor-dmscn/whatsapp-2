@@ -34,7 +34,7 @@ If you are new to this repository, in this order:
 
 There is no single glossary file. Terminology lives with its context, because a term means something in one context and nothing in another:
 
-- [Identity](./internal/identity/CONTEXT.md) — Account, Handle, Credential, Device
+- [Identity](./internal/identity/CONTEXT.md) — Account, Handle, Credential, Device, Session
 - [Messaging](./internal/messaging/CONTEXT.md) — Conversation, Membership, Entry, Sequence Number, Cursor, Receipt
 - [Media](./internal/media/CONTEXT.md) — Attachment, Variant, Ready
 - [Calling](./internal/calling/CONTEXT.md) — Call, Participant, Ringing, Layer
@@ -51,7 +51,7 @@ Three binaries, split by resource profile rather than by bounded context ([ADR-0
 | `worker` | Read-model projections and media processing |
 | `sfu` | Call media forwarding |
 
-Contexts are packages inside `api`, with boundaries enforced by import linting — a violation is a build failure, not a code-review note.
+Contexts are packages inside `api`, with boundaries enforced by an architecture test — a violation is a build failure, not a code-review note. Package names carry their context (`identitypg`, `messagingapi`) so no import needs an alias ([ADR-0011](./docs/adr/0011-context-prefixed-package-names.md)).
 
 ## Decisions worth knowing up front
 

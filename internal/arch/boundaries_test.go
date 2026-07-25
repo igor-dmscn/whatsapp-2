@@ -27,32 +27,45 @@ const (
 // platform is shared plumbing; arch is this test.
 var notContexts = map[string]bool{"platform": true, "arch": true}
 
-// TestDomainDependsOnNothing asserts that every context's domain package imports
-// only the standard library.
+// Package naming is deliberate and is what keeps this test from needing a
+// third rule. Layer names would be identical across contexts — four packages
+// called domain, four called transport — so anything importing two contexts would
+// have to alias them, and generic names collide by design. Prefixing with the
+// context (identityapp, messagingpg) makes every package name unique across the
+// repository, so no import anywhere needs an alias. See ADR-0011.
+
+// TestDomainDependsOnNothing asserts that every context's model imports only the
+// standard library.
 //
-// This is the property the whole layering exists to protect. A domain package
-// that imports a driver, a framework or a transport has stopped being a model of
-// the business and become a description of the plumbing.
+// The model lives in files directly inside the context directory —
+// internal/messaging/*.go is package messaging — while adapters live in
+// subdirectories. Depth is therefore the rule: a file at the context root is the
+// model, and a file below it is an adapter.
+//
+// This is the property the whole layering exists to protect. A model that imports
+// a driver, a framework or a transport has stopped describing the business and
+// started describing the plumbing.
 func TestDomainDependsOnNothing(t *testing.T) {
 	eachGoFile(t, filepath.Join(repoRoot, "internal"), func(path string, imports []string) {
 		context, rest, ok := splitContext(path)
-		if !ok || !strings.HasPrefix(rest, "domain") {
+		if !ok || strings.Contains(rest, "/") {
+			// Below the context root, so an adapter rather than the model.
 			return
 		}
 		for _, imported := range imports {
 			if isStdlib(imported) {
 				continue
 			}
-			t.Errorf("%s: domain of context %q imports %q\n"+
-				"\tThe domain layer may import only the standard library.\n"+
-				"\tDefine a port in the domain and implement it in infrastructure instead.",
+			t.Errorf("%s: the %s model imports %q\n"+
+				"\tA context's model may import only the standard library.\n"+
+				"\tDeclare a port beside the aggregates and implement it in an adapter package.",
 				path, context, imported)
 		}
 	})
 }
 
 // TestContextsDoNotImportEachOther asserts that no bounded context imports
-// another.
+// another, at any depth.
 //
 // Cross-context collaboration goes one of two ways: an event over Kafka, or a
 // port the consuming context defines and the wiring in cmd/ satisfies. Neither

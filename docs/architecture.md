@@ -81,19 +81,24 @@ Calling needs to know whether an account may join a call, which is a Messaging q
 
 ## Layering inside a context
 
-Standard ports-and-adapters, one direction of dependency:
+Standard ports-and-adapters, one direction of dependency. Packages are named for
+their context rather than their layer, so no import in the repository needs an
+alias ([ADR-0011](./adr/0011-context-prefixed-package-names.md)):
 
 ```
-transport (HTTP, WebSocket, Kafka consumer)
-    ↓
-application (commands, queries, orchestration)
-    ↓
-domain (aggregates, invariants, domain events) ← depends on nothing
-    ↑
-infrastructure (Postgres, Redis, object store) implements domain ports
+internal/messaging/                  package messaging       ← depends on nothing
+                                     aggregates, ports, domain services
+internal/messaging/messagingapp/     package messagingapp
+                                     use cases, clock, identifiers, event publishing
+internal/messaging/messagingpg/      package messagingpg      implements ports
+internal/messaging/messagingredis/   package messagingredis   implements ports
+internal/messaging/messagingapi/     package messagingapi     HTTP, WebSocket, hub
 ```
 
-The domain package imports no framework, no driver, and no other context. That is the property the whole structure exists to protect, and the one worth failing a build over.
+The model — the files directly inside the context directory — imports no framework,
+no driver, and no other context. That is the property the whole structure exists to
+protect, and the one worth failing a build over. Depth is the rule the architecture
+test applies: a file at the context root is the model, a file below it is an adapter.
 
 ## CQRS, precisely scoped
 
