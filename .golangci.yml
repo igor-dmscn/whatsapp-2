@@ -1,0 +1,41 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # Errors are wrapped so a failure names the path it took, not just the leaf.
+    - errorlint
+    - wrapcheck
+    # Context must be threaded, not created mid-call — correlation identifiers
+    # and cancellation both depend on it.
+    - contextcheck
+    - noctx
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+
+  settings:
+    wrapcheck:
+      ignore-sigs:
+        - .Errorf(
+        - errors.New(
+        - errors.Join(
+        - .Wrap(
+        - .Wrapf(
+
+  exclusions:
+    rules:
+      # Tests may be blunter than production code.
+      - path: _test\.go$
+        linters:
+          - errcheck
+          - wrapcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -1,0 +1,41 @@
+.PHONY: help up down migrate build lint test check clean
+
+# Loaded so make targets see the same values the binaries do.
+ifneq (,$(wildcard .env))
+include .env
+export
+endif
+
+help: ## Show available targets
+	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
+
+up: ## Start dependencies and wait until they are healthy
+	docker compose up -d --wait
+
+down: ## Stop dependencies, keeping volumes
+	docker compose down
+
+migrate: ## Apply database migrations
+	go run ./cmd/migrate
+
+build: ## Build all binaries into bin/
+	go build -o bin/ ./cmd/...
+
+# The architecture test is part of lint, not just test: a boundary violation is
+# the kind of mistake that should stop a change from landing, and lint is what
+# people run before pushing. golangci-lint is optional so a clean clone can lint
+# with nothing but the Go toolchain installed.
+lint: ## Vet, check architectural boundaries, and run golangci-lint if present
+	go vet ./...
+	go test ./internal/arch/...
+	@command -v golangci-lint >/dev/null 2>&1 \
+		&& golangci-lint run \
+		|| echo "golangci-lint not installed, skipping (see .golangci.yml)"
+
+test: ## Run all tests
+	go test ./...
+
+check: lint test ## Everything CI would run
+
+clean: ## Remove build output
+	rm -rf bin/
