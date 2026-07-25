@@ -2,7 +2,22 @@
 
 Real-time messaging, media sharing, and live audio/video calling. A Go backend with React and CLI clients, built as a reference implementation — the codebase is meant to be read, so the reasoning is committed alongside the code.
 
-**Status: design complete, implementation not started.** See [the plan](./docs/plan.md).
+**Status: phase 0 complete — scaffold builds, lints and runs.** Phase 1 is Identity. See [the plan](./docs/plan.md).
+
+## Running it
+
+Requires Go 1.26 and Docker.
+
+```sh
+cp .env.example .env
+make up        # Postgres, Redis, Kafka, MinIO — returns when all are healthy
+make migrate   # apply schema
+make check     # lint + tests
+make build     # binaries into bin/
+```
+
+`make help` lists every target. The three binaries currently start, log and shut
+down on SIGTERM; they gain behaviour from phase 1 onward.
 
 ## Reading order
 

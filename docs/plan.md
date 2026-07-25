@@ -11,7 +11,7 @@ Requirement IDs (`MS-3`, `NF-7`, …) refer to [requirements.md](./requirements.
 
 ---
 
-## Phase 0 — Scaffold
+## Phase 0 — Scaffold — **complete**
 
 **Goal:** the repository builds, lints, tests and runs locally, with nothing in it yet.
 
