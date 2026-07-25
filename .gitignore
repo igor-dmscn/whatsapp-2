@@ -1,0 +1,9 @@
+bin/
+*.env
+.env.local
+node_modules/
+dist/
+coverage.out
+*.db
+*.sqlite
+.DS_Store
