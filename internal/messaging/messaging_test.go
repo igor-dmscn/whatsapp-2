@@ -33,10 +33,12 @@ import (
 	"comms/internal/messaging/internal/broadcast"
 	"comms/internal/messaging/internal/postgres"
 	"comms/internal/messaging/internal/presence"
+	"comms/internal/messaging/internal/push"
 	"comms/internal/platform/database"
 	"comms/internal/platform/database/testdb"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/id"
+	"comms/internal/platform/kafka"
 	"comms/internal/platform/ratelimit"
 )
 
@@ -1484,5 +1486,159 @@ func TestSendsSurviveRedisBeingUnreachable(t *testing.T) {
 	fetched := node.entriesAfter(brunoToken, conversation.ID, 0)
 	if len(fetched) != 2 {
 		t.Fatalf("fetched %d entries, want 2", len(fetched))
+	}
+}
+
+// --- push notifications ---
+
+// recordingSender captures what push decided, which is the part worth asserting.
+type recordingSender struct {
+	mutex sync.Mutex
+	sent  []string // "account:sequence"
+}
+
+func (s *recordingSender) Send(_ context.Context, notification push.Notification) error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.sent = append(s.sent, fmt.Sprintf("%s:%d", notification.AccountID, notification.Sequence))
+	return nil
+}
+
+func (s *recordingSender) all() []string {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return append([]string(nil), s.sent...)
+}
+
+// entryRecord builds the Kafka record the relay would publish for an entry.
+//
+// Hand-built rather than driven through Kafka, because what is under test is the decision the
+// consumer makes about a record, not the transport that carried it — which phase 3 already
+// establishes end to end. The shape has to match the outbox envelope, and it does: the fields
+// this consumer reads are the ones asserted below.
+func entryRecord(conversationID, authorID string, sequence int64) kafka.Record {
+	value, _ := json.Marshal(map[string]any{
+		"name": "messaging.entry_appended",
+		"payload": map[string]any{
+			"conversation_id": conversationID,
+			"author_id":       authorID,
+			"sequence":        sequence,
+		},
+	})
+	return kafka.Record{Topic: "messaging.entries", Name: "messaging.entry_appended", Value: value}
+}
+
+// TestPushSkipsTheAuthorAndAnybodyAlreadyLooking is the whole judgement of push, and each rule
+// is somebody's complaint if it is missing.
+func TestPushSkipsTheAuthorAndAnybodyAlreadyLooking(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+	redisClient := openRedis(t)
+
+	author, reader, watcher := newAccountID(), newAccountID(), newAccountID()
+	authorToken := tokens.issue(author)
+	watcherToken := tokens.issue(watcher)
+	conversation := node.startGroup(authorToken)
+	for _, account := range []string{reader, watcher} {
+		if _, status := node.addMember(authorToken, conversation.ID, account); status != http.StatusCreated {
+			t.Fatalf("adding a member returned %d", status)
+		}
+	}
+
+	// The watcher is holding a socket, so they are looking. The reader is not.
+	looking := node.dial(t)
+	looking.authenticate(watcherToken)
+	looking.resume(nil)
+	awaitConnections(t, node, 1)
+
+	sender := &recordingSender{}
+	store := presence.NewStore(redisClient)
+	notifier := push.NewNotifier(
+		postgres.NewMembershipRepository(testdb.Open(t)),
+		store, store, sender,
+		// No producer: a nil one degrades to logging, which is what these tests want. That
+		// the dead-letter path publishes when there *is* a producer is the kafka package's
+		// own test, not something to assert through a consumer.
+		kafka.NewDeadLetters(nil, "messaging-push", testLogger()),
+		testLogger(),
+	)
+
+	if err := notifier.Apply(context.Background(), entryRecord(conversation.ID, author, 1)); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	sent := sender.all()
+	if len(sent) != 1 {
+		t.Fatalf("notified %v, want only the reader", sent)
+	}
+	if sent[0] != reader+":1" {
+		t.Fatalf("notified %q, want the reader", sent[0])
+	}
+}
+
+// TestPushDoesNotNotifyTwiceForOneEntry is what at-least-once delivery makes inevitable.
+//
+// A duplicated unread badge is invisible, which is why idempotency there is a constraint on a
+// projection. A duplicated buzz is not invisible at all, so this needs its own mechanism — and
+// it has to work across processes, because the redelivery may land on a different worker.
+func TestPushDoesNotNotifyTwiceForOneEntry(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+	redisClient := openRedis(t)
+
+	author, reader := newAccountID(), newAccountID()
+	authorToken := tokens.issue(author)
+	conversation := node.startGroup(authorToken)
+	if _, status := node.addMember(authorToken, conversation.ID, reader); status != http.StatusCreated {
+		t.Fatalf("adding a member returned %d", status)
+	}
+
+	store := presence.NewStore(redisClient)
+	sender := &recordingSender{}
+	build := func() *push.Notifier {
+		return push.NewNotifier(
+			postgres.NewMembershipRepository(testdb.Open(t)), store, store, sender,
+			kafka.NewDeadLetters(nil, "messaging-push", testLogger()), testLogger())
+	}
+
+	record := entryRecord(conversation.ID, author, 1)
+	// Twice through *different* notifiers, which is the case a per-process memory would pass
+	// and a shared claim has to handle: two workers consuming the same redelivered record.
+	if err := build().Apply(context.Background(), record); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	if err := build().Apply(context.Background(), record); err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+
+	if sent := sender.all(); len(sent) != 1 {
+		t.Fatalf("notified %v for one entry, want one notification", sent)
+	}
+}
+
+// TestPushSkipsARecordItCannotRead: a malformed record must not stop the partition.
+//
+// The same rule as the projector, and the consequence of getting it wrong is the same shape but
+// milder — one person misses one notification, rather than every unread count in the system
+// freezing. Which is exactly why it must not be allowed to block what is behind it.
+func TestPushSkipsARecordItCannotRead(t *testing.T) {
+	sender := &recordingSender{}
+	store := presence.NewStore(openRedis(t))
+	notifier := push.NewNotifier(
+		postgres.NewMembershipRepository(testdb.Open(t)), store, store, sender,
+		kafka.NewDeadLetters(nil, "messaging-push", testLogger()), testLogger())
+
+	unreadable := kafka.Record{
+		Topic: "messaging.entries",
+		Name:  "messaging.entry_appended",
+		Value: []byte(`{"name":"messaging.entry_appended","payload":{"author_id":"nobody"}}`),
+	}
+	// nil, not an error: returning one would leave the offset uncommitted and this record
+	// would be retried forever, with everything behind it waiting.
+	if err := notifier.Apply(context.Background(), unreadable); err != nil {
+		t.Fatalf("a record with no conversation was retried rather than skipped: %v", err)
+	}
+	if sent := sender.all(); len(sent) != 0 {
+		t.Fatalf("notified %v from an unreadable record", sent)
 	}
 }

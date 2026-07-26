@@ -10,6 +10,8 @@ package kafka_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -235,4 +237,116 @@ func TestAHandlerFailureLeavesRecordsToBeRedelivered(t *testing.T) {
 	}
 	stopRecovering()
 	<-recoverDone
+}
+
+// TestASkippedRecordIsKeptRatherThanOnlyLogged is the dead-letter topic.
+//
+// A consumer that cannot apply a record must skip it — retrying forever blocks every record
+// behind it on that partition — but skipping and forgetting means a projection is now
+// permanently a little wrong with nothing to look at. This is what makes the record findable.
+//
+// Asserted through a real broker because that is the only interesting part: the decision to skip
+// is each consumer's own and is tested there, while whether the evidence survives is a question
+// about publishing.
+func TestASkippedRecordIsKeptRatherThanOnlyLogged(t *testing.T) {
+	addresses := brokers(t)
+	logger := slog.New(slog.DiscardHandler)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// The *real* dead-letter topic, unlike every other test here, because the point is to
+	// drive the real publisher rather than to imitate it. Safe: the record carries a key
+	// unique to this run, and the only consumer of this topic is a person looking at it.
+	topic := kafka.TopicDeadLetter
+	if err := kafka.EnsureTopics(ctx, addresses, 3, logger, topic); err != nil {
+		t.Fatalf("ensure topics: %v", err)
+	}
+
+	producer, err := kafka.NewProducer(ctx, addresses, logger)
+	if err != nil {
+		t.Fatalf("producer: %v", err)
+	}
+	defer producer.Close()
+
+	// A unique offset stands in for a unique identity: the key a letter is published under
+	// is topic and offset, so this is what makes the record findable among whatever else the
+	// topic holds.
+	offset := time.Now().UnixNano()
+	original := kafka.Record{
+		Topic:     "messaging.entries",
+		Name:      "messaging.entry_appended",
+		Partition: 2,
+		Offset:    offset,
+		Value:     []byte(`{"name":"messaging.entry_appended","payload":{"broken":true}}`),
+	}
+
+	// The real publisher, which is the thing under test.
+	deadLetters := kafka.NewDeadLetters(producer, "messaging-projections", logger)
+	deadLetters.Record(ctx, original,
+		errors.New("record cannot be applied: sequence 0 is not a position in the log"))
+
+	key := fmt.Sprintf("%s:%d", original.Topic, offset)
+
+	group := fmt.Sprintf("test-%d", time.Now().UnixNano())
+	consumer, err := kafka.NewConsumer(addresses, group, []string{topic}, logger)
+	if err != nil {
+		t.Fatalf("consumer: %v", err)
+	}
+
+	var (
+		mutex    sync.Mutex
+		received kafka.DeadLetter
+		found    bool
+		done     = make(chan struct{})
+	)
+
+	consumeCtx, stopConsuming := context.WithCancel(ctx)
+	defer stopConsuming()
+
+	go func() {
+		defer close(done)
+		consumer.Run(consumeCtx, func(_ context.Context, record kafka.Record) error {
+			if record.Key != key {
+				return nil
+			}
+			mutex.Lock()
+			defer mutex.Unlock()
+			if err := json.Unmarshal(record.Value, &received); err != nil {
+				return nil
+			}
+			found = true
+			stopConsuming()
+			return nil
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("the dead letter never arrived")
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	if !found {
+		t.Fatal("the dead letter never arrived")
+	}
+
+	// The original bytes, verbatim. A summary written by the code that could not understand
+	// the record is not evidence, so what is kept has to be what arrived.
+	if string(received.Value) != string(original.Value) {
+		t.Fatalf("the kept record is %q, want the original", received.Value)
+	}
+	// And enough to find it in the log it came from. Offset alone is not enough: offsets are
+	// per partition, so two records on one topic routinely share one.
+	if received.Topic != original.Topic || received.Partition != original.Partition ||
+		received.Offset != original.Offset {
+		t.Fatalf("the letter locates the record at %s/%d/%d, want %s/%d/%d",
+			received.Topic, received.Partition, received.Offset,
+			original.Topic, original.Partition, original.Offset)
+	}
+	if received.Consumer == "" || received.Reason == "" {
+		t.Fatalf("the letter says neither who gave up nor why: %+v", received)
+	}
 }

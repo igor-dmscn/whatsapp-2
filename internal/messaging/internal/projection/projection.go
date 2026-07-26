@@ -54,13 +54,18 @@ type (
 
 // Projector applies events to the read models.
 type Projector struct {
-	state  domain.MemberStateStore
-	logger *slog.Logger
+	state       domain.MemberStateStore
+	deadLetters *kafka.DeadLetters
+	logger      *slog.Logger
 }
 
 // NewProjector returns a projector writing to state.
-func NewProjector(state domain.MemberStateStore, logger *slog.Logger) *Projector {
-	return &Projector{state: state, logger: logger}
+func NewProjector(
+	state domain.MemberStateStore,
+	deadLetters *kafka.DeadLetters,
+	logger *slog.Logger,
+) *Projector {
+	return &Projector{state: state, deadLetters: deadLetters, logger: logger}
 }
 
 // Topics is what a projector needs to consume.
@@ -81,8 +86,8 @@ func Topics() []string {
 // running the worker against a topic that had a test's incomplete record on it, and
 // watching the projection wedge on offset 0 rather than fall behind and recover.
 //
-// ponytail: skipped records are logged and gone. A dead-letter topic is the phase-10
-// version, when there is somewhere for an operator to look.
+// Skipped records go to the dead-letter topic as well as to the log, which is the phase-10
+// half of this: a log line scrolls away, and what an operator needs is the record itself.
 var errUnprocessable = errors.New("record cannot be applied")
 
 // Apply handles one record.
@@ -118,15 +123,11 @@ func (p *Projector) Apply(ctx context.Context, record kafka.Record) error {
 	}
 
 	if errors.Is(err, errUnprocessable) {
-		// Swallowed so the offset commits and the partition keeps moving. Logged at
-		// error because a skipped event means a projection is now permanently a
-		// little wrong, and that must be visible.
-		logging.With(ctx, p.logger).Error("skipping unprocessable record",
-			slog.String("event", name),
-			slog.String("topic", record.Topic),
-			slog.Int64("offset", record.Offset),
-			slog.Any("error", err),
-		)
+		// Swallowed so the offset commits and the partition keeps moving, and kept: the
+		// record goes to the dead-letter topic with the reason attached, because a skipped
+		// event means a projection is now permanently a little wrong and somebody has to be
+		// able to find out which one.
+		p.deadLetters.Record(ctx, record, err)
 		return nil
 	}
 	return err

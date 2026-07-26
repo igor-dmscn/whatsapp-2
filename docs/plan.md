@@ -373,7 +373,17 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
   Typing is *both* recorded and broadcast, and both are needed: the broadcast makes it appear for people already there, the record makes it appear for somebody who opens the conversation a second later and asks. Every answer is a whole snapshot rather than a delta, so a lost push, a reconnect and a first render all repair themselves the same way.
 
   **Verified across two nodes**, which is where a naive implementation is wrong — presence held in a node's memory is presence only that node can see. Three integration tests and three browser tests: the other person shows as here, shows as typing while they type, stops when they send, and disappears when they close the tab. A non-member asking gets silence rather than a refusal, so asking cannot be used to discover which conversations exist.
-- Push notifications as a Kafka consumer.
+- ~~Push notifications as a Kafka consumer.~~ **Done**, and a consumer rather than something the send path does: a person waiting for their message to be accepted must not also wait for a provider on the other side of the internet, and a provider being down must not fail a send.
+
+  The consumer holds the whole judgement, which is where all of it is. Three rules, each somebody's complaint if it is missing: **not the author**, **not somebody already looking**, and **not twice**. The second is why presence was built first — a notification on the phone in your hand while you read the message on it is worse than silence, because it teaches people to ignore notifications. The third is what at-least-once delivery makes inevitable: a duplicated unread badge is invisible, a duplicated buzz is not, and the claim has to be shared across processes because the redelivery may land on a different worker.
+
+  **APNs and FCM are not implemented, and cannot be** ([ADR-0014](./adr/0014-push-decides-here-delivers-elsewhere.md)): both need credentials issued to a real application by a real vendor account, and NF-15 says the system starts locally with no cloud dependencies. The default sender logs. Inventing a device-token table to make the seam look complete was rejected too — tokens come from a mobile SDK, there is no mobile client, and a table with no writer asserts only that a join works.
+
+  Suppression and presence both **fail toward sending**: if Redis cannot say, the notification goes out, because a notification somebody did not need is a smaller failure than silence about a message they did.
+
+- ~~A dead-letter topic for records a consumer skips as permanently unprocessable.~~ **Done.** Phase 3 established that a record which can never be applied must be skipped rather than retried — retrying forever blocks every record behind it on that partition — and left a `ponytail:` comment saying the skipped record was logged and gone. It now goes to `platform.dead_letter` with the original bytes verbatim, which consumer gave up, why, and where to find it in the log it came from. Topic, partition *and* offset, because offsets are per partition and two records on one topic routinely share one.
+
+  One topic for every consumer rather than one each: what an operator does with these is look at them, and looking in five places is how nobody looks at all. Publishing is best-effort by necessity — this is already the failure path, and a consumer that stopped because it could not report a skip would have converted one lost projection into the stalled partition the skip exists to avoid.
 - ~~Rate limiting on send, handle search, and connect.~~ **Done**, in Redis rather than in each process — which is the whole change, because a limit counted per node is multiplied by the node count and loosens every time the deployment grows. Phase 1's in-process limiter said so in a `ponytail:` comment and named this phase as its replacement; it is gone.
 
   Sixty sends per ten seconds, thirty handle lookups per minute (ID-5), thirty connections per minute. All three are far above what a person does and far below what a loop does, which is the only band a useful limit occupies. Per account, not per device or per address: a device is something a client can make more of, and an address is shared by everyone behind one office router.
@@ -392,7 +402,7 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
 
   **Kafka unreachable** was already covered by phase 3: an entry and its outbox row commit together, a failed publish leaves rows to retry, and stopping the relay delays events rather than losing them (NF-6).
 - A service worker, so the browser client's offline cold start is genuinely offline. Noted in phase 6 and still owed: the database survives a restart, the page it is loaded by does not.
-- A dead-letter topic for records a consumer skips as permanently unprocessable. They are logged today, which is a record nobody reads.
+
 - **A flake in the media tests. Found, and it was the same bug NF-14 exposed** — worth recording because of how it was found, which was not by looking for it.
 
   The symptom was a hang: roughly one run in three, `go test ./...` sat at `<-gathered` inside `Join` until Go's ten-minute panic, naming a different test each time. It reproduced on `internal/calling/internal/sfu` alone under `-count=5`, and on the commit before any of the node work, so it was pre-existing and not the node work.

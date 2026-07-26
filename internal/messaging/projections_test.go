@@ -38,10 +38,14 @@ func newProjections(t *testing.T) *projections {
 	state := postgres.NewMemberStateStore(db)
 
 	return &projections{
-		t:         t,
-		db:        db,
-		state:     state,
-		projector: projection.NewProjector(state, slog.New(slog.DiscardHandler)),
+		t:     t,
+		db:    db,
+		state: state,
+		// A nil producer for dead letters, which degrades to logging. These tests assert
+		// what the projector does with a record, not where a skipped one is filed.
+		projector: projection.NewProjector(state,
+			kafka.NewDeadLetters(nil, "messaging-projections", slog.New(slog.DiscardHandler)),
+			slog.New(slog.DiscardHandler)),
 	}
 }
 
@@ -494,7 +498,9 @@ func TestProjectionRetriesWhenItsStoreFails(t *testing.T) {
 	// the offset is not committed and the record comes back. Skipping it would lose an
 	// unread count for good.
 	failing := &failingStateStore{}
-	projector := projection.NewProjector(failing, slog.New(slog.DiscardHandler))
+	projector := projection.NewProjector(failing,
+		kafka.NewDeadLetters(nil, "messaging-projections", slog.New(slog.DiscardHandler)),
+		slog.New(slog.DiscardHandler))
 
 	record := kafka.Record{
 		Name: "messaging.entry_appended",

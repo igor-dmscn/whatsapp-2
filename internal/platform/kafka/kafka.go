@@ -58,7 +58,7 @@ const (
 // AllTopics is what EnsureTopics creates.
 var AllTopics = []string{
 	TopicMessagingEntries, TopicMessagingReceipts, TopicIdentityEvents,
-	TopicMediaAttachments, TopicCallingEvents,
+	TopicMediaAttachments, TopicCallingEvents, TopicDeadLetter,
 }
 
 // Brokers splits a comma-separated broker list.
@@ -192,11 +192,14 @@ type Handler func(ctx context.Context, record Record) error
 
 // Record is a consumed event.
 type Record struct {
-	Topic  string
-	Key    string
-	Name   string
-	Value  []byte
-	Offset int64
+	Topic string
+	Key   string
+	Name  string
+	Value []byte
+	// Partition and Offset together identify the record. Offset alone does not: offsets are
+	// per partition, so two records on one topic routinely share one.
+	Partition int32
+	Offset    int64
 }
 
 // Consumer reads a consumer group's share of one or more topics.
@@ -293,10 +296,11 @@ func toRecord(record *kgo.Record) Record {
 		}
 	}
 	return Record{
-		Topic:  record.Topic,
-		Key:    string(record.Key),
-		Name:   name,
-		Value:  record.Value,
-		Offset: record.Offset,
+		Topic:     record.Topic,
+		Key:       string(record.Key),
+		Name:      name,
+		Value:     record.Value,
+		Partition: record.Partition,
+		Offset:    record.Offset,
 	}
 }

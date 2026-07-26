@@ -172,6 +172,31 @@ func (s *Store) TypingIn(ctx context.Context, conversationID string, now time.Ti
 	return typing, nil
 }
 
+// FirstTime claims a notification, reporting whether this process is the first to do so.
+//
+// SET NX with an expiry, which is the whole mechanism: the first caller sets the key and is told
+// so, everybody else finds it already there. Atomic in one command, so two nodes consuming the
+// same redelivered record cannot both decide they are first.
+//
+// It lives here rather than in the push package because it is the same kind of thing as
+// everything else in this file — a fact that matters for minutes and then does not. A permanent
+// record of every notification ever sent would be a table nobody reads.
+func (s *Store) FirstTime(ctx context.Context, key string) (bool, error) {
+	claimed, err := s.client.SetNX(ctx, "notified:"+key, "1", NotificationMemory).Result()
+	if err != nil {
+		return false, fmt.Errorf("claim notification: %w", err)
+	}
+	return claimed, nil
+}
+
+// NotificationMemory is how long a sent notification is remembered, and it is a bet on how late
+// a redelivery can be.
+//
+// An hour. Kafka redelivers within seconds normally, and after a consumer group is reset or a
+// partition is reassigned it can be much later — but a notification about an hour-old message is
+// not something to suppress, it is something that should never have been queued.
+const NotificationMemory = time.Hour
+
 // isNoResult reports whether an error is Redis saying a key does not exist.
 //
 // Which is an answer here rather than a failure: nobody online in a conversation nobody has

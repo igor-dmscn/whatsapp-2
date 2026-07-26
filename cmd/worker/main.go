@@ -83,7 +83,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	}
 	defer producer.Close()
 
-	projections, err := messaging.NewProjections(db, brokers, logger)
+	// The producer is handed to both consumers so that a record neither can apply lands on
+	// the dead-letter topic rather than only in a log line that scrolls away.
+	projections, err := messaging.NewProjections(db, brokers, producer, logger)
 	if err != nil {
 		return err
 	}
@@ -109,6 +111,14 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
+	// Push notifications, on their own consumer group so a slow provider does not hold up
+	// the projections unread badges depend on. Redis reaches it for two things: whether the
+	// recipient is already looking, and whether this notification has already gone out.
+	notifications, err := messaging.NewPushNotifications(db, redisClient, brokers, producer, logger)
+	if err != nil {
+		return err
+	}
+
 	relay := outbox.NewRelay(db, producer, logger)
 
 	// The relay and the projections are independent: the relay moves rows to Kafka
@@ -116,7 +126,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// convenience, not a coupling — either could be its own binary the moment one of
 	// them needs to scale separately from the other.
 	var running sync.WaitGroup
-	running.Add(3)
+	running.Add(4)
 
 	go func() {
 		defer running.Done()
@@ -125,6 +135,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	go func() {
 		defer running.Done()
 		projections.Run(ctx)
+	}()
+	go func() {
+		defer running.Done()
+		notifications.Run(ctx)
 	}()
 	// Its own consumer group, so that deriving variants from a large photo does not
 	// hold up the projections that unread badges depend on.

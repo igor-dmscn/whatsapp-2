@@ -21,6 +21,7 @@ import (
 	"comms/internal/messaging/internal/postgres"
 	"comms/internal/messaging/internal/presence"
 	"comms/internal/messaging/internal/projection"
+	"comms/internal/messaging/internal/push"
 	"comms/internal/platform/database"
 	"comms/internal/platform/kafka"
 	"comms/internal/platform/ratelimit"
@@ -299,16 +300,26 @@ type Projections struct {
 // Its own consumer group, so that adding a second kind of consumer later — the
 // notification sender of phase 10, say — does not make the two compete for
 // partitions or share a replay.
-func NewProjections(db *sql.DB, brokers []string, logger *slog.Logger) (*Projections, error) {
+// NewProjections wires the read-model consumer.
+//
+// The producer is for dead letters and may be nil, which degrades to logging — a consumer that
+// could not report a skipped record must still skip it, or one bad message stops the partition.
+func NewProjections(
+	db *sql.DB,
+	brokers []string,
+	producer *kafka.Producer,
+	logger *slog.Logger,
+) (*Projections, error) {
 	consumer, err := kafka.NewConsumer(brokers, "messaging-projections", projection.Topics(), logger)
 	if err != nil {
 		return nil, err //nolint:wrapcheck // already wrapped where it happened.
 	}
 
 	return &Projections{
-		consumer:  consumer,
-		projector: projection.NewProjector(postgres.NewMemberStateStore(db), logger),
-		logger:    logger,
+		consumer: consumer,
+		projector: projection.NewProjector(postgres.NewMemberStateStore(db),
+			kafka.NewDeadLetters(producer, "messaging-projections", logger), logger),
+		logger: logger,
 	}, nil
 }
 
@@ -317,4 +328,54 @@ func (p *Projections) Run(ctx context.Context) {
 	p.logger.Info("messaging projections started")
 	p.consumer.Run(ctx, p.projector.Apply)
 	p.logger.Info("messaging projections stopped")
+}
+
+// PushNotifications is the consumer that decides who to wake up about an entry.
+//
+// Its own consumer group, so that a slow push provider does not hold up the projections unread
+// badges depend on — the same reason media processing has its own.
+type PushNotifications struct {
+	consumer *kafka.Consumer
+	notifier *push.Notifier
+	logger   *slog.Logger
+}
+
+// NewPushNotifications wires the consumer, with a sender that logs.
+//
+// The provider is a seam rather than an implementation, and ADR-0014 says why: credentials for
+// APNs or FCM cannot exist in a system that runs entirely on one machine with no cloud
+// dependencies, and the decision — who, and whether they are already looking — is where all the
+// judgement is anyway.
+func NewPushNotifications(
+	db *sql.DB,
+	redisClient *redis.Client,
+	brokers []string,
+	producer *kafka.Producer,
+	logger *slog.Logger,
+) (*PushNotifications, error) {
+	consumer, err := kafka.NewConsumer(brokers, "messaging-push", push.Topics(), logger)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // already wrapped where it happened.
+	}
+
+	store := presence.NewStore(redisClient)
+	return &PushNotifications{
+		consumer: consumer,
+		notifier: push.NewNotifier(
+			postgres.NewMembershipRepository(db),
+			store,
+			store,
+			push.NewLoggingSender(logger),
+			kafka.NewDeadLetters(producer, "messaging-push", logger),
+			logger,
+		),
+		logger: logger,
+	}, nil
+}
+
+// Run consumes until ctx is cancelled.
+func (p *PushNotifications) Run(ctx context.Context) {
+	p.logger.Info("push notifications started")
+	p.consumer.Run(ctx, p.notifier.Apply)
+	p.logger.Info("push notifications stopped")
 }
