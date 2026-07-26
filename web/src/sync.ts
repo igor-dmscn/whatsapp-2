@@ -49,6 +49,11 @@ export type SyncOptions = {
    *  first version of this, and it meant a message queued before a refresh stayed queued
    *  forever. */
   postEntry?: (conversationID: string, clientEntryID: string, text: string, replyTo: number) => Promise<Entry>
+  /** onAttachmentChanged fires when an attachment became ready or failed.
+   *
+   *  Carries only the identifier, because the state and the URLs have to be fetched to
+   *  be trusted — a frame is not a source of truth about something signed and expiring. */
+  onAttachmentChanged?: (attachmentID: string) => void
   /** open connects. Defaults to a real WebSocket at the current origin.
    *
    *  It takes no URL: the default computes one from location, and a caller that
@@ -111,6 +116,9 @@ type entryFrame = {
    *  entry that amends nothing, which resolve() correctly ignores — a silent failure. */
   target_sequence?: number
   reply_to?: number
+  /** attachment_id travels for the same reason: a live recipient renders a placeholder
+   *  immediately rather than discovering the reference on a later fetch. */
+  attachment_id?: string
 }
 
 type gapsFrame = {
@@ -127,10 +135,28 @@ type reactionFrame = {
   removed: boolean
 }
 
+/** attachmentFrame says an attachment changed, and nothing about how.
+ *
+ *  Deliberately stateless: the variant URLs are signed and short-lived, so a frame
+ *  carrying them would be stale by the time a client acted on it. "Look again" is the
+ *  whole message, and the client re-fetches — which it must do for the URLs anyway. */
+type attachmentFrame = {
+  type: 'attachment'
+  conversation_id: string
+  attachment_id: string
+}
+
 type readyFrame = { type: 'ready'; account_id: string; device_id: string }
 type errorFrame = { type: 'error'; code: string; message: string }
 
-type serverFrame = entryFrame | gapsFrame | reactionFrame | readyFrame | errorFrame | { type: string }
+type serverFrame =
+  | entryFrame
+  | gapsFrame
+  | reactionFrame
+  | attachmentFrame
+  | readyFrame
+  | errorFrame
+  | { type: string }
 
 /** openAtCurrentOrigin is the browser default: same origin as the page, so the
  *  server's same-origin check passes with no configuration to keep in step. */
@@ -152,6 +178,7 @@ function toEntry(frame: entryFrame): Entry {
     created_at: frame.created_at,
     target_sequence: frame.target_sequence,
     reply_to: frame.reply_to,
+    attachment_id: frame.attachment_id,
   }
 }
 
@@ -484,6 +511,13 @@ export class Sync {
         this.onReaction(frame as reactionFrame)
         break
 
+      case 'attachment':
+        // Forwarded rather than stored. Nothing about the log changed, so no sequence
+        // moves and no gap opens — the only thing to do is tell whoever is rendering
+        // that attachment to ask again.
+        this.options.onAttachmentChanged?.((frame as attachmentFrame).attachment_id)
+        break
+
       case 'error':
         this.options.onFatal?.(new Error((frame as errorFrame).message))
         break
@@ -575,6 +609,7 @@ export class Sync {
           body: decodeBody(entry.body),
           target_sequence: entry.target_sequence ?? 0,
           reply_to: entry.reply_to ?? 0,
+          attachment_id: entry.attachment_id ?? '',
           created_at: entry.created_at,
         },
       ])

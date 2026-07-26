@@ -92,6 +92,13 @@ type EntryRepository interface {
 	// ErrEntryNotFound if there is none. Used to refuse editing something already
 	// retracted.
 	LatestAmendmentFor(ctx context.Context, conversationID ConversationID, target Sequence) (*Entry, error)
+
+	// ByAttachment returns the entry carrying an attachment, or ErrEntryNotFound.
+	//
+	// This is what lets Media apply the log's own visibility rule to a photo without
+	// holding a copy of it: the attachment is as visible as the entry that references
+	// it, and that entry's position is the only thing needed to decide.
+	ByAttachment(ctx context.Context, conversationID ConversationID, attachmentID AttachmentID) (*Entry, error)
 }
 
 // EventPublisher carries recorded domain events out of the context.

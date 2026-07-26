@@ -162,6 +162,7 @@ func (s *Service) Send(
 	contentType string,
 	body []byte,
 	replyTo domain.Sequence,
+	attachmentID domain.AttachmentID,
 ) (*domain.Entry, error) {
 	// Authorisation before content. The aggregate checks this again in Append and
 	// that is where the rule lives — MayWrite is the membership's own method, called
@@ -185,7 +186,10 @@ func (s *Service) Send(
 	if err != nil {
 		return nil, err
 	}
-	payload, err := domain.NewPayload(contentType, body)
+	// A photo with no caption is an entry with no content, which NewPayload rightly
+	// refuses on its own. What makes it legitimate is the attachment, so the two are
+	// validated together rather than the payload rule being loosened for everyone.
+	payload, err := domain.PayloadFor(contentType, body, attachmentID)
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +206,8 @@ func (s *Service) Send(
 	err = s.atomically(ctx, func(ctx context.Context) error {
 		appended, events, err := s.conversations.AppendEntry(ctx, conversationID,
 			func(conversation *domain.Conversation) (*domain.Entry, error) {
-				return conversation.Append(s.ids.NewEntryID(), membership, parsedClientID, payload, replyTo, s.now())
+				return conversation.Append(s.ids.NewEntryID(), membership, parsedClientID,
+					payload, replyTo, attachmentID, s.now())
 			},
 		)
 		if err != nil {
@@ -251,6 +256,55 @@ func (s *Service) Send(
 //
 // The rule itself is still the membership's — Active() is its method. What this adds
 // is that no read path can forget to ask.
+// MayAttach reports whether an account may add an attachment to a conversation.
+//
+// Media asks this before issuing an upload URL. It is the same question as "may this
+// account send here", because an attachment is only ever reachable through an entry —
+// so a reader in a channel is refused, and a removed member is refused (MS-6).
+func (s *Service) MayAttach(ctx context.Context, conversationID, accountID string) (bool, error) {
+	membership, err := s.readerMembership(
+		ctx, domain.ConversationID(conversationID), domain.AccountID(accountID))
+	if err != nil {
+		if errors.Is(err, domain.ErrNotAMember) {
+			return false, nil
+		}
+		return false, fmt.Errorf("look up membership: %w", err)
+	}
+	return membership.MayWrite(), nil
+}
+
+// MayView reports whether an account may see an attachment.
+//
+// The rule is that an attachment is exactly as visible as the entry that references
+// it. That keeps the join-point policy in one place: a member who joined at position 40
+// cannot read entry 39, and must not be able to fetch its photo either — which asking
+// about the attachment on its own could not decide.
+//
+// An attachment no entry references yet is visible to nobody here. Media allows its
+// owner, which is what lets a client show what it is uploading, and is a claim only
+// Media can make since it holds the ownership.
+func (s *Service) MayView(ctx context.Context, conversationID, accountID, attachmentID string) (bool, error) {
+	membership, err := s.readerMembership(
+		ctx, domain.ConversationID(conversationID), domain.AccountID(accountID))
+	if err != nil {
+		if errors.Is(err, domain.ErrNotAMember) {
+			return false, nil
+		}
+		return false, fmt.Errorf("look up membership: %w", err)
+	}
+
+	entry, err := s.entries.ByAttachment(
+		ctx, domain.ConversationID(conversationID), domain.AttachmentID(attachmentID))
+	if err != nil {
+		if errors.Is(err, domain.ErrEntryNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("look up entry by attachment: %w", err)
+	}
+
+	return membership.CanSee(entry.Sequence()), nil
+}
+
 func (s *Service) readerMembership(
 	ctx context.Context,
 	conversationID domain.ConversationID,

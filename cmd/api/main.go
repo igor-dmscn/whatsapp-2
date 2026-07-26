@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"comms/internal/identity"
+	"comms/internal/media"
 	"comms/internal/messaging"
 	"comms/internal/platform/config"
 	"comms/internal/platform/database"
@@ -40,6 +41,21 @@ func allowedOrigins() []string {
 		return strings.Split(configured, ",")
 	}
 	return nil
+}
+
+// storeConfig is where attachment bytes live.
+//
+// One endpoint and one static key: MinIO in development, and the same code against S3
+// in a deployment that sets these differently. No credential provider chain, because
+// there is one credential.
+func storeConfig() media.Config {
+	return media.Config{
+		Endpoint:  config.EnvOr("S3_ENDPOINT", "http://localhost:9000"),
+		Bucket:    config.EnvOr("S3_BUCKET", "comms-attachments"),
+		Region:    config.EnvOr("S3_REGION", "us-east-1"),
+		AccessKey: config.MustEnv("S3_ACCESS_KEY"),
+		SecretKey: config.MustEnv("S3_SECRET_KEY"),
+	}
 }
 
 func main() {
@@ -100,6 +116,17 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// One goroutine per process reads broadcasts for every socket this node holds.
 	go messagingModule.Run(ctx)
 
+	attachments, err := media.OpenStore(ctx, storeConfig())
+	if err != nil {
+		return err
+	}
+
+	// Media asks Messaging who may attach and who may view: an attachment is exactly as
+	// visible as the entry referencing it, and that rule belongs to the context that
+	// owns membership. No notifier here — this process signs URLs and serves metadata,
+	// and has no readiness to announce.
+	mediaModule := media.New(db, attachments, messagingModule, nil, identityModule.Caller, logger)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, logger, http.StatusOK, map[string]any{
@@ -109,6 +136,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	})
 	identityModule.Routes(mux)
 	messagingModule.Routes(mux, identityModule.Authenticated)
+	mediaModule.Routes(mux, identityModule.Authenticated)
 
 	server := &http.Server{
 		Addr:              config.EnvOr("API_ADDR", ":8080"),

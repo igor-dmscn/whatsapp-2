@@ -5,6 +5,14 @@ import "time"
 // EntryID identifies an entry.
 type EntryID string
 
+// AttachmentID references a photo or video held by Media.
+//
+// An identifier and nothing else. Messaging stores no attachment metadata, has no
+// foreign key to Media's tables, and cannot tell whether the attachment is ready — a
+// message referencing one is readable the instant it is sent, which is the point
+// (MD-1). See CONTEXT-MAP.md.
+type AttachmentID string
+
 // EntryKind distinguishes what occupies a position in the log.
 //
 // Two kinds exist because ADR-0008 makes edits and deletes new entries rather
@@ -52,8 +60,10 @@ type Entry struct {
 	// target is the position this entry amends, zero for an ordinary message.
 	target Sequence
 	// replyTo is the position this entry replies to, zero for none.
-	replyTo   Sequence
-	createdAt time.Time
+	replyTo Sequence
+	// attachmentID is the photo or video this entry carries, empty for none.
+	attachmentID AttachmentID
+	createdAt    time.Time
 }
 
 func newEntry(
@@ -66,6 +76,7 @@ func newEntry(
 	payload Payload,
 	target Sequence,
 	replyTo Sequence,
+	attachmentID AttachmentID,
 	now time.Time,
 ) (*Entry, error) {
 	if id == "" {
@@ -86,6 +97,12 @@ func newEntry(
 	if !kind.Amends() && target != 0 {
 		return nil, ValidationError{"target_sequence", "only a revision or retraction amends an entry"}
 	}
+	if payload.Empty() && attachmentID == "" && kind != KindRetraction {
+		// An entry with neither content nor an attachment says nothing and occupies a
+		// position. Only a retraction is legitimately empty — it means "what was here is
+		// withdrawn", which is content of a sort.
+		return nil, ValidationError{"body", "an entry must carry content or an attachment"}
+	}
 
 	return &Entry{
 		id:             id,
@@ -97,6 +114,7 @@ func newEntry(
 		payload:        payload,
 		target:         target,
 		replyTo:        replyTo,
+		attachmentID:   attachmentID,
 		createdAt:      now,
 	}, nil
 }
@@ -113,6 +131,7 @@ func ReconstituteEntry(
 	payload Payload,
 	target Sequence,
 	replyTo Sequence,
+	attachmentID AttachmentID,
 	createdAt time.Time,
 ) *Entry {
 	return &Entry{
@@ -125,6 +144,7 @@ func ReconstituteEntry(
 		payload:        payload,
 		target:         target,
 		replyTo:        replyTo,
+		attachmentID:   attachmentID,
 		createdAt:      createdAt,
 	}
 }
@@ -143,6 +163,9 @@ func (e *Entry) Target() Sequence { return e.target }
 
 // ReplyTo is the position this entry replies to, or zero for none.
 func (e *Entry) ReplyTo() Sequence { return e.replyTo }
+
+// AttachmentID is the photo or video this entry carries, or empty for none.
+func (e *Entry) AttachmentID() AttachmentID { return e.attachmentID }
 
 // String reports position and shape, never content.
 func (e *Entry) String() string {

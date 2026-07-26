@@ -45,6 +45,19 @@ func ReconstitutePayload(contentType string, body []byte) Payload {
 	return Payload{contentType: contentType, body: body}
 }
 
+// PayloadFor returns the payload of a message that may carry an attachment.
+//
+// A photo sent with no caption is an entry with no content, which NewPayload rightly
+// refuses on its own — an empty message is a client bug. What makes it legitimate here
+// is the attachment, so the two are decided together rather than the payload rule
+// being loosened for every sender.
+func PayloadFor(contentType string, body []byte, attachmentID AttachmentID) (Payload, error) {
+	if attachmentID != "" && len(body) == 0 {
+		return NoPayload(), nil
+	}
+	return NewPayload(contentType, body)
+}
+
 // NoPayload is what a retraction carries: nothing.
 //
 // Named rather than left as a zero value, so a call site saying "this entry has no

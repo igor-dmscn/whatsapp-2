@@ -14,7 +14,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 
 import { ApiError, Client, deliveryOf, login, register, SessionExpired } from './api'
-import type { Conversation, DeliveryState, Invite, Member, Role, Session } from './api'
+import type { Attachment, Conversation, DeliveryState, Invite, Member, Role, Session } from './api'
 import { Sync } from './sync'
 import { LocalStore, type Hit } from './store'
 import { resolve, summarise, type Message, type ReactionsBySequence } from './transcript'
@@ -227,6 +227,15 @@ function Workspace({
     else setError(describe(failure))
   }
 
+  // Attachment epochs: a bump counter per attachment, so that "look at this again"
+  // becomes a re-fetch in the one component showing it rather than a re-render of the
+  // whole transcript. In a ref for the same reason as fatal above — the socket must not
+  // depend on the identity of a callback that changes every render.
+  const [epochs, setEpochs] = useState<Record<string, number>>({})
+  const bump = useRef<(attachmentID: string) => void>(() => {})
+  bump.current = (attachmentID) =>
+    setEpochs((held) => ({ ...held, [attachmentID]: (held[attachmentID] ?? 0) + 1 }))
+
   const sync = useMemo(
     () =>
       new Sync({
@@ -235,6 +244,7 @@ function Workspace({
         postEntry: (conversationID, clientEntryID, text, replyTo) =>
           client.send(conversationID, clientEntryID, text, replyTo),
         onFatal: (failure) => fatal.current(failure),
+        onAttachmentChanged: (attachmentID) => bump.current(attachmentID),
         store: store ?? undefined,
       }),
     [client, store],
@@ -495,6 +505,8 @@ function Workspace({
                 }}
                 onReply={setReplyTo}
                 onError={setError}
+                client={client}
+                epochs={epochs}
               />
               <Composer
                 replyTo={replyTo}
@@ -503,6 +515,17 @@ function Workspace({
                   // Through the syncer, so the send is recorded as pending before it is
                   // attempted and retried on the next connection if it fails.
                   await sync.send(selected, clientEntryID, text, replyTo)
+                  setReplyTo(0)
+                }}
+                onAttach={async (file, clientEntryID, text, onProgress) => {
+                  // Not through the pending queue, deliberately. That queue exists so a
+                  // typed message survives being offline; an attachment cannot be sent
+                  // offline at all, because the bytes have to reach the store first. So
+                  // there is nothing to queue — if the upload failed there is no
+                  // attachment to reference, and the draft is kept for a retry.
+                  const attachmentID = await client.attach(selected, file, onProgress)
+                  const entry = await client.send(selected, clientEntryID, text, replyTo, attachmentID)
+                  sync.accept(entry)
                   setReplyTo(0)
                 }}
                 onError={setError}
@@ -843,6 +866,8 @@ function Transcript({
   onReact,
   onReply,
   onError,
+  client,
+  epochs,
 }: {
   messages: Message[]
   reactions: ReactionsBySequence
@@ -854,6 +879,10 @@ function Transcript({
   onReact: (sequence: number, emoji: string, mine: boolean) => Promise<void>
   onReply: (sequence: number) => void
   onError: (message: string) => void
+  client: Client
+  /** epochs bumps when the server says an attachment changed, which is what makes a
+   *  placeholder become a thumbnail without a poll. */
+  epochs: Record<string, number>
 }) {
   const [editing, setEditing] = useState(0)
   const byPosition = new Map(messages.map((message) => [message.sequence, message]))
@@ -876,6 +905,14 @@ function Transcript({
           <span className="who">
             {message.authorID === me ? 'you' : (handles[message.authorID] ?? message.authorID.slice(0, 8))}
           </span>
+
+          {message.attachmentID !== '' && (
+            <AttachmentView
+              client={client}
+              attachmentID={message.attachmentID}
+              epoch={epochs[message.attachmentID] ?? 0}
+            />
+          )}
 
           {message.retracted ? (
             <span className="body retracted">deleted</span>
@@ -1041,18 +1078,121 @@ function Ticks({ state }: { state: DeliveryState }) {
   )
 }
 
+/**
+ * AttachmentView shows one photo or video, whatever state it is in.
+ *
+ * It fetches its own metadata rather than being handed it, for two reasons. The URLs are
+ * signed and expire within the hour, so they cannot be cached with the entry — a stored
+ * URL is a broken image waiting to happen. And the entry arrives before the attachment
+ * is ready (MD-1), so there is nothing to hand over at the moment it is rendered.
+ */
+function AttachmentView({
+  client,
+  attachmentID,
+  epoch,
+}: {
+  client: Client
+  attachmentID: string
+  epoch: number
+}) {
+  const [attachment, setAttachment] = useState<Attachment | null>(null)
+  const [failed, setFailed] = useState(false)
+  const [open, setOpen] = useState(false)
+
+  useEffect(() => {
+    let current = true
+    client
+      .attachment(attachmentID)
+      .then((found) => {
+        if (current) setAttachment(found)
+      })
+      .catch(() => {
+        // Not a fatal error and not worth a banner: an attachment this account may not
+        // see, or one whose metadata could not be fetched, renders as unavailable. The
+        // message it belongs to is still readable, which is the point of the two being
+        // separate.
+        if (current) setFailed(true)
+      })
+    return () => {
+      current = false
+    }
+    // epoch is the dependency that matters: the server said this attachment changed, so
+    // ask again.
+  }, [client, attachmentID, epoch])
+
+  if (failed) return <span className="attachment unavailable">attachment unavailable</span>
+
+  if (!attachment || attachment.state === 'pending' || attachment.state === 'uploaded') {
+    // The placeholder, and the whole reason an entry is decoupled from its attachment: a
+    // message carrying a 90 MB video is readable now and displayable later (MD-1).
+    return (
+      <span className="attachment pending" aria-label="Attachment processing">
+        <span className="spinner" /> preparing…
+      </span>
+    )
+  }
+
+  if (attachment.state === 'failed') {
+    return (
+      <span className="attachment failed" title={attachment.failure}>
+        this attachment could not be processed
+      </span>
+    )
+  }
+
+  // Video has no derived renditions — deriving one needs a transcoder — so it is played
+  // from the retained original with the browser's own controls. preload is metadata so
+  // opening a conversation does not start downloading every video in it.
+  if (attachment.content_type.startsWith('video/')) {
+    return (
+      <video className="attachment video" controls preload="metadata" src={attachment.original_url}>
+        <track kind="captions" />
+      </video>
+    )
+  }
+
+  const thumbnail = attachment.variants.find((variant) => variant.name === 'thumbnail')
+  const display = attachment.variants.find((variant) => variant.name === 'display')
+  const shown = open ? (display ?? thumbnail) : thumbnail
+  if (!shown) return <span className="attachment unavailable">attachment unavailable</span>
+
+  return (
+    <button
+      type="button"
+      className={open ? 'attachment photo open' : 'attachment photo'}
+      onClick={() => setOpen(!open)}
+      aria-label={open ? 'Close attachment' : 'Open attachment'}
+    >
+      {/* Dimensions are set so the transcript does not jump as thumbnails load. */}
+      <img src={shown.url} width={shown.width} height={shown.height} alt="" loading="lazy" />
+    </button>
+  )
+}
+
 function Composer({
   replyTo,
   onCancelReply,
   onSend,
+  onAttach,
   onError,
 }: {
   replyTo: number
   onCancelReply: () => void
   onSend: (text: string, clientEntryID: string) => Promise<void>
+  onAttach: (
+    file: File,
+    clientEntryID: string,
+    text: string,
+    onProgress: (fraction: number) => void,
+  ) => Promise<void>
   onError: (message: string) => void
 }) {
   const [draft, setDraft] = useState('')
+  const [chosen, setChosen] = useState<File | null>(null)
+  // -1 means no upload in flight, which is distinguishable from 0 — a hundred-megabyte
+  // upload sits at zero for a moment and must not look idle.
+  const [progress, setProgress] = useState(-1)
+  const chooser = useRef<HTMLInputElement>(null)
   // The identifier belongs to the draft, not to the attempt. A send that fails and is
   // tried again reuses it, so the server recognises the retry and returns the entry the
   // first attempt created rather than writing a second one (MS-2).
@@ -1062,19 +1202,28 @@ function Composer({
   async function submit(event: React.FormEvent) {
     event.preventDefault()
     const text = draft.trim()
-    if (!text || sending) return
+    // A photo needs no caption, so an empty draft is a valid send when a file is
+    // chosen. An empty draft with no file is not a message.
+    if ((!text && !chosen) || sending) return
 
     setSending(true)
     try {
-      await onSend(text, clientEntryID)
+      if (chosen) {
+        await onAttach(chosen, clientEntryID, text, setProgress)
+        setChosen(null)
+        if (chooser.current) chooser.current.value = ''
+      } else {
+        await onSend(text, clientEntryID)
+      }
       setDraft('')
       setClientEntryID(crypto.randomUUID())
     } catch (failure) {
-      // The draft and its identifier are kept, so pressing send again is a retry of
-      // the same entry rather than a new one.
+      // The draft, the file and the identifier are all kept, so pressing send again is a
+      // retry of the same entry rather than a new one.
       onError(describe(failure))
     } finally {
       setSending(false)
+      setProgress(-1)
     }
   }
 
@@ -1088,14 +1237,39 @@ function Composer({
           </button>
         </span>
       )}
+      {chosen && (
+        <span className="chosen">
+          {chosen.name}
+          {progress >= 0 ? ` — ${Math.round(progress * 100)}%` : ''}
+          <button
+            type="button"
+            className="link"
+            onClick={() => {
+              setChosen(null)
+              if (chooser.current) chooser.current.value = ''
+            }}
+          >
+            remove
+          </button>
+        </span>
+      )}
+      {/* A plain file input, which is what a browser already knows how to do: a picker,
+          a camera on a phone, and drag and drop, none of it written here. */}
+      <input
+        ref={chooser}
+        type="file"
+        accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime"
+        aria-label="Attach a photo or video"
+        onChange={(event) => setChosen(event.target.files?.[0] ?? null)}
+      />
       <input
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
-        placeholder="Message"
+        placeholder={chosen ? 'Caption (optional)' : 'Message'}
         aria-label="Message"
         autoFocus
       />
-      <button type="submit" disabled={sending || draft.trim() === ''}>
+      <button type="submit" disabled={sending || (draft.trim() === '' && !chosen)}>
         Send
       </button>
     </form>

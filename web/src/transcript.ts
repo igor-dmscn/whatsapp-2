@@ -25,6 +25,11 @@ export type Message = {
    *  amount of later editing can bring content back — the server refuses it. */
   retracted: boolean
   replyTo: number
+  /** attachmentID is the photo or video this message carries, empty for none.
+   *
+   *  Survives an edit, because an edit changes what a message says and not what it
+   *  carries — and a retraction clears it, because a withdrawn message shows nothing. */
+  attachmentID: string
 }
 
 /**
@@ -50,6 +55,11 @@ export function resolve(entries: Entry[]): Message[] {
     if (amendment.kind === 'retraction') {
       message.retracted = true
       message.text = ''
+      // The reference goes with the text. The attachment itself is not deleted — the
+      // original is retained (MD-5) — but a withdrawn message shows nothing, and
+      // leaving the photo on screen under the word "deleted" would be worse than
+      // either alternative.
+      message.attachmentID = ''
       return
     }
     message.text = decodeBody(amendment.body)
@@ -66,6 +76,7 @@ export function resolve(entries: Entry[]): Message[] {
         edited: false,
         retracted: false,
         replyTo: entry.reply_to ?? 0,
+        attachmentID: entry.attachment_id ?? '',
       }
       messages.set(entry.sequence, message)
 

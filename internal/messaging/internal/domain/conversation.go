@@ -126,6 +126,7 @@ func (c *Conversation) Append(
 	clientEntryID ClientEntryID,
 	payload Payload,
 	replyTo Sequence,
+	attachmentID AttachmentID,
 	now time.Time,
 ) (*Entry, error) {
 	if err := c.mayWrite(author); err != nil {
@@ -146,7 +147,8 @@ func (c *Conversation) Append(
 	}
 
 	sequence := c.head.Next()
-	entry, err := newEntry(entryID, c.id, sequence, author.AccountID(), clientEntryID, KindMessage, payload, 0, replyTo, now)
+	entry, err := newEntry(entryID, c.id, sequence, author.AccountID(), clientEntryID,
+		KindMessage, payload, 0, replyTo, attachmentID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -250,8 +252,12 @@ func (c *Conversation) amend(
 	now time.Time,
 ) (*Entry, error) {
 	sequence := c.head.Next()
+	// No attachment: an amendment changes what an entry says, not what it carries.
+	// Editing a photo's caption leaves the photo where it is, and retracting the entry
+	// takes the caption away while the attachment stops being referenced.
 	entry, err := newEntry(
-		entryID, c.id, sequence, actor.AccountID(), clientEntryID, kind, payload, target.Sequence(), 0, now)
+		entryID, c.id, sequence, actor.AccountID(), clientEntryID, kind, payload,
+		target.Sequence(), 0, "", now)
 	if err != nil {
 		return nil, err
 	}

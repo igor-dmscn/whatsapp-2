@@ -82,6 +82,16 @@ func (h *Hub) dispatch(ctx context.Context, message *redis.Message) {
 			return
 		}
 
+		if envelope.Type == "attachment" {
+			var attachment broadcast.AttachmentMessage
+			if err := json.Unmarshal([]byte(message.Payload), &attachment); err != nil {
+				h.logger.Warn("decode attachment change", slog.Any("error", err))
+				return
+			}
+			h.deliverAttachment(attachment)
+			return
+		}
+
 		if envelope.Type == "reaction" {
 			var reaction broadcast.ReactionMessage
 			if err := json.Unmarshal([]byte(message.Payload), &reaction); err != nil {
@@ -172,6 +182,43 @@ func (h *Hub) deliverReaction(message broadcast.ReactionMessage) {
 	encoded, err := json.Marshal(message)
 	if err != nil {
 		h.logger.Error("encode reaction frame", slog.Any("error", err))
+		return
+	}
+	for _, connection := range targets {
+		connection.Send(encoded)
+	}
+}
+
+// deliverAttachment tells every local connection following the conversation to look
+// at an attachment again.
+//
+// No visibility check, and that is a decision rather than an omission. Readiness is a
+// fact about an attachment, which has no position in the log, so there is no sequence
+// to check against a join point. What a connection outside the attachment's visibility
+// learns is one opaque identifier — and if it acts on it, the fetch is refused, because
+// Media asks Messaging whether the entry referencing that attachment is visible to the
+// asker. The authorisation lives on the read, where it can be exact.
+func (h *Hub) deliverAttachment(message broadcast.AttachmentMessage) {
+	conversationID := domain.ConversationID(message.ConversationID)
+
+	h.mutex.RLock()
+	targets := make([]*Connection, 0, 8)
+	for _, connections := range h.connections {
+		for connection := range connections {
+			if connection.alreadySees(conversationID) {
+				targets = append(targets, connection)
+			}
+		}
+	}
+	h.mutex.RUnlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		h.logger.Error("encode attachment frame", slog.Any("error", err))
 		return
 	}
 	for _, connection := range targets {

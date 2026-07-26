@@ -511,3 +511,81 @@ aside {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* --- attachments (phase 7) --- */
+
+.attachment {
+  display: block;
+  margin: 0.2rem 0;
+}
+
+.attachment.photo {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+}
+
+/* A thumbnail bounded in CSS as well as by the variant's own size, so a transcript
+   stays readable while a wide photo is still loading. */
+.attachment.photo img {
+  max-width: 12rem;
+  max-height: 12rem;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.attachment.photo.open img {
+  max-width: 100%;
+  max-height: 60vh;
+  object-fit: contain;
+}
+
+.attachment.video {
+  max-width: 20rem;
+  border-radius: 6px;
+}
+
+.attachment.pending,
+.attachment.failed,
+.attachment.unavailable {
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+.attachment.failed {
+  color: #b45309;
+}
+
+.spinner {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  margin-right: 0.3rem;
+  border: 2px solid #d1d5db;
+  border-top-color: #6b7280;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.chosen {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  width: 100%;
+  font-size: 0.8rem;
+  color: #6b7280;
+}
+
+/* The file input is wide by default and would push the message box off the row. */
+.composer input[type='file'] {
+  flex: 0 0 auto;
+  max-width: 9rem;
+  font-size: 0.75rem;
+}

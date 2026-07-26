@@ -64,6 +64,10 @@ type BroadcastMessage struct {
 	// carrying the body was meant to avoid.
 	TargetSequence int64 `json:"target_sequence,omitempty"`
 	ReplyTo        int64 `json:"reply_to,omitempty"`
+	// AttachmentID travels with the broadcast for the same reason the body does: a
+	// live recipient must be able to render a placeholder immediately, and discovering
+	// the reference would otherwise cost a fetch of an entry it already has.
+	AttachmentID string `json:"attachment_id,omitempty"`
 }
 
 // ReactionMessage is the wire form of a reaction on the ephemeral path.
@@ -83,6 +87,21 @@ type ReactionMessage struct {
 	Emoji          string    `json:"emoji"`
 	Removed        bool      `json:"removed"`
 	CreatedAt      time.Time `json:"created_at"`
+}
+
+// AttachmentMessage tells clients an attachment changed and carries no state.
+//
+// Deliberately only "look again": readiness is a fact about an attachment, not about a
+// position in the log, and a frame carrying variant URLs would be stale the moment they
+// expire. The client re-fetches, which it must do anyway to obtain those URLs.
+//
+// On the conversation's channel, like an entry, so no new subscription is needed. It
+// has no sequence, which means the hub cannot apply its per-connection visibility check
+// — see deliverAttachment for why that is safe.
+type AttachmentMessage struct {
+	Type           string `json:"type"`
+	ConversationID string `json:"conversation_id"`
+	AttachmentID   string `json:"attachment_id"`
 }
 
 // ControlMessage tells a node something about an account rather than a
@@ -107,6 +126,7 @@ func (b *RedisBroadcaster) BroadcastEntry(ctx context.Context, entry *domain.Ent
 		CreatedAt:      entry.CreatedAt(),
 		TargetSequence: int64(entry.Target()),
 		ReplyTo:        int64(entry.ReplyTo()),
+		AttachmentID:   string(entry.AttachmentID()),
 	})
 	if err != nil {
 		return fmt.Errorf("encode entry broadcast: %w", err)
@@ -134,6 +154,27 @@ func (b *RedisBroadcaster) BroadcastReaction(ctx context.Context, reaction domai
 
 	if err := b.client.Publish(ctx, entriesChannel(reaction.ConversationID), encoded).Err(); err != nil {
 		return fmt.Errorf("publish reaction: %w", err)
+	}
+	return nil
+}
+
+// AttachmentChanged is how Media reaches connected clients.
+//
+// Media does not publish here itself: it would have to know this package's channel
+// names, and a shared string is a coupling with no compiler to notice when it breaks.
+// So Messaging owns the fanout and Media asks for it through a port.
+func (b *RedisBroadcaster) AttachmentChanged(ctx context.Context, conversationID, attachmentID string) error {
+	encoded, err := json.Marshal(AttachmentMessage{
+		Type:           "attachment",
+		ConversationID: conversationID,
+		AttachmentID:   attachmentID,
+	})
+	if err != nil {
+		return fmt.Errorf("encode attachment broadcast: %w", err)
+	}
+
+	if err := b.client.Publish(ctx, entriesChannel(domain.ConversationID(conversationID)), encoded).Err(); err != nil {
+		return fmt.Errorf("publish attachment change: %w", err)
 	}
 	return nil
 }

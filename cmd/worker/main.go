@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"comms/internal/media"
 	"comms/internal/messaging"
 	"comms/internal/platform/config"
 	"comms/internal/platform/database"
@@ -23,6 +24,21 @@ import (
 	"comms/internal/platform/logging"
 	"comms/internal/platform/outbox"
 )
+
+// storeConfig is where attachment bytes live.
+//
+// One endpoint and one static key: MinIO in development, and the same code against S3
+// in a deployment that sets these differently. No credential provider chain, because
+// there is one credential.
+func storeConfig() media.Config {
+	return media.Config{
+		Endpoint:  config.EnvOr("S3_ENDPOINT", "http://localhost:9000"),
+		Bucket:    config.EnvOr("S3_BUCKET", "comms-attachments"),
+		Region:    config.EnvOr("S3_REGION", "us-east-1"),
+		AccessKey: config.MustEnv("S3_ACCESS_KEY"),
+		SecretKey: config.MustEnv("S3_SECRET_KEY"),
+	}
+}
 
 func main() {
 	logger := logging.New("worker")
@@ -72,6 +88,27 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 
+	attachments, err := media.OpenStore(ctx, storeConfig())
+	if err != nil {
+		return err
+	}
+
+	// Redis, not Kafka, for telling clients an attachment is ready. The only purpose of
+	// that message is to reach an open socket, Redis is already the socket fanout
+	// (ADR-0005), and readiness is recoverable — a client that misses it discovers the
+	// change the next time it renders. A durable event would be a promise nothing needs.
+	redisClient, err := messaging.OpenRedis(ctx, config.EnvOr("REDIS_URL", "redis://localhost:6379"))
+	if err != nil {
+		return err
+	}
+	defer redisClient.Close()
+
+	processing, err := media.NewProcessing(
+		db, attachments, messaging.NewNotifier(redisClient), brokers, logger)
+	if err != nil {
+		return err
+	}
+
 	relay := outbox.NewRelay(db, producer, logger)
 
 	// The relay and the projections are independent: the relay moves rows to Kafka
@@ -79,7 +116,7 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// convenience, not a coupling — either could be its own binary the moment one of
 	// them needs to scale separately from the other.
 	var running sync.WaitGroup
-	running.Add(2)
+	running.Add(3)
 
 	go func() {
 		defer running.Done()
@@ -88,6 +125,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	go func() {
 		defer running.Done()
 		projections.Run(ctx)
+	}()
+	// Its own consumer group, so that deriving variants from a large photo does not
+	// hold up the projections that unread badges depend on.
+	go func() {
+		defer running.Done()
+		processing.Run(ctx)
 	}()
 
 	logger.Info("worker started", slog.Int("partitions", partitions))

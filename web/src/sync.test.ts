@@ -326,3 +326,61 @@ describe('payloads', () => {
     expect(decodeBody(encodeBody(awkward))).toBe(awkward)
   })
 })
+
+describe('attachment changes', () => {
+  it('forwards the identifier and touches nothing about the log', async () => {
+    // The frame says an attachment changed and nothing about how. What must not happen
+    // is the syncer treating it as an entry: no position is filled, so no gap opens.
+    const changed: string[] = []
+    const socket = new FakeSocket()
+    const sync = new Sync({
+      token: async () => 'access-token',
+      open: () => socket,
+      fetchEntries: async () => [],
+      onAttachmentChanged: (attachmentID) => changed.push(attachmentID),
+    })
+
+    sync.start()
+    socket.onopen?.({})
+    await flush()
+    socket.deliver({ type: 'ready', account_id: 'account-1', device_id: 'device-1' })
+    await flush()
+
+    socket.deliver({ type: 'attachment', conversation_id: conversation, attachment_id: 'photo-1' })
+    await flush()
+
+    expect(changed).toEqual(['photo-1'])
+    expect(sync.getSnapshot().conversations.get(conversation) ?? []).toHaveLength(0)
+
+    sync.stop()
+  })
+
+  it('carries the reference on a live entry', async () => {
+    // Without this a live photo renders as a message with no attachment until the next
+    // fetch — the sort of difference between live and refetched state that is very hard
+    // to notice and very easy to ship.
+    const test = harness()
+    await connected(test)
+
+    test.socket.deliver({
+      type: 'entry',
+      conversation_id: conversation,
+      entry_id: 'entry-1',
+      sequence: 1,
+      author_id: 'account-1',
+      client_entry_id: 'client-1',
+      kind: 'message',
+      content_type: 'text/plain; charset=utf-8',
+      body: '',
+      created_at: '2026-01-01T00:00:00.000Z',
+      attachment_id: 'photo-1',
+    })
+    await flush()
+
+    const held = test.sync.getSnapshot().conversations.get(conversation) ?? []
+    expect(held).toHaveLength(1)
+    expect(held[0]!.attachment_id).toBe('photo-1')
+
+    test.sync.stop()
+  })
+})

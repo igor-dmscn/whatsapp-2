@@ -96,7 +96,7 @@ describe.skipIf(!live)('two people, two nodes', () => {
   it('delivers a message live across nodes', async () => {
     await alice.page.getByLabel('Handle to message').fill(bob.handle)
     await alice.page.getByRole('button', { name: 'Start' }).click()
-    await alice.page.waitForSelector('.composer input', { timeout })
+    await alice.page.waitForSelector(composerText, { timeout })
 
     await send(alice.page, 'hello from alice')
 
@@ -217,17 +217,23 @@ async function join_(browser: Browser, url: string, handle: string): Promise<Per
   return { context, page, handle }
 }
 
+/** composerText is the message box.
+ *
+ *  Located by container *and* by not being the file input. Two rules rather than one,
+ *  because each has already been wrong on its own: the label "Message" is a substring of
+ *  the start-a-conversation field's, and `.composer input` matched the attach control the
+ *  moment phase 7 added one — breaking every send in this file at once. */
+const composerText = '.composer input:not([type=file])'
+
 async function send(page: Page, text: string): Promise<void> {
-  // Located by container rather than by label: "Message" is a substring of the
-  // start-a-conversation field's label too, and a selector that matches two
-  // different inputs will eventually pick the wrong one.
-  await page.locator('.composer input').fill(text)
+  await page.locator(composerText).fill(text)
   await page.getByRole('button', { name: 'Send' }).click()
   // The composer clears only after the server has assigned a position, so this
   // waits for the send to have actually happened.
   await page.waitForFunction(
-    () => (document.querySelector<HTMLInputElement>('.composer input')?.value ?? 'x') === '',
-    undefined,
+    (selector: string) =>
+      (document.querySelector<HTMLInputElement>(selector)?.value ?? 'x') === '',
+    composerText,
     { timeout },
   )
 }
@@ -410,7 +416,7 @@ describe.skipIf(!live)('badges and ticks', () => {
 async function start(person: Person, handle: string): Promise<string> {
   await person.page.getByLabel('Handle to message').fill(handle)
   await person.page.getByRole('button', { name: 'Start' }).click()
-  await person.page.waitForSelector('.composer input', { timeout })
+  await person.page.waitForSelector(composerText, { timeout })
   await person.page.waitForSelector('.conversations button.selected', { timeout })
 
   const id = await person.page
@@ -797,7 +803,7 @@ describe.skipIf(!live)('local persistence and search', () => {
     let sentText = ''
     try {
       sentText = `sent while offline ${unique}`
-      await person.page.locator('.composer input').fill(sentText)
+      await person.page.locator(composerText).fill(sentText)
       await person.page.getByRole('button', { name: 'Send' }).click()
 
       // The send fails, and the failure is reported. What matters is what happens
@@ -886,3 +892,244 @@ describe.skipIf(!live)('local persistence and search', () => {
     }
   }, timeout * 4)
 })
+
+// Phase 7: photos and video. Two browsers again, because the interesting part is the
+// recipient's placeholder becoming a thumbnail without them doing anything.
+describe.skipIf(!live)('attachments', () => {
+  let browser: Browser
+  let sender: Person
+  let recipient: Person
+
+  beforeAll(async () => {
+    const { chromium } = await import('playwright-core')
+    browser = await chromium.launch({ headless: true, executablePath: chromiumPath() })
+
+    sender = await join_(browser, nodeAURL, `mira${unique}`)
+    recipient = await join_(browser, nodeBURL, `nadia${unique}`)
+    await start(sender, recipient.handle)
+    await recipient.page.waitForSelector('.conversations button', { timeout })
+    await recipient.page.click('.conversations button')
+  }, timeout * 3)
+
+  afterAll(async () => {
+    await browser?.close()
+  })
+
+  /** attach chooses a file built in the page and sends it with the given caption. */
+  async function attach(page: Page, name: string, mimeType: string, bytes: Buffer, caption: string) {
+    await page.setInputFiles('.composer input[type=file]', { name, mimeType, buffer: bytes })
+    if (caption) await page.locator(composerText).fill(caption)
+    await page.getByRole('button', { name: 'Send' }).click()
+  }
+
+  it('shows a photo to both sides, pending first and then as a thumbnail', async () => {
+    await attach(sender.page, 'holiday.png', 'image/png', photoBytes(), 'look at this')
+
+    // The message is readable before the photo is displayable. This is MD-1, and it is
+    // the reason the entry and the attachment are decoupled at all — a 90 MB video must
+    // not hold up the sentence next to it.
+    await recipient.page.waitForFunction(
+      () => document.querySelector('.transcript li:last-child .body')?.textContent === 'look at this',
+      undefined,
+      { timeout },
+    )
+
+    // Then the worker derives the variants and the placeholder becomes a thumbnail,
+    // pushed rather than polled — the recipient does nothing.
+    await recipient.page.waitForSelector('.transcript li:last-child .attachment.photo img', { timeout })
+
+    const size = await recipient.page.evaluate(() => {
+      const image = document.querySelector<HTMLImageElement>('.transcript li:last-child .attachment img')
+      return { width: image?.naturalWidth ?? 0, complete: image?.complete ?? false }
+    })
+    // Loaded from the object store with a signed URL and no credentials, which is the
+    // whole delivery path: the bytes never touched api in either direction.
+    if (!size.complete || size.width === 0) throw new Error('the thumbnail did not load')
+    if (size.width > 320) throw new Error(`the thumbnail is ${size.width}px wide, want at most 320`)
+
+    // And the sender sees their own the same way.
+    await sender.page.waitForSelector('.transcript li:last-child .attachment.photo img', { timeout })
+  }, timeout * 3)
+
+  it('opens the larger rendition on demand', async () => {
+    // A transcript shows thumbnails; opening one shows the bounded display copy. Both
+    // exist so that neither the list nor the full view fetches the original.
+    await recipient.page.locator('.transcript li:last-child .attachment.photo').click()
+
+    // Waited on the *decoded* size rather than on the src changing: a swapped src is
+    // not yet a loaded image, and measuring one mid-load reads zero. That is what the
+    // first version of this test asserted, and it failed for the wrong reason.
+    await recipient.page.waitForFunction(
+      () => {
+        const image = document.querySelector<HTMLImageElement>(
+          '.transcript li:last-child .attachment img',
+        )
+        return (image?.complete ?? false) && (image?.naturalWidth ?? 0) > 320
+      },
+      undefined,
+      { timeout },
+    )
+  }, timeout * 2)
+
+  it('sends a photo with no caption', async () => {
+    // An empty message is a client bug; a photo with no caption is not. The attachment
+    // is what makes the entry legitimate, which is a server-side rule this exercises.
+    const before = await sender.page.locator('.transcript li').count()
+
+    await attach(sender.page, 'quiet.png', 'image/png', photoBytes(), '')
+
+    await sender.page.waitForFunction(
+      (want: number) => document.querySelectorAll('.transcript li').length === want,
+      before + 1,
+      { timeout },
+    )
+    await sender.page.waitForSelector('.transcript li:last-child .attachment.photo img', { timeout })
+  }, timeout * 3)
+
+  it('plays a video from the retained original, with no variants', async () => {
+    // Video keeps the same lifecycle as a photo — pending, then ready — so a client has
+    // one shape of state to handle. What it does not get is derived renditions: that
+    // needs a transcoder. See docs/plan.md phase 7.
+    await attach(sender.page, 'clip.mp4', 'video/mp4', Buffer.alloc(4096, 7), 'a clip')
+
+    await recipient.page.waitForSelector('.transcript li:last-child video.attachment', { timeout })
+    const source = await recipient.page.evaluate(
+      () => document.querySelector<HTMLVideoElement>('.transcript li:last-child video')?.src ?? '',
+    )
+    // The original, signed, straight from the object store.
+    if (!source.includes('X-Amz-Signature')) throw new Error(`video src is not a signed URL: ${source}`)
+  }, timeout * 3)
+
+  it('refuses an attachment over the limit before transferring it', async () => {
+    // MD-4 through the interface. Nothing is uploaded: the request that would have
+    // authorised the transfer is refused, so there is no signed URL and no transfer.
+    const refusal = await sender.page.evaluate(async () => {
+      const session = JSON.parse(sessionStorage.getItem('comms.session')!)
+      const conversation = document
+        .querySelector('.conversations button.selected')
+        ?.getAttribute('data-conversation')
+
+      const started = Date.now()
+      const response = await fetch('/v1/attachments', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${session.access_token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          conversation_id: conversation,
+          content_type: 'video/mp4',
+          // 101 MB, declared. One JSON field rather than a hundred megabytes on the
+          // wire, which is exactly the point of declaring the size up front.
+          byte_size: 101 * 1024 * 1024,
+        }),
+      })
+      return { status: response.status, body: await response.json(), elapsed: Date.now() - started }
+    })
+
+    if (refusal.status !== 413) throw new Error(`got ${refusal.status}, want 413`)
+    if (refusal.body?.error?.code !== 'attachment_too_large') {
+      throw new Error(`got code ${refusal.body?.error?.code}`)
+    }
+    // A hundred megabytes could not have been transferred in this time, which is the
+    // assertion "rejected before the body is read" reduces to from outside.
+    if (refusal.elapsed > 2000) throw new Error(`the refusal took ${refusal.elapsed}ms`)
+  }, timeout)
+
+  it('shows an attachment that could not be processed as such', async () => {
+    // Declared as a photo, and is not one. The store enforces the declared type and
+    // length, not that the bytes decode — so this is the failure a real user hits when
+    // something goes wrong with their file, and it must not be a spinner forever.
+    await attach(sender.page, 'broken.png', 'image/png', Buffer.from('not a photo at all'), 'this one is broken')
+
+    await sender.page.waitForSelector('.transcript li:last-child .attachment.failed', { timeout })
+    // And the message itself still reads.
+    await sender.page.waitForFunction(
+      () => document.querySelector('.transcript li:last-child .body')?.textContent === 'this one is broken',
+      undefined,
+      { timeout },
+    )
+  }, timeout * 3)
+})
+
+/** photoBytes returns a small PNG that decodes to something with detail in it.
+ *
+ *  Built here rather than committed as a fixture: a binary blob in the repository is a
+ *  thing nobody can read, and what matters about this file is only its dimensions. */
+function photoBytes(): Buffer {
+  const width = 600
+  const height = 400
+
+  // A minimal PNG written by hand: IHDR, one IDAT of stored (uncompressed) deflate
+  // blocks, IEND. Stored blocks mean no compressor is needed, which keeps this to
+  // arithmetic rather than a dependency.
+  const raw = Buffer.alloc((width * 3 + 1) * height)
+  for (let y = 0; y < height; y++) {
+    const row = y * (width * 3 + 1)
+    raw[row] = 0 // no filter
+    for (let x = 0; x < width; x++) {
+      raw[row + 1 + x * 3] = x % 256
+      raw[row + 2 + x * 3] = y % 256
+      raw[row + 3 + x * 3] = 128
+    }
+  }
+
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr(width, height)),
+    chunk('IDAT', zlibStored(raw)),
+    chunk('IEND', Buffer.alloc(0)),
+  ])
+}
+
+function ihdr(width: number, height: number): Buffer {
+  const body = Buffer.alloc(13)
+  body.writeUInt32BE(width, 0)
+  body.writeUInt32BE(height, 4)
+  body[8] = 8 // bit depth
+  body[9] = 2 // truecolour
+  return body
+}
+
+function chunk(type: string, body: Buffer): Buffer {
+  const header = Buffer.alloc(4)
+  header.writeUInt32BE(body.length, 0)
+  const typed = Buffer.concat([Buffer.from(type, 'ascii'), body])
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(typed), 0)
+  return Buffer.concat([header, typed, crc])
+}
+
+/** zlibStored wraps bytes in a zlib stream of stored deflate blocks. */
+function zlibStored(body: Buffer): Buffer {
+  const blocks: Buffer[] = []
+  const limit = 65535
+  for (let offset = 0; offset < body.length; offset += limit) {
+    const slice = body.subarray(offset, Math.min(offset + limit, body.length))
+    const header = Buffer.alloc(5)
+    header[0] = offset + limit >= body.length ? 1 : 0
+    header.writeUInt16LE(slice.length, 1)
+    header.writeUInt16LE(~slice.length & 0xffff, 3)
+    blocks.push(header, slice)
+  }
+
+  const adler = Buffer.alloc(4)
+  adler.writeUInt32BE(adler32(body), 0)
+  return Buffer.concat([Buffer.from([0x78, 0x01]), ...blocks, adler])
+}
+
+function crc32(bytes: Buffer): number {
+  let crc = 0xffffffff
+  for (const byte of bytes) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit++) crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function adler32(bytes: Buffer): number {
+  let low = 1
+  let high = 0
+  for (const byte of bytes) {
+    low = (low + byte) % 65521
+    high = (high + low) % 65521
+  }
+  return ((high << 16) | low) >>> 0
+}

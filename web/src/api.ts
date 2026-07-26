@@ -95,6 +95,51 @@ export type Entry = {
   target_sequence?: number
   /** reply_to is the position this entry replies to, absent for none. */
   reply_to?: number
+  /** attachment_id is the photo or video this entry carries, absent for none.
+   *
+   *  An identifier only. Whether it is ready is fetched separately, which is what lets
+   *  a message carrying a 90 MB video be readable the instant it arrives (MD-1). */
+  attachment_id?: string
+}
+
+/** AttachmentState is where an attachment is in its lifecycle.
+ *
+ *  Three states before it can be shown, and they mean different things to a viewer:
+ *  pending is still uploading, uploaded is waiting for a thumbnail, failed will never
+ *  have one. */
+export type AttachmentState = 'pending' | 'uploaded' | 'ready' | 'failed'
+
+export type Variant = {
+  name: 'thumbnail' | 'display' | string
+  content_type: string
+  url: string
+  width: number
+  height: number
+  byte_size: number
+}
+
+export type Attachment = {
+  id: string
+  conversation_id: string
+  owner_id: string
+  content_type: string
+  byte_size: number
+  state: AttachmentState
+  failure?: string
+  original_url?: string
+  variants: Variant[]
+  /** expires_at is when the URLs above stop working. Signed and short-lived, so a
+   *  client that holds one for an hour re-fetches rather than showing a broken image. */
+  expires_at: string
+  created_at: string
+}
+
+type UploadTarget = {
+  attachment_id: string
+  url: string
+  method: string
+  headers: Record<string, string>
+  expires_at: string
 }
 
 export type Reaction = {
@@ -391,7 +436,13 @@ export class Client {
    * with the sequence it already has — which is what makes retrying a send safe
    * when the response was lost rather than the request.
    */
-  send(conversationID: string, clientEntryID: string, text: string, replyTo = 0): Promise<Entry> {
+  send(
+    conversationID: string,
+    clientEntryID: string,
+    text: string,
+    replyTo = 0,
+    attachmentID = '',
+  ): Promise<Entry> {
     return this.authorized<Entry>(`/v1/conversations/${conversationID}/entries`, {
       method: 'POST',
       body: JSON.stringify({
@@ -399,7 +450,87 @@ export class Client {
         content_type: textContentType,
         body: encodeBody(text),
         reply_to: replyTo,
+        attachment_id: attachmentID,
       }),
     })
+  }
+
+  /**
+   * attach uploads a file and returns the attachment identifier to reference it by.
+   *
+   * Three steps, and the middle one does not touch the api: the bytes go straight to
+   * the object store with a signed URL, so a hundred megabytes never passes through the
+   * server. That is the whole reason for the round trip before it.
+   *
+   * The identifier is returned as soon as the upload completes, not when the attachment
+   * is ready — the caller sends its message immediately and the photo appears when it
+   * has been processed (MD-1).
+   */
+  async attach(conversationID: string, file: File, onProgress?: (fraction: number) => void): Promise<string> {
+    const contentType = file.type || 'application/octet-stream'
+
+    const target = await this.authorized<UploadTarget>('/v1/attachments', {
+      method: 'POST',
+      body: JSON.stringify({
+        conversation_id: conversationID,
+        content_type: contentType,
+        // Declared before anything is sent, and signed into the URL. A client that
+        // lies is refused by the store, not by the api (MD-4).
+        byte_size: file.size,
+      }),
+    })
+
+    await this.transfer(target, file, contentType, onProgress)
+
+    await this.authorized<{ state: string }>(
+      `/v1/attachments/${target.attachment_id}/completion`, { method: 'POST' })
+
+    return target.attachment_id
+  }
+
+  /**
+   * transfer PUTs the bytes to the store.
+   *
+   * XMLHttpRequest rather than fetch, and only for this: upload progress. A request
+   * body stream is the fetch equivalent and is still not available everywhere, while a
+   * hundred-megabyte upload with no progress bar looks broken.
+   *
+   * No credentials are attached, deliberately — the signature is the authorisation, and
+   * sending a bearer token to the object store would leak it there.
+   */
+  private transfer(
+    target: UploadTarget,
+    file: File,
+    contentType: string,
+    onProgress?: (fraction: number) => void,
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest()
+      request.open(target.method, target.url)
+      // Content-Length is set by the browser from the body and cannot be set here;
+      // it matches file.size, which is what was signed.
+      request.setRequestHeader('Content-Type', contentType)
+
+      request.upload.addEventListener('progress', (event) => {
+        if (event.lengthComputable) onProgress?.(event.loaded / event.total)
+      })
+      request.addEventListener('load', () => {
+        if (request.status >= 200 && request.status < 300) {
+          resolve()
+          return
+        }
+        // The store's refusals are XML, and the status is what distinguishes a
+        // signature mismatch from an expired URL. Both mean: ask for another.
+        reject(new ApiError(request.status, 'upload_refused', 'the store refused the upload'))
+      })
+      request.addEventListener('error', () =>
+        reject(new ApiError(0, 'upload_failed', 'the upload could not be completed')))
+      request.send(file)
+    })
+  }
+
+  /** attachment returns an attachment's state and freshly signed URLs. */
+  attachment(attachmentID: string): Promise<Attachment> {
+    return this.authorized<Attachment>(`/v1/attachments/${attachmentID}`)
   }
 }

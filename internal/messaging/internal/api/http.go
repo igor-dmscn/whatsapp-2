@@ -105,6 +105,10 @@ type sendRequest struct {
 	// ReplyTo is the position this entry replies to, zero for none. A reference
 	// field and nothing more (ADR-0008).
 	ReplyTo int64 `json:"reply_to"`
+	// AttachmentID is a photo or video this entry carries, empty for none. An
+	// identifier only: whether it has finished uploading is Media's business, and an
+	// entry referencing one still pending is readable now (MD-1).
+	AttachmentID string `json:"attachment_id"`
 }
 
 type reviseRequest struct {
@@ -207,6 +211,10 @@ type entryResponse struct {
 	// which is the degradation ADR-0008 requires.
 	TargetSequence int64 `json:"target_sequence,omitempty"`
 	ReplyTo        int64 `json:"reply_to,omitempty"`
+	// AttachmentID is the photo or video this entry carries, absent for none. The
+	// client fetches its state and URLs separately, which is what lets the entry be
+	// delivered before the attachment is ready.
+	AttachmentID string `json:"attachment_id,omitempty"`
 }
 
 func newEntryResponse(entry *domain.Entry) entryResponse {
@@ -222,6 +230,7 @@ func newEntryResponse(entry *domain.Entry) entryResponse {
 		CreatedAt:      entry.CreatedAt(),
 		TargetSequence: int64(entry.Target()),
 		ReplyTo:        int64(entry.ReplyTo()),
+		AttachmentID:   string(entry.AttachmentID()),
 	}
 }
 
@@ -383,6 +392,7 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request) {
 	entry, err := h.service.Send(
 		r.Context(), conversationID, domain.AccountID(accountID),
 		request.ClientEntryID, request.ContentType, body, domain.Sequence(request.ReplyTo),
+		domain.AttachmentID(request.AttachmentID),
 	)
 	if err != nil {
 		h.writeDomainError(w, r, err)

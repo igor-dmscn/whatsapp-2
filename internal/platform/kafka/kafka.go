@@ -40,10 +40,19 @@ const (
 	// TopicIdentityEvents carries account, device and session facts. Messaging
 	// consumes device revocation from here.
 	TopicIdentityEvents = "identity.events"
+	// TopicMediaAttachments carries uploads awaiting processing.
+	//
+	// This one is a work queue rather than a stream of facts other contexts observe,
+	// which is why it is on its own topic: a thirty-second video occupies a consumer
+	// for as long as it takes to decode, and behind entries on a shared topic that
+	// would delay every unread badge in the system.
+	TopicMediaAttachments = "media.attachments"
 )
 
 // AllTopics is what EnsureTopics creates.
-var AllTopics = []string{TopicMessagingEntries, TopicMessagingReceipts, TopicIdentityEvents}
+var AllTopics = []string{
+	TopicMessagingEntries, TopicMessagingReceipts, TopicIdentityEvents, TopicMediaAttachments,
+}
 
 // Brokers splits a comma-separated broker list.
 func Brokers(configured string) []string {

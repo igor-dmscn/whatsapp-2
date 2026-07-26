@@ -142,8 +142,8 @@ func (r *ConversationRepository) AppendEntry(
 		}
 
 		_, err = r.db.ExecContext(ctx,
-			`INSERT INTO entries (id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			`INSERT INTO entries (id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, attachment_id, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 			string(entry.ID()), string(entry.ConversationID()), int64(entry.Sequence()),
 			string(entry.AuthorID()), string(entry.ClientEntryID()), string(entry.Kind()),
 			// body is NOT NULL, and a retraction has none. Zero bytes rather than
@@ -153,6 +153,9 @@ func (r *ConversationRepository) AppendEntry(
 			// NULL rather than zero for "none": a zero sequence would be a position,
 			// and the partial index on target_sequence exists to skip these rows.
 			nullableSequence(entry.Target()), nullableSequence(entry.ReplyTo()),
+			// NULL for "no attachment", so the partial index skips the overwhelming
+			// majority of entries.
+			nullableID(entry.AttachmentID()),
 			entry.CreatedAt(),
 		)
 		if err != nil {
@@ -314,7 +317,7 @@ func (r *EntryRepository) Range(
 	limit int,
 ) ([]*domain.Entry, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, created_at
+		`SELECT id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, attachment_id, created_at
 		   FROM entries
 		  WHERE conversation_id = $1 AND sequence >= $2 AND sequence <= $3
 		  ORDER BY sequence
@@ -347,7 +350,7 @@ func (r *EntryRepository) ByClientEntryID(
 	clientEntryID domain.ClientEntryID,
 ) (*domain.Entry, error) {
 	entry, err := scanEntry(r.db.QueryRowContext(ctx,
-		`SELECT id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, created_at
+		`SELECT id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, attachment_id, created_at
 		   FROM entries
 		  WHERE conversation_id = $1 AND author_id = $2 AND client_entry_id = $3`,
 		string(conversationID), string(authorID), string(clientEntryID),
@@ -370,6 +373,15 @@ func storedBody(payload domain.Payload) []byte {
 }
 
 // nullableSequence maps a zero sequence to NULL.
+// nullableID is NULL for an empty reference, so the partial index on attachment_id
+// covers only the entries that have one.
+func nullableID(id domain.AttachmentID) any {
+	if id == "" {
+		return nil
+	}
+	return string(id)
+}
+
 func nullableSequence(sequence domain.Sequence) any {
 	if sequence == 0 {
 		return nil
@@ -389,10 +401,11 @@ func scanEntry(row scanner) (*domain.Entry, error) {
 		body           []byte
 		target         sql.NullInt64
 		replyTo        sql.NullInt64
+		attachmentID   sql.NullString
 		createdAt      time.Time
 	)
 	if err := row.Scan(&id, &conversationID, &sequence, &authorID, &clientEntryID, &kind,
-		&contentType, &body, &target, &replyTo, &createdAt); err != nil {
+		&contentType, &body, &target, &replyTo, &attachmentID, &createdAt); err != nil {
 		return nil, err
 	}
 
@@ -403,8 +416,35 @@ func scanEntry(row scanner) (*domain.Entry, error) {
 
 	return domain.ReconstituteEntry(
 		id, conversationID, domain.Sequence(sequence), authorID, clientEntryID, kind, payload,
-		domain.Sequence(target.Int64), domain.Sequence(replyTo.Int64), createdAt,
+		domain.Sequence(target.Int64), domain.Sequence(replyTo.Int64),
+		domain.AttachmentID(attachmentID.String), createdAt,
 	), nil
+}
+
+// ByAttachment returns the entry carrying an attachment.
+//
+// Scoped to the conversation as well as the attachment, so that a caller cannot use a
+// stolen attachment identifier to discover which conversation it belongs to.
+func (r *EntryRepository) ByAttachment(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	attachmentID domain.AttachmentID,
+) (*domain.Entry, error) {
+	entry, err := scanEntry(r.db.QueryRowContext(ctx,
+		`SELECT `+entryColumns+`
+		   FROM entries
+		  WHERE conversation_id = $1 AND attachment_id = $2
+		  ORDER BY sequence
+		  LIMIT 1`,
+		string(conversationID), string(attachmentID),
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, domain.ErrEntryNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select entry by attachment: %w", err)
+	}
+	return entry, nil
 }
 
 func (r *EntryRepository) AtSequence(
@@ -456,7 +496,7 @@ func (r *EntryRepository) LatestAmendmentFor(
 // entryColumns is the projection every entry query shares. One constant, because a
 // column added to the table and to scanEntry but forgotten in one query is a runtime
 // scan error rather than a compile error.
-const entryColumns = `id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, created_at`
+const entryColumns = `id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, attachment_id, created_at`
 
 // scanner is what *sql.Row and *sql.Rows have in common.
 type scanner interface {

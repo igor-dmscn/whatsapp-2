@@ -143,3 +143,40 @@ describe('summarise', () => {
     expect(summarise(emptied, 1, 'account-1')).toEqual([])
   })
 })
+
+describe('attachments', () => {
+  it('carries the reference onto the message', () => {
+    const messages = resolve([entry(1, 'message', 'look at this', { attachment_id: 'photo-1' })])
+
+    expect(messages[0]!.attachmentID).toBe('photo-1')
+  })
+
+  it('keeps the attachment through an edit', () => {
+    // An edit changes what a message says, not what it carries. Losing the reference
+    // here would make the photo vanish the moment its caption was corrected.
+    const messages = resolve([
+      entry(1, 'message', 'wrong caption', { attachment_id: 'photo-1' }),
+      entry(2, 'revision', 'right caption', { target_sequence: 1 }),
+    ])
+
+    expect(messages[0]!.text).toBe('right caption')
+    expect(messages[0]!.attachmentID).toBe('photo-1')
+  })
+
+  it('drops the attachment when the message is retracted', () => {
+    // The photo is not deleted from the store — the original is retained — but a
+    // withdrawn message shows nothing, and a photo under the word "deleted" would be
+    // worse than either alternative.
+    const messages = resolve([
+      entry(1, 'message', 'oops', { attachment_id: 'photo-1' }),
+      entry(2, 'retraction', '', { target_sequence: 1 }),
+    ])
+
+    expect(messages[0]!.retracted).toBe(true)
+    expect(messages[0]!.attachmentID).toBe('')
+  })
+
+  it('treats a message with no attachment as carrying none', () => {
+    expect(resolve([entry(1, 'message', 'just text')])[0]!.attachmentID).toBe('')
+  })
+})

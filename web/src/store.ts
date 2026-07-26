@@ -45,6 +45,8 @@ export type Held = {
   body: string
   target_sequence: number
   reply_to: number
+  /** attachment_id is the photo or video this entry carries, empty for none. */
+  attachment_id: string
   created_at: string
 }
 
@@ -100,6 +102,15 @@ const migrations = [
     INSERT INTO entries_fts (entries_fts, rowid, body) VALUES ('delete', old.rowid, old.body);
     INSERT INTO entries_fts (rowid, body) VALUES (new.rowid, new.body);
   END`,
+  // Added as a migration rather than folded into the CREATE TABLE above: a client
+  // upgraded from phase 6 already has a database, and rewriting the schema would
+  // mean discarding what it holds and refetching everything.
+  //
+  // Only the reference is stored. Attachment state and variant URLs are not: the URLs
+  // are signed and expire within the hour, so a cached one is a broken image waiting
+  // to happen. The reference is enough to render a placeholder offline and to know
+  // what to ask about when there is a connection again.
+  `ALTER TABLE entries ADD COLUMN attachment_id TEXT NOT NULL DEFAULT ''`,
   `CREATE TABLE pending (
     client_entry_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, body TEXT NOT NULL,
     reply_to INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
@@ -376,8 +387,8 @@ export class LocalStore {
       for (const entry of entries) {
         this.db.exec({
           sql: `INSERT INTO entries
-                  (conversation_id, sequence, id, author_id, client_entry_id, kind, body, target_sequence, reply_to, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  (conversation_id, sequence, id, author_id, client_entry_id, kind, body, target_sequence, reply_to, attachment_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (conversation_id, sequence) DO NOTHING`,
           bind: [
             entry.conversation_id,
@@ -389,6 +400,7 @@ export class LocalStore {
             entry.body,
             entry.target_sequence,
             entry.reply_to,
+            entry.attachment_id ?? '',
             entry.created_at,
           ],
         })
@@ -447,7 +459,8 @@ export class LocalStore {
 
   entries(conversationID: string): Held[] {
     return this.db.selectObjects(
-      `SELECT conversation_id, sequence, id, author_id, client_entry_id, kind, body, target_sequence, reply_to, created_at
+      `SELECT conversation_id, sequence, id, author_id, client_entry_id, kind, body,
+              target_sequence, reply_to, attachment_id, created_at
          FROM entries WHERE conversation_id = ? ORDER BY sequence`,
       [conversationID],
     ) as Held[]

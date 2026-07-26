@@ -52,6 +52,10 @@ type Module struct {
 	service *app.Service
 	handler *api.Handler
 	hub     *api.Hub
+	// notifier is the same broadcaster the service publishes entries through. Held
+	// separately because Media reaches it directly, without a use case in between:
+	// "look at this attachment again" is not a messaging decision.
+	notifier *broadcast.RedisBroadcaster
 }
 
 // New wires the context.
@@ -63,6 +67,8 @@ func New(
 	options Options,
 	logger *slog.Logger,
 ) *Module {
+	broadcaster := broadcast.NewRedisBroadcaster(redisClient)
+
 	service := app.NewService(
 		postgres.NewConversationRepository(db),
 		postgres.NewMembershipRepository(db),
@@ -70,7 +76,7 @@ func New(
 		postgres.NewInviteRepository(db),
 		postgres.NewReactionStore(db),
 		postgres.NewMemberStateStore(db),
-		broadcast.NewRedisBroadcaster(redisClient),
+		broadcaster,
 		// Events go to the outbox, in the same transaction as the change they
 		// describe (ADR-0003). The relay in cmd/worker publishes them to Kafka, and
 		// the projector consumes them back into the member-state read model.
@@ -84,9 +90,10 @@ func New(
 	hub := api.NewHub(redisClient, logger)
 
 	return &Module{
-		service: service,
-		hub:     hub,
-		handler: api.NewHandler(service, hub, authenticator, api.CallerResolver(caller), options.AllowedOrigins, logger),
+		service:  service,
+		hub:      hub,
+		notifier: broadcaster,
+		handler:  api.NewHandler(service, hub, authenticator, api.CallerResolver(caller), options.AllowedOrigins, logger),
 	}
 }
 
@@ -116,6 +123,54 @@ func (m *Module) DisconnectDevice(deviceID string) {
 // ConnectionCount reports how many sockets this node holds, for health reporting.
 func (m *Module) ConnectionCount() int {
 	return m.hub.ConnectionCount()
+}
+
+// MayAttach reports whether an account may add an attachment to a conversation.
+//
+// Media's port, satisfied here in plain strings so that neither context imports the
+// other. It is the same question as "may this account send here": an attachment is
+// only ever reachable through an entry, so a reader in a channel and a removed member
+// are both refused.
+func (m *Module) MayAttach(ctx context.Context, conversationID, accountID string) (bool, error) {
+	return m.service.MayAttach(ctx, conversationID, accountID) //nolint:wrapcheck // already named where it happened.
+}
+
+// MayView reports whether an account may see an attachment.
+//
+// An attachment is exactly as visible as the entry that references it, which keeps the
+// join-point policy in the one place that owns it: a member who joined at position 40
+// cannot read entry 39 and must not be able to fetch its photo either.
+func (m *Module) MayView(ctx context.Context, conversationID, accountID, attachmentID string) (bool, error) {
+	return m.service.MayView(ctx, conversationID, accountID, attachmentID) //nolint:wrapcheck // already named where it happened.
+}
+
+// AttachmentChanged tells connected clients to look at an attachment again.
+//
+// Satisfied here rather than by Media publishing onto these channels itself, which
+// would mean sharing a channel-name string across a context boundary with no compiler
+// to notice when it drifts.
+func (m *Module) AttachmentChanged(ctx context.Context, conversationID, attachmentID string) error {
+	return m.notifier.AttachmentChanged(ctx, conversationID, attachmentID) //nolint:wrapcheck // already named where it happened.
+}
+
+// Notifier reaches connected clients without a database or an HTTP surface.
+//
+// For cmd/worker, which derives attachment variants and has to announce them but holds
+// no sockets and serves no requests. A whole Module there would need a database handle
+// and an authenticator it would never use.
+type Notifier struct {
+	broadcaster *broadcast.RedisBroadcaster
+}
+
+// NewNotifier returns a notifier publishing through client.
+func NewNotifier(client *redis.Client) *Notifier {
+	return &Notifier{broadcaster: broadcast.NewRedisBroadcaster(client)}
+}
+
+// AttachmentChanged tells clients following a conversation to look at an attachment
+// again.
+func (n *Notifier) AttachmentChanged(ctx context.Context, conversationID, attachmentID string) error {
+	return n.broadcaster.AttachmentChanged(ctx, conversationID, attachmentID) //nolint:wrapcheck // already named where it happened.
 }
 
 // OpenRedis returns a client, verifying it can be reached.
