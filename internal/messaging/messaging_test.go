@@ -128,6 +128,7 @@ func newNode(t *testing.T, tokens *fakeAuthenticator) *node {
 		postgres.NewConversationRepository(db),
 		postgres.NewMembershipRepository(db),
 		postgres.NewEntryRepository(db),
+		postgres.NewInviteRepository(db),
 		postgres.NewMemberStateStore(db),
 		broadcast.NewRedisBroadcaster(redisClient),
 		// The real outbox, not a double. These tests are what establish that an

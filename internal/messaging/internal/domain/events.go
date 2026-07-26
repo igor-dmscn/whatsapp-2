@@ -76,6 +76,16 @@ type MemberJoined struct {
 
 func (MemberJoined) EventName() string { return "messaging.member_joined" }
 
+// RoleChanged is raised when a membership's role changes.
+type RoleChanged struct {
+	occurred
+	ConversationID ConversationID
+	AccountID      AccountID
+	Role           Role
+}
+
+func (RoleChanged) EventName() string { return "messaging.role_changed" }
+
 // CursorAdvanced is raised when a member reports having read through a position.
 //
 // Through, not "one more": a client that read fifty messages sends one event, and a
@@ -110,3 +120,37 @@ type MemberLeft struct {
 }
 
 func (MemberLeft) EventName() string { return "messaging.member_left" }
+
+// InviteCreated is raised when a shareable invite is issued.
+//
+// It names the invite and the role it grants but never the token: an event travels
+// beyond the aggregate that raised it, and the token is the credential (ADR-0010).
+type InviteCreated struct {
+	occurred
+	ConversationID ConversationID
+	InviteID       InviteID
+	CreatedBy      AccountID
+	Role           Role
+}
+
+func (InviteCreated) EventName() string { return "messaging.invite_created" }
+
+// InviteRedeemed is raised when an invite is used. Carries the running count, which
+// is what makes an unexpectedly popular link visible as one.
+type InviteRedeemed struct {
+	occurred
+	ConversationID ConversationID
+	InviteID       InviteID
+	Uses           int
+}
+
+func (InviteRedeemed) EventName() string { return "messaging.invite_redeemed" }
+
+// InviteRevoked is raised when an invite is withdrawn.
+type InviteRevoked struct {
+	occurred
+	ConversationID ConversationID
+	InviteID       InviteID
+}
+
+func (InviteRevoked) EventName() string { return "messaging.invite_revoked" }

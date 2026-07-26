@@ -136,6 +136,37 @@ func (m *Membership) CanSee(sequence Sequence) bool {
 	return sequence >= m.visibleFrom
 }
 
+// ChangeRole moves a membership to a different role, reporting whether anything
+// changed.
+//
+// The check that the actor is allowed to do this is not here: it spans the
+// conversation's kind and the actor's own role, so it belongs to neither aggregate.
+// See AuthoriseMembershipChange.
+func (m *Membership) ChangeRole(role Role, now time.Time) (changed bool, err error) {
+	switch role {
+	case RoleMember, RoleAdmin, RoleReader:
+	default:
+		return false, ValidationError{"role", "unknown role"}
+	}
+	if !m.Active() {
+		return false, ErrNotAMember
+	}
+	if m.role == role {
+		// Nothing happened, so nothing is announced. A consumer reacting to a
+		// role change that did not occur is a consumer acting on a fiction.
+		return false, nil
+	}
+
+	m.role = role
+	m.record(RoleChanged{
+		occurred:       occurred{now},
+		ConversationID: m.conversationID,
+		AccountID:      m.accountID,
+		Role:           role,
+	})
+	return true, nil
+}
+
 // Read records that this member has read the conversation through a position.
 //
 // The cursor itself is not stored on the membership. It is projected from these

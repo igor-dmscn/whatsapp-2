@@ -121,6 +121,12 @@ type Broadcaster interface {
 type IDs interface {
 	NewConversationID() ConversationID
 	NewEntryID() EntryID
+	NewInviteID() InviteID
+
+	// NewInviteToken returns an unguessable token. In the domain's ports because
+	// the domain requires the value and refuses a short one, but cannot produce
+	// randomness without a library.
+	NewInviteToken() InviteToken
 }
 
 // MemberState is the projected per-member view of a conversation (ADR-0002).
@@ -193,4 +199,22 @@ type MemberStateStore interface {
 // means.
 type Transactor interface {
 	InTransaction(ctx context.Context, work func(context.Context) error) error
+}
+
+// InviteRepository stores Invite aggregates.
+type InviteRepository interface {
+	Save(ctx context.Context, invite *Invite) error
+
+	// ByToken loads an invite by its secret, returning ErrInviteNotFound if there
+	// is none. The lookup is by token rather than by identifier because redeeming
+	// is the only unauthenticated-ish path into a conversation, and the token is
+	// all the redeemer has.
+	ByToken(ctx context.Context, token InviteToken) (*Invite, error)
+
+	// ByID loads an invite for its creator to revoke.
+	ByID(ctx context.Context, id InviteID) (*Invite, error)
+
+	// In lists a conversation's invites, so administrators can see and withdraw
+	// links they have handed out.
+	In(ctx context.Context, conversationID ConversationID) ([]*Invite, error)
 }

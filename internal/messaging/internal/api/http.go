@@ -62,6 +62,21 @@ func (h *Handler) Routes(mux *http.ServeMux, authenticated func(http.Handler) ht
 
 	mux.Handle("GET /v1/conversations", authenticated(http.HandlerFunc(h.listConversations)))
 	mux.Handle("POST /v1/conversations/{conversationID}/receipt", authenticated(http.HandlerFunc(h.acknowledge)))
+
+	mux.Handle("POST /v1/conversations/group", authenticated(http.HandlerFunc(h.startGroup)))
+	mux.Handle("POST /v1/conversations/channel", authenticated(http.HandlerFunc(h.startChannel)))
+	mux.Handle("GET /v1/conversations/{conversationID}/members", authenticated(http.HandlerFunc(h.listMembers)))
+	mux.Handle("POST /v1/conversations/{conversationID}/members", authenticated(http.HandlerFunc(h.addMember)))
+	mux.Handle("DELETE /v1/conversations/{conversationID}/members/{accountID}", authenticated(http.HandlerFunc(h.removeMember)))
+	mux.Handle("PUT /v1/conversations/{conversationID}/members/{accountID}/role", authenticated(http.HandlerFunc(h.changeRole)))
+	mux.Handle("DELETE /v1/conversations/{conversationID}/membership", authenticated(http.HandlerFunc(h.leave)))
+
+	mux.Handle("GET /v1/conversations/{conversationID}/invites", authenticated(http.HandlerFunc(h.listInvites)))
+	mux.Handle("POST /v1/conversations/{conversationID}/invites", authenticated(http.HandlerFunc(h.createInvite)))
+	mux.Handle("DELETE /v1/invites/{inviteID}", authenticated(http.HandlerFunc(h.revokeInvite)))
+	// Redeeming needs an authenticated account — an invite says which conversation
+	// somebody may join, not who they are.
+	mux.Handle("POST /v1/invites/{token}/redeem", authenticated(http.HandlerFunc(h.redeemInvite)))
 	mux.Handle("POST /v1/conversations/direct", authenticated(http.HandlerFunc(h.startDirect)))
 	mux.Handle("GET /v1/conversations/{conversationID}", authenticated(http.HandlerFunc(h.getConversation)))
 	mux.Handle("GET /v1/conversations/{conversationID}/entries", authenticated(http.HandlerFunc(h.listEntries)))
@@ -104,6 +119,42 @@ type conversationResponse struct {
 	// per entry per recipient (MS-13).
 	OthersReadThrough      int64 `json:"others_read_through"`
 	OthersDeliveredThrough int64 `json:"others_delivered_through"`
+}
+
+type addMemberRequest struct {
+	AccountID string `json:"account_id"`
+}
+
+type changeRoleRequest struct {
+	Role string `json:"role"`
+}
+
+type createInviteRequest struct {
+	// MaxUses of zero means unlimited, matching the aggregate.
+	MaxUses   int        `json:"max_uses"`
+	ExpiresAt *time.Time `json:"expires_at"`
+}
+
+type memberResponse struct {
+	AccountID   string     `json:"account_id"`
+	Role        string     `json:"role"`
+	VisibleFrom int64      `json:"visible_from"`
+	JoinedAt    time.Time  `json:"joined_at"`
+	LeftAt      *time.Time `json:"left_at"`
+}
+
+type inviteResponse struct {
+	ID        string     `json:"id"`
+	Role      string     `json:"role"`
+	MaxUses   int        `json:"max_uses"`
+	Uses      int        `json:"uses"`
+	Revoked   bool       `json:"revoked"`
+	CreatedAt time.Time  `json:"created_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	// Token is returned so its creator can share the link. Only to an
+	// administrator of the conversation, which is what the handlers check before
+	// calling this.
+	Token string `json:"token"`
 }
 
 type acknowledgeRequest struct {
@@ -307,6 +358,222 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, h.logger, http.StatusCreated, newEntryResponse(entry))
 }
 
+// --- groups, channels and membership ---
+
+func (h *Handler) startGroup(w http.ResponseWriter, r *http.Request) {
+	h.startKind(w, r, h.service.StartGroup)
+}
+
+func (h *Handler) startChannel(w http.ResponseWriter, r *http.Request) {
+	h.startKind(w, r, h.service.StartChannel)
+}
+
+func (h *Handler) startKind(
+	w http.ResponseWriter,
+	r *http.Request,
+	start func(context.Context, domain.AccountID) (*domain.Conversation, error),
+) {
+	accountID, _ := h.caller(r.Context())
+
+	conversation, err := start(r.Context(), domain.AccountID(accountID))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	httpx.WriteJSON(w, h.logger, http.StatusCreated, conversationResponse{
+		ID:          string(conversation.ID()),
+		Kind:        string(conversation.Kind()),
+		Head:        int64(conversation.Head()),
+		Role:        string(domain.RoleAdmin),
+		VisibleFrom: int64(domain.FirstSequence),
+		CreatedAt:   conversation.CreatedAt(),
+	})
+}
+
+func (h *Handler) listMembers(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+	conversationID := domain.ConversationID(r.PathValue("conversationID"))
+
+	members, err := h.service.Members(r.Context(), conversationID, domain.AccountID(accountID))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	responses := make([]memberResponse, 0, len(members))
+	for _, member := range members {
+		responses = append(responses, memberResponse{
+			AccountID:   string(member.AccountID()),
+			Role:        string(member.Role()),
+			VisibleFrom: int64(member.VisibleFrom()),
+			JoinedAt:    member.JoinedAt(),
+			LeftAt:      member.LeftAt(),
+		})
+	}
+
+	httpx.WriteJSON(w, h.logger, http.StatusOK, map[string]any{"members": responses})
+}
+
+func (h *Handler) addMember(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+	conversationID := domain.ConversationID(r.PathValue("conversationID"))
+
+	var request addMemberRequest
+	if err := httpx.DecodeJSON(r, &request); err != nil {
+		h.fail(w, r, http.StatusBadRequest, "malformed_body", err.Error())
+		return
+	}
+
+	membership, err := h.service.AddMember(r.Context(), conversationID,
+		domain.AccountID(accountID), domain.AccountID(request.AccountID))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	httpx.WriteJSON(w, h.logger, http.StatusCreated, memberResponse{
+		AccountID:   string(membership.AccountID()),
+		Role:        string(membership.Role()),
+		VisibleFrom: int64(membership.VisibleFrom()),
+		JoinedAt:    membership.JoinedAt(),
+	})
+}
+
+func (h *Handler) removeMember(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+
+	err := h.service.RemoveMember(r.Context(),
+		domain.ConversationID(r.PathValue("conversationID")),
+		domain.AccountID(accountID),
+		domain.AccountID(r.PathValue("accountID")),
+	)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, h.logger, http.StatusNoContent, nil)
+}
+
+func (h *Handler) changeRole(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+
+	var request changeRoleRequest
+	if err := httpx.DecodeJSON(r, &request); err != nil {
+		h.fail(w, r, http.StatusBadRequest, "malformed_body", err.Error())
+		return
+	}
+
+	err := h.service.ChangeRole(r.Context(),
+		domain.ConversationID(r.PathValue("conversationID")),
+		domain.AccountID(accountID),
+		domain.AccountID(r.PathValue("accountID")),
+		domain.Role(request.Role),
+	)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, h.logger, http.StatusNoContent, nil)
+}
+
+func (h *Handler) leave(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+
+	err := h.service.Leave(r.Context(),
+		domain.ConversationID(r.PathValue("conversationID")),
+		domain.AccountID(accountID),
+	)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, h.logger, http.StatusNoContent, nil)
+}
+
+// --- invites ---
+
+func newInviteResponse(invite *domain.Invite) inviteResponse {
+	return inviteResponse{
+		ID:        string(invite.ID()),
+		Role:      string(invite.Role()),
+		MaxUses:   invite.MaxUses(),
+		Uses:      invite.Uses(),
+		Revoked:   invite.Revoked(),
+		CreatedAt: invite.CreatedAt(),
+		ExpiresAt: invite.ExpiresAt(),
+		Token:     string(invite.Token()),
+	}
+}
+
+func (h *Handler) createInvite(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+
+	var request createInviteRequest
+	if err := httpx.DecodeJSON(r, &request); err != nil {
+		h.fail(w, r, http.StatusBadRequest, "malformed_body", err.Error())
+		return
+	}
+
+	invite, err := h.service.CreateInvite(r.Context(),
+		domain.ConversationID(r.PathValue("conversationID")),
+		domain.AccountID(accountID), request.MaxUses, request.ExpiresAt,
+	)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	httpx.WriteJSON(w, h.logger, http.StatusCreated, newInviteResponse(invite))
+}
+
+func (h *Handler) listInvites(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+
+	invites, err := h.service.Invites(r.Context(),
+		domain.ConversationID(r.PathValue("conversationID")), domain.AccountID(accountID))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	responses := make([]inviteResponse, 0, len(invites))
+	for _, invite := range invites {
+		responses = append(responses, newInviteResponse(invite))
+	}
+	httpx.WriteJSON(w, h.logger, http.StatusOK, map[string]any{"invites": responses})
+}
+
+func (h *Handler) revokeInvite(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+
+	err := h.service.RevokeInvite(r.Context(),
+		domain.InviteID(r.PathValue("inviteID")), domain.AccountID(accountID))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, h.logger, http.StatusNoContent, nil)
+}
+
+func (h *Handler) redeemInvite(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+
+	conversation, err := h.service.RedeemInvite(r.Context(),
+		domain.InviteToken(r.PathValue("token")), domain.AccountID(accountID))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	httpx.WriteJSON(w, h.logger, http.StatusOK, conversationResponse{
+		ID:        string(conversation.ID()),
+		Kind:      string(conversation.Kind()),
+		Head:      int64(conversation.Head()),
+		CreatedAt: conversation.CreatedAt(),
+	})
+}
+
 // --- error mapping ---
 
 func (h *Handler) writeDomainError(w http.ResponseWriter, r *http.Request, err error) {
@@ -333,6 +600,30 @@ func (h *Handler) writeDomainError(w http.ResponseWriter, r *http.Request, err e
 
 	case errors.Is(err, domain.ErrGroupIsFull):
 		h.fail(w, r, http.StatusConflict, "group_full", "this group is at its member limit")
+
+	case errors.Is(err, domain.ErrAlreadyAMember):
+		h.fail(w, r, http.StatusConflict, "already_a_member", "that account already belongs to this conversation")
+
+	case errors.Is(err, domain.ErrNotPermittedToAdminister):
+		h.fail(w, r, http.StatusForbidden, "not_permitted", "you may not change this conversation's membership")
+
+	case errors.Is(err, domain.ErrMembershipIsFixed):
+		h.fail(w, r, http.StatusConflict, "membership_fixed", "a direct conversation's membership cannot be changed")
+
+	case errors.Is(err, domain.ErrCannotRemoveSelf):
+		h.fail(w, r, http.StatusUnprocessableEntity, "cannot_remove_self", "leave the conversation instead")
+
+	case errors.Is(err, domain.ErrInviteNotFound):
+		h.fail(w, r, http.StatusNotFound, "invite_not_found", "no such invite")
+
+	case errors.Is(err, domain.ErrInviteExpired):
+		h.fail(w, r, http.StatusGone, "invite_expired", "this invite has expired")
+
+	case errors.Is(err, domain.ErrInviteRevoked):
+		h.fail(w, r, http.StatusGone, "invite_revoked", "this invite has been withdrawn")
+
+	case errors.Is(err, domain.ErrInviteExhausted):
+		h.fail(w, r, http.StatusGone, "invite_exhausted", "this invite has already been used")
 
 	default:
 		logging.With(r.Context(), h.logger).Error("unhandled error", slog.Any("error", err))

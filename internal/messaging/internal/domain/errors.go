@@ -13,6 +13,24 @@ var (
 	ErrAlreadyAMember           = errors.New("already a member of this conversation")
 	ErrCannotMessageSelf        = errors.New("cannot start a direct conversation with yourself")
 
+	// ErrNotPermittedToAdminister means the actor may not change who belongs.
+	ErrNotPermittedToAdminister = errors.New("not permitted to change this conversation's membership")
+
+	// ErrMembershipIsFixed means the conversation's membership cannot change at
+	// all. Direct conversations are the case: the pair is the conversation's
+	// identity, so adding or removing anyone would make it a different thing
+	// while keeping its history (MS-4).
+	ErrMembershipIsFixed = errors.New("this conversation's membership cannot be changed")
+
+	// ErrCannotRemoveSelf means an admin tried to remove their own membership
+	// rather than leaving.
+	ErrCannotRemoveSelf = errors.New("leave the conversation rather than removing yourself")
+
+	ErrInviteNotFound  = errors.New("invite not found")
+	ErrInviteExpired   = errors.New("invite has expired")
+	ErrInviteRevoked   = errors.New("invite has been revoked")
+	ErrInviteExhausted = errors.New("invite has been used its maximum number of times")
+
 	// ErrEntryAlreadySent means this author already sent an entry with this
 	// client-supplied identifier. Not a failure — the caller resolves it by
 	// returning the entry that already exists (MS-2).

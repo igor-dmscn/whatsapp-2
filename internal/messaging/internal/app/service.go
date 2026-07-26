@@ -25,6 +25,7 @@ type Service struct {
 	conversations domain.ConversationRepository
 	memberships   domain.MembershipRepository
 	entries       domain.EntryRepository
+	invites       domain.InviteRepository
 	state         domain.MemberStateStore
 	broadcaster   domain.Broadcaster
 	events        domain.EventPublisher
@@ -39,6 +40,7 @@ func NewService(
 	conversations domain.ConversationRepository,
 	memberships domain.MembershipRepository,
 	entries domain.EntryRepository,
+	invites domain.InviteRepository,
 	state domain.MemberStateStore,
 	broadcaster domain.Broadcaster,
 	events domain.EventPublisher,
@@ -51,7 +53,7 @@ func NewService(
 		now = time.Now
 	}
 	return &Service{
-		conversations, memberships, entries, state,
+		conversations, memberships, entries, invites, state,
 		broadcaster, events, transactor, ids, now, logger,
 	}
 }
@@ -158,15 +160,11 @@ func (s *Service) Send(
 	contentType string,
 	body []byte,
 ) (*domain.Entry, error) {
-	parsedClientID, err := domain.ParseClientEntryID(clientEntryID)
-	if err != nil {
-		return nil, err
-	}
-	payload, err := domain.NewPayload(contentType, body)
-	if err != nil {
-		return nil, err
-	}
-
+	// Authorisation before content. The aggregate checks this again in Append and
+	// that is where the rule lives — MayWrite is the membership's own method, called
+	// here rather than restated. What the early call buys is that an account with no
+	// business writing is refused before the server does any work on its payload,
+	// which matters more once phase 7 makes payloads large.
 	membership, err := s.memberships.Of(ctx, conversationID, author)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotAMember) {
@@ -175,6 +173,18 @@ func (s *Service) Send(
 			return nil, domain.ErrNotAMember
 		}
 		return nil, fmt.Errorf("look up membership: %w", err)
+	}
+	if !membership.MayWrite() {
+		return nil, domain.ErrNotPermittedToWrite
+	}
+
+	parsedClientID, err := domain.ParseClientEntryID(clientEntryID)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := domain.NewPayload(contentType, body)
+	if err != nil {
+		return nil, err
 	}
 
 	// Checked before the transaction so the common retry costs one indexed read
@@ -229,6 +239,32 @@ func (s *Service) Send(
 	return entry, nil
 }
 
+// readerMembership loads a membership that entitles somebody to read.
+//
+// Separate from memberships.Of, and the difference is the bug it fixes: Of answers
+// "is there a row", which stays true of somebody who was removed. Every read path
+// that called Of directly left a removed member reading the conversation
+// indefinitely. Found by a test that removed a member and then read as them.
+//
+// The rule itself is still the membership's — Active() is its method. What this adds
+// is that no read path can forget to ask.
+func (s *Service) readerMembership(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	reader domain.AccountID,
+) (*domain.Membership, error) {
+	membership, err := s.memberships.Of(ctx, conversationID, reader)
+	if err != nil {
+		return nil, err
+	}
+	if !membership.Active() {
+		// Absence rather than forbidden, like every other non-membership: a removed
+		// member should not be able to confirm the conversation still exists.
+		return nil, domain.ErrNotAMember
+	}
+	return membership, nil
+}
+
 // Fetch returns a range of entries a caller is entitled to see.
 //
 // Visibility is applied from the caller's membership rather than trusted from the
@@ -241,7 +277,7 @@ func (s *Service) Fetch(
 	after domain.Sequence,
 	limit int,
 ) ([]*domain.Entry, error) {
-	membership, err := s.memberships.Of(ctx, conversationID, reader)
+	membership, err := s.readerMembership(ctx, conversationID, reader)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +350,7 @@ func (s *Service) Conversations(ctx context.Context, accountID domain.AccountID)
 
 // Conversation returns a conversation a caller belongs to.
 func (s *Service) Conversation(ctx context.Context, conversationID domain.ConversationID, reader domain.AccountID) (*domain.Conversation, error) {
-	if _, err := s.memberships.Of(ctx, conversationID, reader); err != nil {
+	if _, err := s.readerMembership(ctx, conversationID, reader); err != nil {
 		return nil, err
 	}
 	conversation, err := s.conversations.ByID(ctx, conversationID)
@@ -326,7 +362,7 @@ func (s *Service) Conversation(ctx context.Context, conversationID domain.Conver
 
 // Members returns a conversation's memberships, for a caller who belongs to it.
 func (s *Service) Members(ctx context.Context, conversationID domain.ConversationID, reader domain.AccountID) ([]*domain.Membership, error) {
-	if _, err := s.memberships.Of(ctx, conversationID, reader); err != nil {
+	if _, err := s.readerMembership(ctx, conversationID, reader); err != nil {
 		return nil, err
 	}
 	members, err := s.memberships.In(ctx, conversationID)
@@ -378,7 +414,7 @@ func (s *Service) Acknowledge(
 		return fmt.Errorf("look up conversation: %w", err)
 	}
 
-	membership, err := s.memberships.Of(ctx, conversationID, accountID)
+	membership, err := s.readerMembership(ctx, conversationID, accountID)
 	if err != nil {
 		return fmt.Errorf("look up membership: %w", err)
 	}
@@ -452,4 +488,422 @@ func (s *Service) Summaries(ctx context.Context, accountID domain.AccountID) ([]
 		})
 	}
 	return summaries, nil
+}
+
+// --- groups and channels ---
+
+// StartGroup creates a group with its creator as the only member, an administrator.
+//
+// The creator is an admin rather than a member because a group whose creator cannot
+// add anybody is a group that cannot be used, and because somebody has to be able to
+// promote the next administrator.
+func (s *Service) StartGroup(ctx context.Context, creator domain.AccountID) (*domain.Conversation, error) {
+	return s.startWithCreator(ctx, domain.StartGroup, creator)
+}
+
+// StartChannel creates a channel with its creator as an administrator.
+//
+// Every subsequent joiner is a reader, and reading the whole back catalogue: a
+// broadcast with no history is useless to a new subscriber (MS-6).
+func (s *Service) StartChannel(ctx context.Context, creator domain.AccountID) (*domain.Conversation, error) {
+	return s.startWithCreator(ctx, domain.StartChannel, creator)
+}
+
+func (s *Service) startWithCreator(
+	ctx context.Context,
+	start func(domain.ConversationID, time.Time) (*domain.Conversation, error),
+	creator domain.AccountID,
+) (*domain.Conversation, error) {
+	if creator == "" {
+		return nil, domain.ValidationError{Field: "account_id", Reason: "must not be empty"}
+	}
+
+	now := s.now()
+	conversation, err := start(s.ids.NewConversationID(), now)
+	if err != nil {
+		return nil, err
+	}
+
+	membership, err := domain.Join(conversation.ID(), creator, domain.RoleAdmin, domain.FirstSequence, now)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.conversations.Start(ctx, conversation, []*domain.Membership{membership}); err != nil {
+		return nil, fmt.Errorf("start conversation: %w", err)
+	}
+
+	if err := s.atomically(ctx, func(ctx context.Context) error {
+		events := conversation.TakeEvents()
+		events = append(events, membership.TakeEvents()...)
+		return s.publish(ctx, events)
+	}); err != nil {
+		return nil, err
+	}
+
+	return conversation, nil
+}
+
+// AddMember adds an account to a conversation on an administrator's behalf.
+//
+// The joining position comes from the conversation, not from the caller. That is the
+// whole of the history policy (MS-5, MS-6): a group member sees nothing said before
+// they arrived, a channel subscriber sees everything. Letting a caller pass the
+// position would make the policy a request parameter, which is how someone ends up
+// reading a group's history by asking nicely.
+func (s *Service) AddMember(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	actor domain.AccountID,
+	joiner domain.AccountID,
+) (*domain.Membership, error) {
+	if joiner == "" {
+		return nil, domain.ValidationError{Field: "account_id", Reason: "must not be empty"}
+	}
+
+	conversation, err := s.conversations.ByID(ctx, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("look up conversation: %w", err)
+	}
+
+	actorMembership, err := s.memberships.Of(ctx, conversationID, actor)
+	if err != nil {
+		return nil, fmt.Errorf("look up membership: %w", err)
+	}
+
+	// The domain service, because the rule spans the conversation's kind and the
+	// actor's role and belongs to neither aggregate.
+	if err := domain.AuthoriseMembershipChange(conversation, actorMembership); err != nil {
+		return nil, err
+	}
+
+	existing, err := s.memberships.Of(ctx, conversationID, joiner)
+	switch {
+	case err == nil && existing.Active():
+		return nil, domain.ErrAlreadyAMember
+	case err != nil && !errors.Is(err, domain.ErrNotAMember):
+		return nil, fmt.Errorf("look up joiner: %w", err)
+	}
+
+	count, err := s.memberships.CountIn(ctx, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("count members: %w", err)
+	}
+	// The aggregate holds the limit; the count is state it cannot see. NF-13's cap is
+	// also enforced by the aggregate having the number, not by this call site knowing
+	// it.
+	if err := conversation.AuthoriseJoin(count); err != nil {
+		return nil, err
+	}
+
+	return s.join(ctx, conversation, joiner, conversation.DefaultRole())
+}
+
+// RedeemInvite joins the caller to a conversation using a shared link.
+//
+// The path into a conversation for someone no administrator has heard of. The invite
+// carries the role, fixed when it was created, so a link cannot grant more later than
+// it appeared to grant when it was shared.
+func (s *Service) RedeemInvite(
+	ctx context.Context,
+	token domain.InviteToken,
+	joiner domain.AccountID,
+) (*domain.Conversation, error) {
+	if joiner == "" {
+		return nil, domain.ValidationError{Field: "account_id", Reason: "must not be empty"}
+	}
+
+	invite, err := s.invites.ByToken(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("look up invite: %w", err)
+	}
+
+	conversation, err := s.conversations.ByID(ctx, invite.ConversationID())
+	if err != nil {
+		return nil, fmt.Errorf("look up conversation: %w", err)
+	}
+
+	// Already a member: the invite is not consumed and this is not an error. Somebody
+	// clicking a link twice, or a link they were already given, should land in the
+	// conversation rather than be told off.
+	if existing, err := s.memberships.Of(ctx, conversation.ID(), joiner); err == nil && existing.Active() {
+		return conversation, nil
+	} else if err != nil && !errors.Is(err, domain.ErrNotAMember) {
+		return nil, fmt.Errorf("look up membership: %w", err)
+	}
+
+	count, err := s.memberships.CountIn(ctx, conversation.ID())
+	if err != nil {
+		return nil, fmt.Errorf("count members: %w", err)
+	}
+	if err := conversation.AuthoriseJoin(count); err != nil {
+		return nil, err
+	}
+
+	if err := invite.Redeem(s.now()); err != nil {
+		return nil, err
+	}
+
+	// The redemption and the membership commit together. A use counted without a
+	// membership silently spends a single-use link; a membership without the count
+	// lets a single-use link be used twice.
+	if err := s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.invites.Save(ctx, invite); err != nil {
+			return err
+		}
+		if _, err := s.join(ctx, conversation, joiner, invite.Role()); err != nil {
+			return err
+		}
+		return s.publish(ctx, invite.TakeEvents())
+	}); err != nil {
+		return nil, err
+	}
+
+	return conversation, nil
+}
+
+// join creates and saves a membership at the conversation's joining position.
+func (s *Service) join(
+	ctx context.Context,
+	conversation *domain.Conversation,
+	joiner domain.AccountID,
+	role domain.Role,
+) (*domain.Membership, error) {
+	membership, err := domain.Join(
+		conversation.ID(), joiner, role, conversation.JoiningPosition(), s.now())
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.memberships.Save(ctx, membership); err != nil {
+			return err
+		}
+		return s.publish(ctx, membership.TakeEvents())
+	}); err != nil {
+		return nil, err
+	}
+
+	// Their node has to start listening or the conversation delivers nothing live
+	// until they reconnect. Allowed to fail: the ephemeral path always is.
+	if err := s.broadcaster.NotifyConversationStarted(ctx, joiner, conversation.ID()); err != nil {
+		logging.With(ctx, s.logger).Warn("notify conversation started",
+			slog.String("conversation_id", string(conversation.ID())),
+			slog.Any("error", err),
+		)
+	}
+
+	return membership, nil
+}
+
+// RemoveMember withdraws somebody's membership on an administrator's behalf.
+func (s *Service) RemoveMember(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	actor domain.AccountID,
+	subject domain.AccountID,
+) error {
+	if actor == subject {
+		// Leaving and being removed are different acts with different meanings, and
+		// only one of them should be reachable by asking to remove yourself.
+		return domain.ErrCannotRemoveSelf
+	}
+
+	conversation, err := s.conversations.ByID(ctx, conversationID)
+	if err != nil {
+		return fmt.Errorf("look up conversation: %w", err)
+	}
+
+	actorMembership, err := s.memberships.Of(ctx, conversationID, actor)
+	if err != nil {
+		return fmt.Errorf("look up membership: %w", err)
+	}
+	if err := domain.AuthoriseMembershipChange(conversation, actorMembership); err != nil {
+		return err
+	}
+
+	subjectMembership, err := s.memberships.Of(ctx, conversationID, subject)
+	if err != nil {
+		return fmt.Errorf("look up subject: %w", err)
+	}
+
+	return s.leave(ctx, subjectMembership)
+}
+
+// Leave withdraws the caller's own membership.
+//
+// Available in every kind, direct conversations included: a membership change made by
+// its own subject is not the same act as one made about them, and the reason direct
+// membership is fixed is that nobody else may alter it.
+func (s *Service) Leave(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	accountID domain.AccountID,
+) error {
+	membership, err := s.memberships.Of(ctx, conversationID, accountID)
+	if err != nil {
+		return fmt.Errorf("look up membership: %w", err)
+	}
+	return s.leave(ctx, membership)
+}
+
+func (s *Service) leave(ctx context.Context, membership *domain.Membership) error {
+	if !membership.Leave(s.now()) {
+		// Already gone. Nothing changed, so nothing is saved and nothing announced.
+		return nil
+	}
+
+	return s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.memberships.Save(ctx, membership); err != nil {
+			return err
+		}
+		return s.publish(ctx, membership.TakeEvents())
+	})
+}
+
+// ChangeRole moves a member to a different role.
+func (s *Service) ChangeRole(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	actor domain.AccountID,
+	subject domain.AccountID,
+	role domain.Role,
+) error {
+	conversation, err := s.conversations.ByID(ctx, conversationID)
+	if err != nil {
+		return fmt.Errorf("look up conversation: %w", err)
+	}
+
+	actorMembership, err := s.memberships.Of(ctx, conversationID, actor)
+	if err != nil {
+		return fmt.Errorf("look up membership: %w", err)
+	}
+	if err := domain.AuthoriseMembershipChange(conversation, actorMembership); err != nil {
+		return err
+	}
+
+	subjectMembership, err := s.memberships.Of(ctx, conversationID, subject)
+	if err != nil {
+		return fmt.Errorf("look up subject: %w", err)
+	}
+
+	changed, err := subjectMembership.ChangeRole(role, s.now())
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+
+	return s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.memberships.Save(ctx, subjectMembership); err != nil {
+			return err
+		}
+		return s.publish(ctx, subjectMembership.TakeEvents())
+	})
+}
+
+// --- invites ---
+
+// CreateInvite issues a shareable link to a conversation.
+func (s *Service) CreateInvite(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	actor domain.AccountID,
+	maxUses int,
+	expiresAt *time.Time,
+) (*domain.Invite, error) {
+	conversation, err := s.conversations.ByID(ctx, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("look up conversation: %w", err)
+	}
+
+	actorMembership, err := s.memberships.Of(ctx, conversationID, actor)
+	if err != nil {
+		return nil, fmt.Errorf("look up membership: %w", err)
+	}
+	if err := domain.AuthoriseInvite(conversation, actorMembership); err != nil {
+		return nil, err
+	}
+
+	invite, err := domain.CreateInvite(
+		s.ids.NewInviteID(), conversationID, s.ids.NewInviteToken(),
+		actor, conversation.DefaultRole(), maxUses, expiresAt, s.now(),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.invites.Save(ctx, invite); err != nil {
+			return err
+		}
+		return s.publish(ctx, invite.TakeEvents())
+	}); err != nil {
+		return nil, err
+	}
+
+	return invite, nil
+}
+
+// RevokeInvite withdraws a link.
+func (s *Service) RevokeInvite(
+	ctx context.Context,
+	inviteID domain.InviteID,
+	actor domain.AccountID,
+) error {
+	invite, err := s.invites.ByID(ctx, inviteID)
+	if err != nil {
+		return fmt.Errorf("look up invite: %w", err)
+	}
+
+	conversation, err := s.conversations.ByID(ctx, invite.ConversationID())
+	if err != nil {
+		return fmt.Errorf("look up conversation: %w", err)
+	}
+
+	actorMembership, err := s.memberships.Of(ctx, invite.ConversationID(), actor)
+	if err != nil {
+		return fmt.Errorf("look up membership: %w", err)
+	}
+	if err := domain.AuthoriseInvite(conversation, actorMembership); err != nil {
+		return err
+	}
+
+	if !invite.Revoke(s.now()) {
+		return nil
+	}
+
+	return s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.invites.Save(ctx, invite); err != nil {
+			return err
+		}
+		return s.publish(ctx, invite.TakeEvents())
+	})
+}
+
+// Invites lists a conversation's links for an administrator.
+func (s *Service) Invites(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	actor domain.AccountID,
+) ([]*domain.Invite, error) {
+	conversation, err := s.conversations.ByID(ctx, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("look up conversation: %w", err)
+	}
+
+	actorMembership, err := s.memberships.Of(ctx, conversationID, actor)
+	if err != nil {
+		return nil, fmt.Errorf("look up membership: %w", err)
+	}
+	if err := domain.AuthoriseInvite(conversation, actorMembership); err != nil {
+		return nil, err
+	}
+
+	invites, err := s.invites.In(ctx, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("list invites: %w", err)
+	}
+	return invites, nil
 }

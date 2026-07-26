@@ -67,6 +67,7 @@ func New(
 		postgres.NewConversationRepository(db),
 		postgres.NewMembershipRepository(db),
 		postgres.NewEntryRepository(db),
+		postgres.NewInviteRepository(db),
 		postgres.NewMemberStateStore(db),
 		broadcast.NewRedisBroadcaster(redisClient),
 		// Events go to the outbox, in the same transaction as the change they
