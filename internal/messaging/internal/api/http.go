@@ -61,6 +61,7 @@ func (h *Handler) Routes(mux *http.ServeMux, authenticated func(http.Handler) ht
 	mux.HandleFunc("GET /v1/socket", h.Socket)
 
 	mux.Handle("GET /v1/conversations", authenticated(http.HandlerFunc(h.listConversations)))
+	mux.Handle("POST /v1/conversations/{conversationID}/receipt", authenticated(http.HandlerFunc(h.acknowledge)))
 	mux.Handle("POST /v1/conversations/direct", authenticated(http.HandlerFunc(h.startDirect)))
 	mux.Handle("GET /v1/conversations/{conversationID}", authenticated(http.HandlerFunc(h.getConversation)))
 	mux.Handle("GET /v1/conversations/{conversationID}/entries", authenticated(http.HandlerFunc(h.listEntries)))
@@ -89,6 +90,25 @@ type conversationResponse struct {
 	Role        string    `json:"role"`
 	VisibleFrom int64     `json:"visible_from"`
 	CreatedAt   time.Time `json:"created_at"`
+
+	// Projected fields (ADR-0002). Eventually consistent, and a client must render
+	// them correctly while they are behind rather than waiting for them (NF-7) —
+	// which is why they are zero-valued rather than absent when the projection has
+	// not caught up.
+	Unread          int64 `json:"unread"`
+	ReadThrough     int64 `json:"read_through"`
+	DeliveredThough int64 `json:"delivered_through"`
+	// OthersReadThrough and OthersDeliveredThrough are the lowest marks among the
+	// other members. A client derives each of its own entries' delivery state by
+	// comparing its sequence against these, rather than the server storing a state
+	// per entry per recipient (MS-13).
+	OthersReadThrough      int64 `json:"others_read_through"`
+	OthersDeliveredThrough int64 `json:"others_delivered_through"`
+}
+
+type acknowledgeRequest struct {
+	DeliveredThrough int64 `json:"delivered_through"`
+	ReadThrough      int64 `json:"read_through"`
 }
 
 type entryResponse struct {
@@ -147,33 +167,59 @@ func (h *Handler) startDirect(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) listConversations(w http.ResponseWriter, r *http.Request) {
 	accountID, _ := h.caller(r.Context())
 
-	memberships, err := h.service.Conversations(r.Context(), domain.AccountID(accountID))
+	summaries, err := h.service.Summaries(r.Context(), domain.AccountID(accountID))
 	if err != nil {
 		h.writeDomainError(w, r, err)
 		return
 	}
 
-	responses := make([]conversationResponse, 0, len(memberships))
-	for _, membership := range memberships {
-		if !membership.Active() {
-			continue
-		}
-		conversation, err := h.service.Conversation(r.Context(), membership.ConversationID(), domain.AccountID(accountID))
-		if err != nil {
-			h.writeDomainError(w, r, err)
-			return
-		}
+	responses := make([]conversationResponse, 0, len(summaries))
+	for _, summary := range summaries {
 		responses = append(responses, conversationResponse{
-			ID:          string(conversation.ID()),
-			Kind:        string(conversation.Kind()),
-			Head:        int64(conversation.Head()),
-			Role:        string(membership.Role()),
-			VisibleFrom: int64(membership.VisibleFrom()),
-			CreatedAt:   conversation.CreatedAt(),
+			ID:                     string(summary.Conversation.ID()),
+			Kind:                   string(summary.Conversation.Kind()),
+			Head:                   int64(summary.Conversation.Head()),
+			Role:                   string(summary.Membership.Role()),
+			VisibleFrom:            int64(summary.Membership.VisibleFrom()),
+			CreatedAt:              summary.Conversation.CreatedAt(),
+			Unread:                 summary.State.UnreadCount,
+			ReadThrough:            int64(summary.State.ReadSequence),
+			DeliveredThough:        int64(summary.State.DeliveredSequence),
+			OthersReadThrough:      int64(summary.OthersReadThrough),
+			OthersDeliveredThrough: int64(summary.OthersDeliveredThrough),
 		})
 	}
 
 	httpx.WriteJSON(w, h.logger, http.StatusOK, map[string]any{"conversations": responses})
+}
+
+// acknowledge records how far the caller has received and read a conversation.
+//
+// 202 rather than 200: nothing observable has changed when this returns. The marks
+// are published and projected asynchronously (ADR-0002), and a status implying the
+// count is already updated would invite clients to read it back and find it stale.
+func (h *Handler) acknowledge(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+	conversationID := domain.ConversationID(r.PathValue("conversationID"))
+
+	var request acknowledgeRequest
+	if err := httpx.DecodeJSON(r, &request); err != nil {
+		h.fail(w, r, http.StatusBadRequest, "malformed_body", err.Error())
+		return
+	}
+	if request.DeliveredThrough < 0 || request.ReadThrough < 0 {
+		h.fail(w, r, http.StatusUnprocessableEntity, "invalid_field", "marks must not be negative")
+		return
+	}
+
+	err := h.service.Acknowledge(r.Context(), conversationID, domain.AccountID(accountID),
+		domain.Sequence(request.DeliveredThrough), domain.Sequence(request.ReadThrough))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	httpx.WriteJSON(w, h.logger, http.StatusAccepted, nil)
 }
 
 func (h *Handler) getConversation(w http.ResponseWriter, r *http.Request) {

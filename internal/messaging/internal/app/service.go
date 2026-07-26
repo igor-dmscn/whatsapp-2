@@ -25,8 +25,10 @@ type Service struct {
 	conversations domain.ConversationRepository
 	memberships   domain.MembershipRepository
 	entries       domain.EntryRepository
+	state         domain.MemberStateStore
 	broadcaster   domain.Broadcaster
 	events        domain.EventPublisher
+	transactor    domain.Transactor
 	ids           domain.IDs
 	now           Clock
 	logger        *slog.Logger
@@ -37,8 +39,10 @@ func NewService(
 	conversations domain.ConversationRepository,
 	memberships domain.MembershipRepository,
 	entries domain.EntryRepository,
+	state domain.MemberStateStore,
 	broadcaster domain.Broadcaster,
 	events domain.EventPublisher,
+	transactor domain.Transactor,
 	ids domain.IDs,
 	now Clock,
 	logger *slog.Logger,
@@ -46,7 +50,10 @@ func NewService(
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{conversations, memberships, entries, broadcaster, events, ids, now, logger}
+	return &Service{
+		conversations, memberships, entries, state,
+		broadcaster, events, transactor, ids, now, logger,
+	}
 }
 
 // maxRangeLimit caps how many entries one fetch returns.
@@ -105,9 +112,17 @@ func (s *Service) StartDirect(ctx context.Context, initiator, other domain.Accou
 		return nil, fmt.Errorf("start conversation: %w", err)
 	}
 
-	s.publish(ctx, conversation.TakeEvents())
-	for _, membership := range memberships {
-		s.publish(ctx, membership.TakeEvents())
+	// The conversation, its memberships and their events in one transaction. A
+	// membership without its member_joined event is a conversation the projection
+	// never learns anybody belongs to, so its unread count stays zero forever.
+	if err := s.atomically(ctx, func(ctx context.Context) error {
+		events := conversation.TakeEvents()
+		for _, membership := range memberships {
+			events = append(events, membership.TakeEvents()...)
+		}
+		return s.publish(ctx, events)
+	}); err != nil {
+		return nil, err
 	}
 
 	// Tell both accounts' nodes to start listening, or nothing this conversation
@@ -170,11 +185,23 @@ func (s *Service) Send(
 		return nil, fmt.Errorf("look up existing entry: %w", err)
 	}
 
-	entry, events, err := s.conversations.AppendEntry(ctx, conversationID,
-		func(conversation *domain.Conversation) (*domain.Entry, error) {
-			return conversation.Append(s.ids.NewEntryID(), membership, parsedClientID, payload, s.now())
-		},
-	)
+	var entry *domain.Entry
+	err = s.atomically(ctx, func(ctx context.Context) error {
+		appended, events, err := s.conversations.AppendEntry(ctx, conversationID,
+			func(conversation *domain.Conversation) (*domain.Entry, error) {
+				return conversation.Append(s.ids.NewEntryID(), membership, parsedClientID, payload, s.now())
+			},
+		)
+		if err != nil {
+			return err
+		}
+		entry = appended
+		// AppendEntry joins this transaction rather than opening its own, so the
+		// outbox rows below commit with the entry — which is the whole of ADR-0003's
+		// guarantee, and the reason the entry's position and its event can never
+		// disagree.
+		return s.publish(ctx, events)
+	})
 	if err != nil {
 		if errors.Is(err, domain.ErrEntryAlreadySent) {
 			// An identical send won the race. Returning it makes the retry a lookup
@@ -187,7 +214,6 @@ func (s *Service) Send(
 		}
 		return nil, fmt.Errorf("append entry: %w", err)
 	}
-	s.publish(ctx, events)
 
 	// The ephemeral path, and it is allowed to fail: the entry is committed, and a
 	// listener that misses this will notice the sequence gap and refetch. Failing
@@ -310,17 +336,120 @@ func (s *Service) Members(ctx context.Context, conversationID domain.Conversatio
 	return members, nil
 }
 
-// publish hands recorded events to the publisher.
+// atomically runs work in one transaction.
+func (s *Service) atomically(ctx context.Context, work func(context.Context) error) error {
+	return s.transactor.InTransaction(ctx, work) //nolint:wrapcheck // the closure's error is the caller's own.
+}
+
+// publish records events for publication, in the caller's transaction.
 //
-// A publish failure does not fail the use case: the state change is committed, and
-// refusing an accepted message because an event could not be published would be
-// worse than the missing event. Phase 3 removes the choice by writing events in
-// the same transaction.
-func (s *Service) publish(ctx context.Context, events []domain.Event) {
+// A failure here fails the use case, which is the opposite of what the interim
+// publisher did and is the point of the change. An entry committed without its event
+// is an entry that never reaches an unread badge, a receipt or a notification, and
+// nothing afterwards would ever discover the omission.
+func (s *Service) publish(ctx context.Context, events []domain.Event) error {
 	if len(events) == 0 {
-		return
+		return nil
 	}
 	if err := s.events.Publish(ctx, events); err != nil {
-		logging.With(ctx, s.logger).Warn("publish events", slog.Any("error", err))
+		return fmt.Errorf("publish events: %w", err)
 	}
+	return nil
+}
+
+// Acknowledge records how far a member has received and read a conversation.
+//
+// Both marks in one call, because a client that has just rendered messages knows both
+// answers at once and two endpoints would mean two round trips saying the same thing.
+// Either may be zero, meaning "no change to this one".
+//
+// Nothing is stored synchronously. The events go to the outbox and the projection
+// applies them (ADR-0002), so this returns before any count has moved — the window
+// NF-7 requires clients to render correctly rather than treat as a failure.
+func (s *Service) Acknowledge(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	accountID domain.AccountID,
+	deliveredThrough domain.Sequence,
+	readThrough domain.Sequence,
+) error {
+	conversation, err := s.conversations.ByID(ctx, conversationID)
+	if err != nil {
+		return fmt.Errorf("look up conversation: %w", err)
+	}
+
+	membership, err := s.memberships.Of(ctx, conversationID, accountID)
+	if err != nil {
+		return fmt.Errorf("look up membership: %w", err)
+	}
+
+	now := s.now()
+	if deliveredThrough > 0 {
+		if err := membership.Received(deliveredThrough, conversation.Head(), now); err != nil {
+			return err
+		}
+	}
+	if readThrough > 0 {
+		if err := membership.Read(readThrough, conversation.Head(), now); err != nil {
+			return err
+		}
+	}
+
+	return s.atomically(ctx, func(ctx context.Context) error {
+		return s.publish(ctx, membership.TakeEvents())
+	})
+}
+
+// Summary is a conversation as the list screen needs it: the conversation, this
+// member's place in it, and how far everyone else has got.
+type Summary struct {
+	Conversation *domain.Conversation
+	Membership   *domain.Membership
+	State        domain.MemberState
+	// OthersReadThrough and OthersDeliveredThrough are the lowest marks among the
+	// other members, which is what MS-13's per-entry state is derived from.
+	OthersReadThrough      domain.Sequence
+	OthersDeliveredThrough domain.Sequence
+}
+
+// Summaries returns every conversation an account belongs to, with its projected state.
+//
+// This is the screen ADR-0002 rejected computing on read. The projection makes it a
+// handful of indexed lookups instead of an aggregate query over the whole log.
+func (s *Service) Summaries(ctx context.Context, accountID domain.AccountID) ([]Summary, error) {
+	memberships, err := s.memberships.ForAccount(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("list memberships: %w", err)
+	}
+
+	summaries := make([]Summary, 0, len(memberships))
+	for _, membership := range memberships {
+		if !membership.Active() {
+			continue
+		}
+
+		conversation, err := s.conversations.ByID(ctx, membership.ConversationID())
+		if err != nil {
+			return nil, fmt.Errorf("look up conversation: %w", err)
+		}
+
+		state, err := s.state.Of(ctx, membership.ConversationID(), accountID)
+		if err != nil {
+			return nil, fmt.Errorf("look up member state: %w", err)
+		}
+
+		othersRead, othersDelivered, err := s.state.Others(ctx, membership.ConversationID(), accountID)
+		if err != nil {
+			return nil, fmt.Errorf("look up others' marks: %w", err)
+		}
+
+		summaries = append(summaries, Summary{
+			Conversation:           conversation,
+			Membership:             membership,
+			State:                  state,
+			OthersReadThrough:      othersRead,
+			OthersDeliveredThrough: othersDelivered,
+		})
+	}
+	return summaries, nil
 }

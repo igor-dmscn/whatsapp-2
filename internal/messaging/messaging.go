@@ -18,6 +18,9 @@ import (
 	"comms/internal/messaging/internal/app"
 	"comms/internal/messaging/internal/broadcast"
 	"comms/internal/messaging/internal/postgres"
+	"comms/internal/messaging/internal/projection"
+	"comms/internal/platform/database"
+	"comms/internal/platform/kafka"
 )
 
 // Authenticator resolves an access token to the account and device presenting it.
@@ -64,8 +67,13 @@ func New(
 		postgres.NewConversationRepository(db),
 		postgres.NewMembershipRepository(db),
 		postgres.NewEntryRepository(db),
+		postgres.NewMemberStateStore(db),
 		broadcast.NewRedisBroadcaster(redisClient),
-		app.NewLoggingPublisher(logger),
+		// Events go to the outbox, in the same transaction as the change they
+		// describe (ADR-0003). The relay in cmd/worker publishes them to Kafka, and
+		// the projector consumes them back into the member-state read model.
+		postgres.NewOutboxPublisher(db),
+		database.NewConn(db),
 		app.IDs{},
 		time.Now,
 		logger,
@@ -118,4 +126,40 @@ func OpenRedis(ctx context.Context, url string) (*redis.Client, error) {
 		return nil, err //nolint:wrapcheck // already wrapped where it happened.
 	}
 	return client, nil
+}
+
+// Projections builds Messaging's read models from published events.
+//
+// Exposed as one object because cmd/worker cannot see the packages it is made of —
+// they are behind the internal/ fence — so the context composes its own consumer and
+// hands out something that runs.
+type Projections struct {
+	consumer  *kafka.Consumer
+	projector *projection.Projector
+	logger    *slog.Logger
+}
+
+// NewProjections wires the projection consumer.
+//
+// Its own consumer group, so that adding a second kind of consumer later — the
+// notification sender of phase 10, say — does not make the two compete for
+// partitions or share a replay.
+func NewProjections(db *sql.DB, brokers []string, logger *slog.Logger) (*Projections, error) {
+	consumer, err := kafka.NewConsumer(brokers, "messaging-projections", projection.Topics(), logger)
+	if err != nil {
+		return nil, err //nolint:wrapcheck // already wrapped where it happened.
+	}
+
+	return &Projections{
+		consumer:  consumer,
+		projector: projection.NewProjector(postgres.NewMemberStateStore(db), logger),
+		logger:    logger,
+	}, nil
+}
+
+// Run consumes until ctx is cancelled.
+func (p *Projections) Run(ctx context.Context) {
+	p.logger.Info("messaging projections started")
+	p.consumer.Run(ctx, p.projector.Apply)
+	p.logger.Info("messaging projections stopped")
 }
