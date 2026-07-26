@@ -108,7 +108,8 @@ func (l *Local) Leave(
 // participants are split across two nodes and cannot see each other.
 func (l *Local) mine(node string) error {
 	if node != l.address {
-		return fmt.Errorf("%w: this call belongs to %s", domain.ErrNoMediaNode, node)
+		return fmt.Errorf("%w: this call is on %s and this node is %s",
+			domain.ErrNoMediaNode, node, l.address)
 	}
 	return nil
 }

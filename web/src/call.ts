@@ -70,10 +70,16 @@ const iceServers: RTCIceServer[] = []
 export class Call {
   private connection: RTCPeerConnection | null = null
   private state: CallState | null = null
-  /** answering serialises negotiation. WebRTC permits one exchange at a time, and a second
-   *  offer applied before the first is answered leaves the connection in a state neither
-   *  side can resolve. */
-  private answering: Promise<void> = Promise.resolve()
+  /** negotiating serialises *every* exchange that touches this connection.
+   *
+   *  WebRTC permits one negotiation at a time, and the rule has to cover the answer to our
+   *  own join as well as the offers the server sends — not just the offers. The first
+   *  version of this chained only the offers, so a client that received `call.joined` and
+   *  `call.offer` in the same instant ran two exchanges at once and lost one of them. That
+   *  happens exactly when the other participant's tracks reach the server around the moment
+   *  this client joins, which is a race: it presents as media arriving in one direction and
+   *  not the other, with the failing direction varying between runs. */
+  private negotiating: Promise<void> = Promise.resolve()
 
   constructor(private readonly options: CallOptions) {}
 
@@ -139,7 +145,7 @@ export class Call {
   apply(frame: CallFrame): void {
     switch (frame.type) {
       case 'call.joined':
-        void this.joined(frame)
+        this.queue(() => this.joined(frame))
         break
 
       case 'call.current':
@@ -172,17 +178,24 @@ export class Call {
         break
 
       case 'call.offer':
-        // The server has something new to send us — somebody else joined. Queued behind
-        // whatever exchange is in flight, because one at a time is the rule.
-        this.answering = this.answering.then(() => this.answer(frame)).catch((failure) => {
-          this.options.onError(failure)
-        })
+        // The server has something new to send us — somebody else joined.
+        this.queue(() => this.answer(frame))
         break
 
       case 'call.left':
         this.release()
         break
     }
+  }
+
+  /** queue runs work after everything already queued, and reports what it threw.
+   *
+   *  The chain is never broken by a failure: one exchange that could not be completed must
+   *  not stop the next, or a single lost offer ends the call for that participant. */
+  private queue(work: () => Promise<void>): void {
+    this.negotiating = this.negotiating
+      .then(work)
+      .catch((failure) => this.options.onError(failure))
   }
 
   private async joined(frame: Extract<CallFrame, { type: 'call.joined' }>): Promise<void> {

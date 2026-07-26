@@ -95,7 +95,7 @@ describe.skipIf(!live)('two people, two nodes', () => {
 
   it('delivers a message live across nodes', async () => {
     await alice.page.getByLabel('Handle to message').fill(bob.handle)
-    await alice.page.getByRole('button', { name: 'Start' }).click()
+    await alice.page.getByRole('button', { name: 'Start', exact: true }).click()
     await alice.page.waitForSelector(composerText, { timeout })
 
     await send(alice.page, 'hello from alice')
@@ -415,7 +415,10 @@ describe.skipIf(!live)('badges and ticks', () => {
  *  guessing which of several is the new one. */
 async function start(person: Person, handle: string): Promise<string> {
   await person.page.getByLabel('Handle to message').fill(handle)
-  await person.page.getByRole('button', { name: 'Start' }).click()
+  // exact, because getByRole matches accessible names by substring by default and phase 9
+  // added a button called "Start a call". Fourth ambiguous selector in this file; they all
+  // came from a new control whose label contained an old one.
+  await person.page.getByRole('button', { name: 'Start', exact: true }).click()
   await person.page.waitForSelector(composerText, { timeout })
   await person.page.waitForSelector('.conversations button.selected', { timeout })
 
@@ -1134,12 +1137,18 @@ function adler32(bytes: Buffer): number {
   return ((high << 16) | low) >>> 0
 }
 
-// Phase 9: calls. Two browsers, two nodes, and real WebRTC between them through the
-// forwarding server.
+// Phase 9: calls.
+//
+// Two pairs, deliberately. A pair on *one* node exercises the whole path — signalling over
+// the socket, forwarding, renegotiation, media on screen. A pair across *two* nodes shows
+// where that stops: media forwarding is in the api process, so a call belongs to the node it
+// started on and the other node refuses it rather than quietly starting a second one. That
+// refusal is the phase's honest boundary and it is asserted rather than described.
 describe.skipIf(!live)('calls', () => {
   let browser: Browser
   let caller: Person
   let callee: Person
+  let elsewhere: Person
 
   beforeAll(async () => {
     const { chromium } = await import('playwright-core')
@@ -1150,19 +1159,20 @@ describe.skipIf(!live)('calls', () => {
     browser = await chromium.launch({
       headless: true,
       executablePath: chromiumPath(),
-      args: [
-        '--use-fake-device-for-media-stream',
-        '--use-fake-ui-for-media-stream',
-        '--allow-file-access-from-files',
-      ],
+      args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'],
     })
 
+    // Both on node A, so they share a media plane.
     caller = await join_(browser, nodeAURL, `otto${unique}`)
-    callee = await join_(browser, nodeBURL, `petra${unique}`)
+    callee = await join_(browser, nodeAURL, `petra${unique}`)
     await start(caller, callee.handle)
     await callee.page.waitForSelector('.conversations button', { timeout })
     await callee.page.click('.conversations button')
-  }, timeout * 3)
+
+    // And somebody on node B, in their own conversation with the caller, for the
+    // cross-node case.
+    elsewhere = await join_(browser, nodeBURL, `quinn${unique}`)
+  }, timeout * 4)
 
   afterAll(async () => {
     await browser?.close()
@@ -1173,66 +1183,59 @@ describe.skipIf(!live)('calls', () => {
     expect(await caller.page.getByRole('button', { name: 'Start a call' }).count()).toBe(1)
   }, timeout)
 
-  it('rings the other side, who joins and sees media both ways', async () => {
+  it('rings the other side, who joins', async () => {
     await caller.page.getByRole('button', { name: 'Start a call' }).click()
-
-    // The caller is in a call of one, which is what ringing means.
     await caller.page.waitForSelector('.call.joined', { timeout })
 
-    // The callee is told without asking: the notification crossed nodes over Redis, and
-    // their client is on a different api process from the caller's.
-    await callee.page.waitForSelector('.call.ringing', { timeout }).catch(async (failure) => {
-      // A ring that does not arrive has several possible causes on two machines and one
-      // server, so the diagnosis is printed rather than guessed at from a timeout.
-      const banner = await caller.page.locator('.error').allTextContents()
-      const callee_banner = await callee.page.locator('.error').allTextContents()
-      throw new Error(
-        `no ring reached the callee. caller errors: ${JSON.stringify(banner)}; ` +
-          `callee errors: ${JSON.stringify(callee_banner)}; original: ${String(failure)}`,
-      )
-    })
+    // Told without asking: the broadcast says only that something changed, and the client
+    // asks what it now is.
+    await callee.page.waitForSelector('.call.ringing', { timeout })
     // Scoped to the call panel: "Join" is also what the invite-link button says, and a
     // selector that matches two buttons will eventually pick the wrong one. Third time this
     // has happened in this file, hence the note.
     await callee.page.locator('.call.ringing button').click()
     await callee.page.waitForSelector('.call.joined', { timeout })
-
-    // Both sides show a local tile, so the camera was captured and the call is on screen for
-    // each of them.
-    for (const person of [caller, callee]) {
-      await person.page.waitForSelector('.tiles video', { timeout })
-    }
   }, timeout * 3)
 
-  // A known gap, recorded rather than hidden.
-  //
-  // Media between two *browsers* does not arrive yet, in either direction, and it is one
-  // cause rather than two. Whichever side ends up needing the server to re-offer — and which
-  // side that is depends on whether the caller's tracks had reached the node before the
-  // callee joined, so it varies between runs — does not get media. The Go tests establish
-  // that the server re-offers correctly: internal/calling's two-way test and the SFU's
-  // three-party test both assert media arriving at whoever joined first, through the same
-  // frame handler this UI talks to, and both pass. So the fault is a browser failing to
-  // answer a server-initiated offer, and it is not yet diagnosed.
-  //
-  // it.fails rather than it.skip: this runs, and the day it starts passing the suite goes red
-  // and somebody deletes this comment.
-  it.fails('carries media between two browsers', async () => {
-    await caller.page.waitForFunction(
-      () => {
-        const tiles = [...document.querySelectorAll<HTMLVideoElement>('.tiles video')]
-        // Two tiles and the remote one actually playing: a tile with no frames is a
-        // negotiated connection carrying nothing, which is the failure worth catching.
-        return tiles.length >= 2 && tiles.some((video, index) => index > 0 && video.videoWidth > 0)
-      },
-      undefined,
-      { timeout: 15_000 },
-    )
+  it('carries media between two browsers', async () => {
+    // The assertion the whole phase is for. Both directions: the second to join is answered
+    // with the first's tracks, and the first learns of the second only because the server
+    // re-offered — so a playing remote tile on the *caller's* screen is renegotiation
+    // working through a real browser.
+    for (const [name, person] of [
+      ['caller', caller],
+      ['callee', callee],
+    ] as const) {
+      await person.page
+        .waitForFunction(
+          () => {
+            const tiles = [...document.querySelectorAll<HTMLVideoElement>('.tiles video')]
+            // Two tiles and the remote one actually playing: a tile with no frames is a
+            // negotiated connection carrying nothing, which is the failure worth catching.
+            return tiles.length >= 2 && tiles.some((video, index) => index > 0 && video.videoWidth > 0)
+          },
+          undefined,
+          { timeout: 20_000 },
+        )
+        .catch(async () => {
+          const banners = await person.page.locator('.error').allTextContents()
+          const tiles = await person.page.locator('.tiles video').count()
+          // Two nodes each holding one call is the signature of the two browsers being in
+          // separate calls on separate media planes rather than in one call together.
+          const nodes = await Promise.all(
+            [apiAURL, apiBURL].map((url) => fetch(`${url}/health`).then((response) => response.json())),
+          )
+          throw new Error(
+            `${name} has ${tiles} tiles and no remote video. errors: ${JSON.stringify(banners)}; ` +
+              `calls per node: ${nodes.map((node) => node.calls).join(', ')}`,
+          )
+        })
+    }
   }, timeout * 2)
 
   it('mutes locally without renegotiating', async () => {
     // Disabled rather than removed, so nothing about the connection changes — which is why
-    // this asserts on the track's enabled flag rather than on anything visible.
+    // this asserts on the button rather than on anything about the media.
     await caller.page.locator('.controls button', { hasText: 'Mute' }).first().click()
     await caller.page.waitForSelector('.controls button:text-is("Unmute")', { timeout })
 
@@ -1254,4 +1257,40 @@ describe.skipIf(!live)('calls', () => {
     const held = await fetch(`${apiAURL}/health`).then((response) => response.json())
     expect(held.calls).toBe(0)
   }, timeout * 2)
+
+  it('refuses to join a call held by another node, rather than starting a second one', async () => {
+    // The boundary of the in-process media plane, asserted. Media forwarding lives in the
+    // api process, so a call belongs to the node it started on — and a client whose socket
+    // landed elsewhere must be told, not quietly joined to a different call with the same
+    // identifier. That silent split is what this test exists to prevent: it looked like a
+    // working call to both people, with no media and no error.
+    //
+    // The fix that makes this pass properly is one shared media process, which is the
+    // cmd/sfu work phase 9 has not done. See docs/plan.md.
+    await start(caller, elsewhere.handle)
+    await caller.page.waitForSelector('.call.idle', { timeout })
+    await caller.page.getByRole('button', { name: 'Start a call' }).click()
+    await caller.page.waitForSelector('.call.joined', { timeout })
+
+    await elsewhere.page.waitForSelector('.conversations button', { timeout })
+    await elsewhere.page.click('.conversations button')
+    await elsewhere.page.waitForSelector('.call.ringing', { timeout })
+    await elsewhere.page.locator('.call.ringing button').click()
+
+    // Refused, and said so. The client is left able to try again rather than sitting in a
+    // call that carries nothing.
+    await elsewhere.page.waitForFunction(
+      () => document.querySelector('.error')?.textContent?.includes('media node') ?? false,
+      undefined,
+      { timeout },
+    )
+
+    // And exactly one node is holding the call — the one that started it.
+    const nodes = await Promise.all(
+      [apiAURL, apiBURL].map((url) => fetch(`${url}/health`).then((response) => response.json())),
+    )
+    expect(nodes.map((node) => node.calls)).toEqual([1, 0])
+
+    await caller.page.locator('.hang-up').click()
+  }, timeout * 4)
 })

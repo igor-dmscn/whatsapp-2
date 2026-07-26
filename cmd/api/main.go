@@ -155,7 +155,12 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// through it. Media forwarding is in this process for now; the seam that lets it move
 	// out is Calling's MediaNodes port, not anything here.
 	callingModule, err := calling.New(db, messagingModule, messagingModule, calling.Options{
-		Address:    config.EnvOr("SFU_ADDRESS", "local"),
+		// This node's media address, and it must be distinct per process. Defaulting it
+		// to a shared literal is what made CL-4 fail silently: two api nodes both called
+		// themselves the same thing, so the check that a call belongs to *this* node
+		// passed on both, and a call started on one was quietly continued on the other's
+		// media plane. Two participants, two SFUs, no shared media, no error.
+		Address:    config.EnvOr("SFU_ADDRESS", "local"+config.EnvOr("API_ADDR", ":8080")),
 		UDPPortMin: uint16(config.EnvIntOr("SFU_UDP_PORT_MIN", 0)),
 		UDPPortMax: uint16(config.EnvIntOr("SFU_UDP_PORT_MAX", 0)),
 		PublicIP:   config.EnvOr("SFU_PUBLIC_IP", ""),
