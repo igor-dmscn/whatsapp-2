@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -37,6 +38,24 @@ type Signaller interface {
 	// Leave releases the participant. Called on close so that a load run of twenty peers
 	// does not leave twenty participants behind.
 	Leave(ctx context.Context) error
+}
+
+// Renegotiable is a signaller that can also carry an offer *from* the server.
+//
+// Added in phase 9, and its absence in phase 8 is the one thing the harness-first
+// approach got wrong. The stub never re-offered, so the interface never needed to — but a
+// real call of two people is asymmetric: the second to join receives the first's tracks in
+// the answer to their own offer, and the first learns of the second's only if something
+// offers the other way. A harness that cannot answer an offer can test forwarding to a
+// joiner and never forwarding to whoever was already there.
+//
+// Optional rather than folded into Signaller, so the phase-8 stub and its signaller stay
+// exactly as simple as they were.
+type Renegotiable interface {
+	// Offers yields offers the server sent. Closed when the signaller is done.
+	Offers() <-chan string
+	// Answer returns this peer's answer to the most recent offer.
+	Answer(ctx context.Context, answer string) error
 }
 
 // PeerOptions configures a peer.
@@ -143,10 +162,55 @@ func NewPeer(ctx context.Context, signaller Signaller, options PeerOptions) (*Pe
 		return nil, err
 	}
 
+	// A server that re-offers needs somebody listening. Started after the first exchange,
+	// because an offer arriving mid-negotiation is a state neither side can resolve.
+	if renegotiable, ok := signaller.(Renegotiable); ok {
+		go peer.answerOffers(renegotiable)
+	}
+
 	if options.Publish {
 		peer.publish()
 	}
 	return peer, nil
+}
+
+// answerOffers answers every offer the server sends.
+//
+// Serialised by the channel, which is the point: WebRTC permits one negotiation at a
+// time, and two overlapping exchanges leave a connection in a state neither side can
+// resolve.
+func (p *Peer) answerOffers(signaller Renegotiable) {
+	for offer := range signaller.Offers() {
+		if err := p.answer(signaller, offer); err != nil {
+			p.logger.Warn("answer offer", slog.Any("error", err))
+		}
+	}
+}
+
+func (p *Peer) answer(signaller Renegotiable, offer string) error {
+	if err := p.connection.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer, SDP: offer,
+	}); err != nil {
+		return fmt.Errorf("set remote description: %w", err)
+	}
+
+	answer, err := p.connection.CreateAnswer(nil)
+	if err != nil {
+		return fmt.Errorf("create answer: %w", err)
+	}
+
+	gathered := webrtc.GatheringCompletePromise(p.connection)
+	if err := p.connection.SetLocalDescription(answer); err != nil {
+		return fmt.Errorf("set local description: %w", err)
+	}
+	<-gathered
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := signaller.Answer(ctx, p.connection.LocalDescription().SDP); err != nil {
+		return fmt.Errorf("send answer: %w", err)
+	}
+	return nil
 }
 
 func (p *Peer) addTracks() error {
@@ -296,7 +360,12 @@ func (p *Peer) readFeedback(sender *webrtc.RTPSender) {
 // onTrack records everything that arrives on a forwarded track.
 func (p *Peer) onTrack(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 	kind := track.Kind().String()
-	key := kind + ":" + track.ID()
+	// Keyed by SSRC as well as by name, because every publisher's video track is called
+	// "video". Keying by name alone collapsed two publishers into one entry, so a
+	// three-party call looked like a server that had renegotiated once and stopped — the
+	// harness was miscounting, and the SFU was right. The stream identifier is in the key
+	// too, purely so a log line says who it came from.
+	key := kind + ":" + track.StreamID() + ":" + strconv.FormatUint(uint64(track.SSRC()), 10)
 
 	p.mutex.Lock()
 	arrivals, found := p.received[key]
