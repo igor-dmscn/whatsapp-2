@@ -15,7 +15,9 @@ import (
 
 	"comms/internal/platform/database"
 	"comms/internal/platform/database/testdb"
+	"comms/internal/platform/id"
 	"comms/internal/platform/kafka"
+	"comms/internal/platform/logging"
 	"comms/internal/platform/outbox"
 )
 
@@ -39,6 +41,21 @@ func (p *recordingPublisher) Publish(_ context.Context, messages []kafka.Message
 	}
 	p.published = append(p.published, messages...)
 	return nil
+}
+
+// onTopic returns every message published on one topic, so a test sharing a database with others
+// asserts on its own rows.
+func (p *recordingPublisher) onTopic(topic string) []kafka.Message {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	found := make([]kafka.Message, 0, len(p.published))
+	for _, message := range p.published {
+		if message.Topic == topic {
+			found = append(found, message)
+		}
+	}
+	return found
 }
 
 // names returns what was published on one topic.
@@ -327,5 +344,77 @@ func TestEnvelopeRoundTrip(t *testing.T) {
 	}
 	if !at.Equal(occurredAt) {
 		t.Errorf("occurred at %v, want %v", at, occurredAt)
+	}
+}
+
+// TestTheCorrelationIdentifierSurvivesTheOutbox is NF-16's missing half.
+//
+// A send is an HTTP request, a Redis publish, an outbox row, a Kafka event and a worker
+// projection. Requests have carried a correlation identifier since phase 0; events did not, so
+// the worker's half of every trace was five log lines in five places with nothing tying them to
+// the request that caused them.
+//
+// Asserted at the seam rather than end to end. What could go wrong is the identifier being
+// dropped between the request's context and the row, or between the row and the Kafka message —
+// and both of those are here. Whether a consumer then logs it is the consumer's own doing, and
+// the kafka package restores it into the handler's context so that it cannot forget.
+func TestTheCorrelationIdentifierSurvivesTheOutbox(t *testing.T) {
+	h := newHarness(t)
+
+	correlationID := "trace-" + id.New()
+	ctx := logging.Correlate(context.Background(), correlationID)
+
+	if err := database.InTransaction(ctx, h.db, func(ctx context.Context) error {
+		record, err := outbox.Encode(h.topic, "key-1", "test.event", time.Now(),
+			map[string]string{"hello": "world"})
+		if err != nil {
+			return err
+		}
+		return h.writer.Write(ctx, []outbox.Record{record})
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	h.drainAll(t)
+
+	published := h.publisher.onTopic(h.topic)
+	if len(published) != 1 {
+		t.Fatalf("published %d messages, want 1", len(published))
+	}
+	if published[0].CorrelationID != correlationID {
+		t.Fatalf("the message carries %q, want the request's %q",
+			published[0].CorrelationID, correlationID)
+	}
+}
+
+// TestAnEventWithNoRequestBehindItCarriesNoIdentifier: absence is not an empty string.
+//
+// A scheduled sweep or a backfill legitimately has no request behind it, and recording "" would
+// say "correlated with nothing" — a claim rather than an absence. It also matters on the wire:
+// an empty header is indistinguishable from one a proxy blanked, and would put an empty field on
+// every log line the consumer writes.
+func TestAnEventWithNoRequestBehindItCarriesNoIdentifier(t *testing.T) {
+	h := newHarness(t)
+
+	// No Correlate on this context, which is what a background job has.
+	if err := database.InTransaction(context.Background(), h.db, func(ctx context.Context) error {
+		record, err := outbox.Encode(h.topic, "key-2", "test.event", time.Now(),
+			map[string]string{"hello": "world"})
+		if err != nil {
+			return err
+		}
+		return h.writer.Write(ctx, []outbox.Record{record})
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	h.drainAll(t)
+
+	published := h.publisher.onTopic(h.topic)
+	if len(published) != 1 {
+		t.Fatalf("published %d messages, want 1", len(published))
+	}
+	if published[0].CorrelationID != "" {
+		t.Fatalf("an event with no request behind it carries %q", published[0].CorrelationID)
 	}
 }

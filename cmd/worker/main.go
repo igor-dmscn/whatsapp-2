@@ -23,6 +23,7 @@ import (
 	"comms/internal/platform/kafka"
 	"comms/internal/platform/logging"
 	"comms/internal/platform/outbox"
+	"comms/internal/platform/tracing"
 )
 
 // storeConfig is where attachment bytes live.
@@ -55,6 +56,15 @@ func main() {
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
+	// Tracing, which is off unless OTEL_EXPORTER_OTLP_ENDPOINT is set — NF-15 says the whole
+	// system starts locally with no cloud dependencies, so requiring a collector would break
+	// one requirement to satisfy another. Spans are still created either way and go nowhere.
+	flushTraces, err := tracing.Setup(ctx, "worker", logger)
+	if err != nil {
+		return err
+	}
+	defer flushTraces(ctx)
+
 	db, err := database.Open(config.MustEnv("DATABASE_URL"))
 	if err != nil {
 		return err

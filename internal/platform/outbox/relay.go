@@ -97,7 +97,7 @@ func (r *Relay) Drain(ctx context.Context) (int, error) {
 		// ponytail: this serialises the relay across replicas rather than sharding
 		// it. Per-key claims, if one relay ever stops keeping up.
 		rows, err := r.db.QueryContext(ctx,
-			`SELECT id, topic, key, event_name, payload
+			`SELECT id, topic, key, event_name, payload, correlation_id
 			   FROM outbox
 			  WHERE published_at IS NULL
 			  ORDER BY id
@@ -115,13 +115,19 @@ func (r *Relay) Drain(ctx context.Context) (int, error) {
 		)
 		for rows.Next() {
 			var (
-				id      int64
-				message kafka.Message
+				id            int64
+				message       kafka.Message
+				correlationID sql.NullString
 			)
-			if err := rows.Scan(&id, &message.Topic, &message.Key, &message.Name, &message.Value); err != nil {
+			if err := rows.Scan(&id, &message.Topic, &message.Key, &message.Name,
+				&message.Value, &correlationID); err != nil {
 				rows.Close()
 				return fmt.Errorf("scan outbox row: %w", err)
 			}
+			// Carried onto the message so the consumer can log under the same identifier
+			// as the request that caused the row (NF-16). Rows written before the column
+			// existed, and events with no request behind them, have none.
+			message.CorrelationID = correlationID.String
 			ids = append(ids, id)
 			messages = append(messages, message)
 		}

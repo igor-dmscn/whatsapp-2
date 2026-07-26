@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"comms/internal/platform/database"
+	"comms/internal/platform/logging"
 )
 
 // Record is one event awaiting publication.
@@ -69,16 +70,34 @@ func (w *Writer) Write(ctx context.Context, records []Record) error {
 		return fmt.Errorf("outbox write: %w", err)
 	}
 
+	// Read here rather than passed in by every caller. The identifier belongs to the request
+	// writing the row, and this is the only place that knows a row is being written — asking
+	// each context to thread it through Encode would be the same value carried by hand
+	// through four layers, forgotten once, and missing from one event type for a year.
+	correlationID := logging.CorrelationID(ctx)
+
 	for _, record := range records {
 		if _, err := w.db.ExecContext(ctx,
-			`INSERT INTO outbox (topic, key, event_name, payload, occurred_at)
-			 VALUES ($1, $2, $3, $4, $5)`,
+			`INSERT INTO outbox (topic, key, event_name, payload, occurred_at, correlation_id)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
 			record.Topic, record.Key, record.Name, record.Payload, record.OccurredAt,
+			nullable(correlationID),
 		); err != nil {
 			return fmt.Errorf("insert outbox record %s: %w", record.Name, err)
 		}
 	}
 	return nil
+}
+
+// nullable turns an empty identifier into SQL NULL.
+//
+// An empty string would record "correlated with nothing", which is a claim. NULL is the absence
+// of one, which is what an event published with no request behind it actually has.
+func nullable(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 // Envelope is the wire format of every published event.

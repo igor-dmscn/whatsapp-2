@@ -93,7 +93,7 @@ Designed for the first figure, deployed at the second. Both are stated because p
 | ID | Requirement |
 |----|-------------|
 | NF-15 | The whole system starts locally with one command and no cloud dependencies. |
-| NF-16 | Every request and every event carries a correlation identifier through to logs and traces. |
+| NF-16 | Every request and every event carries a correlation identifier through to logs and traces. Requests always did; *events* did not until phase 10 put the identifier on the outbox row and carried it to a Kafka header, which is where the worker's half of every trace was missing. Traces are OpenTelemetry, off unless an endpoint is configured, spanning HTTP, socket frames and Kafka on that same identifier. |
 | NF-17 | A cross-context import violation fails the build. Boundaries are not a code-review convention. |
 | NF-18 | Schema changes are versioned migrations, applied forward, never edited after merge. |
 

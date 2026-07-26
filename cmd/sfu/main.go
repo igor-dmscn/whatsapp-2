@@ -25,6 +25,7 @@ import (
 	"comms/internal/platform/config"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/logging"
+	"comms/internal/platform/tracing"
 )
 
 // shutdownGrace is how long signalling requests get to finish.
@@ -49,6 +50,15 @@ func main() {
 }
 
 func run(ctx context.Context, logger *slog.Logger) error {
+	// Tracing, which is off unless OTEL_EXPORTER_OTLP_ENDPOINT is set — NF-15 says the whole
+	// system starts locally with no cloud dependencies, so requiring a collector would break
+	// one requirement to satisfy another. Spans are still created either way and go nowhere.
+	flushTraces, err := tracing.Setup(ctx, "sfu", logger)
+	if err != nil {
+		return err
+	}
+	defer flushTraces(ctx)
+
 	// A real range by default, unlike api's zero. A node that lets the operating system
 	// choose is undeployable — nobody can open a firewall for "whatever it picks" — and the
 	// default being finite is what makes that visible in development too.

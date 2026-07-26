@@ -20,8 +20,10 @@ import (
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel/attribute"
 
 	"comms/internal/platform/logging"
+	"comms/internal/platform/tracing"
 )
 
 // Topics every deployment expects to exist.
@@ -113,6 +115,11 @@ type Message struct {
 	// Name is the event name, carried as a header so a consumer can route without
 	// decoding the payload first.
 	Name string
+	// CorrelationID ties this event to the request that caused it (NF-16). A header
+	// rather than part of the payload, so that adding it did not change the wire format
+	// every consumer already parses — and so the relay does not have to decode a payload
+	// to attach it. Empty for an event with no request behind it.
+	CorrelationID string
 }
 
 // Publish sends messages and waits for them to be acknowledged by every in-sync
@@ -126,15 +133,21 @@ func (p *Producer) Publish(ctx context.Context, messages []Message) error {
 		return nil
 	}
 
+	// The publishing span, and the trace context that goes on every record in this batch.
+	// One span for the batch rather than per record: the relay publishes what it drained
+	// together, and a span per row would be a hundred siblings saying the same thing.
+	ctx, span := tracing.Start(ctx, "kafka.publish",
+		attribute.Int("messaging.batch.message_count", len(messages)))
+	defer span.End()
+	carried := tracing.Inject(ctx)
+
 	records := make([]*kgo.Record, 0, len(messages))
 	for _, message := range messages {
 		records = append(records, &kgo.Record{
-			Topic: message.Topic,
-			Key:   []byte(message.Key),
-			Value: message.Value,
-			Headers: []kgo.RecordHeader{
-				{Key: "event_name", Value: []byte(message.Name)},
-			},
+			Topic:   message.Topic,
+			Key:     []byte(message.Key),
+			Value:   message.Value,
+			Headers: headersFor(message, carried),
 		})
 	}
 
@@ -144,6 +157,32 @@ func (p *Producer) Publish(ctx context.Context, messages []Message) error {
 	}
 	return nil
 }
+
+// headersFor builds a record's headers.
+//
+// The event name is always there; the correlation identifier only when there is one. An empty
+// header would be indistinguishable from a header a proxy blanked, and the consumer would then
+// log "correlation_id: " on every line — which is worse than the field being absent.
+func headersFor(message Message, carried tracing.Carrier) []kgo.RecordHeader {
+	headers := []kgo.RecordHeader{{Key: "event_name", Value: []byte(message.Name)}}
+	if message.CorrelationID != "" {
+		headers = append(headers,
+			kgo.RecordHeader{Key: CorrelationHeader, Value: []byte(message.CorrelationID)})
+	}
+	// The trace context, so a consumer's span continues this trace instead of starting an
+	// unrelated one. Absent entirely when tracing is off, which is when Inject returns
+	// nothing — a header carrying an invalid trace is worse than no header.
+	for key, value := range carried {
+		headers = append(headers, kgo.RecordHeader{Key: key, Value: []byte(value)})
+	}
+	return headers
+}
+
+// CorrelationHeader is the header a correlation identifier travels in.
+//
+// The same name the HTTP layer uses, lowercased as Kafka headers conventionally are, so that one
+// grep finds the identifier wherever it appears.
+const CorrelationHeader = "correlation_id"
 
 // Close flushes and disconnects.
 func (p *Producer) Close() {
@@ -200,6 +239,14 @@ type Record struct {
 	// per partition, so two records on one topic routinely share one.
 	Partition int32
 	Offset    int64
+	// CorrelationID ties this record to the request that caused it, or is empty. Restored
+	// into the handler's context by Run, so a consumer's log lines carry it without every
+	// consumer having to remember to.
+	CorrelationID string
+	// carried holds the record's remaining headers, which is where trace context lives.
+	// Unexported: a handler has no business reading raw headers, and Run has already used
+	// them to continue the trace by the time the handler sees the record.
+	carried tracing.Carrier
 }
 
 // Consumer reads a consumer group's share of one or more topics.
@@ -267,8 +314,29 @@ func (c *Consumer) Run(ctx context.Context, handle Handler) {
 			if failed {
 				return
 			}
-			if err := handle(ctx, toRecord(record)); err != nil {
-				logging.With(ctx, c.logger).Error("handle record",
+			held := toRecord(record)
+			// The identifier is put back on the context before the handler runs, so that
+			// everything a projection logs lands under the same identifier as the HTTP
+			// request that caused the event — which is the whole of NF-16 and the half
+			// that was missing. Restored here rather than in each consumer, because a
+			// consumer that forgot would be silently uncorrelated.
+			handlerCtx := ctx
+			if held.CorrelationID != "" {
+				handlerCtx = logging.Correlate(ctx, held.CorrelationID)
+			}
+
+			// The trace continued rather than begun, which is what makes one send a
+			// single trace across api and worker instead of two unrelated ones.
+			handlerCtx = tracing.Extract(handlerCtx, held.carried)
+			handlerCtx, span := tracing.Start(handlerCtx, "kafka.consume "+held.Topic,
+				attribute.String("messaging.destination.name", held.Topic),
+				attribute.String("messaging.message.name", held.Name))
+
+			err := handle(handlerCtx, held)
+			span.End()
+
+			if err != nil {
+				logging.With(handlerCtx, c.logger).Error("handle record",
 					slog.String("topic", record.Topic),
 					slog.Int64("offset", record.Offset),
 					slog.Any("error", err),
@@ -289,18 +357,29 @@ func (c *Consumer) Run(ctx context.Context, handle Handler) {
 }
 
 func toRecord(record *kgo.Record) Record {
-	var name string
+	var name, correlationID string
+	carried := tracing.Carrier{}
 	for _, header := range record.Headers {
-		if header.Key == "event_name" {
+		switch header.Key {
+		case "event_name":
 			name = string(header.Value)
+		case CorrelationHeader:
+			correlationID = string(header.Value)
+		default:
+			// Everything else is offered to the propagator, which takes the trace headers
+			// and ignores the rest. Naming them here instead would mean this file knowing
+			// the field names of a specification it does not implement.
+			carried[header.Key] = string(header.Value)
 		}
 	}
 	return Record{
-		Topic:     record.Topic,
-		Key:       string(record.Key),
-		Name:      name,
-		Value:     record.Value,
-		Partition: record.Partition,
-		Offset:    record.Offset,
+		Topic:         record.Topic,
+		Key:           string(record.Key),
+		Name:          name,
+		Value:         record.Value,
+		Partition:     record.Partition,
+		Offset:        record.Offset,
+		CorrelationID: correlationID,
+		carried:       carried,
 	}
 }

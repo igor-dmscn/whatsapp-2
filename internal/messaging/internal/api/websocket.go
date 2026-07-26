@@ -11,9 +11,12 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"go.opentelemetry.io/otel/attribute"
 
 	"comms/internal/messaging/internal/domain"
+	"comms/internal/platform/id"
 	"comms/internal/platform/logging"
+	"comms/internal/platform/tracing"
 )
 
 // handshakeTimeout is how long an unauthenticated socket may stay open.
@@ -254,34 +257,62 @@ func (h *Handler) read(ctx context.Context, connection *Connection, logger *slog
 			continue
 		}
 
-		switch envelope.Type {
-		case "resume":
-			h.handleResume(ctx, connection, raw, logger)
+		// A span and a correlation identifier per frame, which is the socket's answer to
+		// NF-16. Per frame rather than per connection, because a connection lives for hours
+		// and a span that long is a bar on a chart rather than a measurement — while what
+		// somebody wants to know is why *this* join took two seconds.
+		//
+		// A fresh identifier each time, since a frame is not part of the HTTP request that
+		// upgraded the socket. The upgrade's identifier belongs to the handshake.
+		frameCtx := logging.Correlate(ctx, id.New())
+		frameCtx, span := tracing.Start(frameCtx, "socket "+envelope.Type,
+			attribute.String("frame.type", envelope.Type),
+			attribute.String("account.id", string(connection.AccountID())),
+		)
 
-		case "ping":
-			// Application-level, distinct from the protocol ping. Clients behind
-			// proxies that strip control frames still need a way to keep a
-			// connection warm and to learn it is dead.
-			_ = connection.WriteFrame(ctx, clientFrame{Type: "pong"})
+		h.handleFrame(frameCtx, connection, envelope.Type, raw, logging.With(frameCtx, logger))
+		span.End()
+	}
+}
 
-		case "typing":
-			h.handleTyping(ctx, connection, raw, logger)
+// handleFrame routes one frame, on a context that already carries its span.
+//
+// Split out from the read loop when frames gained spans: a span has to end whichever branch the
+// frame took, and a `continue` in the middle of a switch inside a loop is how one gets left open.
+func (h *Handler) handleFrame(
+	ctx context.Context,
+	connection *Connection,
+	frameType string,
+	raw []byte,
+	logger *slog.Logger,
+) {
+	switch frameType {
+	case "resume":
+		h.handleResume(ctx, connection, raw, logger)
 
-		case "presence.ask":
-			h.handlePresenceAsk(ctx, connection, raw, logger)
+	case "ping":
+		// Application-level, distinct from the protocol ping. Clients behind
+		// proxies that strip control frames still need a way to keep a
+		// connection warm and to learn it is dead.
+		_ = connection.WriteFrame(ctx, clientFrame{Type: "pong"})
 
-		default:
-			// Frames Messaging does not own are offered to whoever registered for
-			// them — call signalling, so far (ADR-0004: one socket per client, for
-			// everything). Delegation rather than a switch that grows: Messaging must
-			// not learn what a call is to carry one.
-			if h.delegate(ctx, connection, envelope.Type, raw) {
-				continue
-			}
-			// Still unknown. Ignored rather than fatal, so a newer client talking to
-			// an older server degrades instead of disconnecting.
-			logger.Debug("ignoring unknown frame", slog.String("type", envelope.Type))
+	case "typing":
+		h.handleTyping(ctx, connection, raw, logger)
+
+	case "presence.ask":
+		h.handlePresenceAsk(ctx, connection, raw, logger)
+
+	default:
+		// Frames Messaging does not own are offered to whoever registered for
+		// them — call signalling, so far (ADR-0004: one socket per client, for
+		// everything). Delegation rather than a switch that grows: Messaging must
+		// not learn what a call is to carry one.
+		if h.delegate(ctx, connection, frameType, raw) {
+			return
 		}
+		// Still unknown. Ignored rather than fatal, so a newer client talking to
+		// an older server degrades instead of disconnecting.
+		logger.Debug("ignoring unknown frame", slog.String("type", frameType))
 	}
 }
 

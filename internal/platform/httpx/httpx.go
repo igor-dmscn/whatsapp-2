@@ -14,9 +14,12 @@ import (
 	"strconv"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"comms/internal/platform/id"
 	"comms/internal/platform/logging"
 	"comms/internal/platform/ratelimit"
+	"comms/internal/platform/tracing"
 )
 
 // CorrelationHeader lets a client supply its own identifier so that a report of
@@ -123,8 +126,36 @@ func Correlate(next http.Handler) http.Handler {
 			correlationID = id.New()
 		}
 		w.Header().Set(CorrelationHeader, correlationID)
-		next.ServeHTTP(w, r.WithContext(logging.Correlate(r.Context(), correlationID)))
+
+		ctx := logging.Correlate(r.Context(), correlationID)
+
+		// A trace continued from the caller if it sent one, and begun here if not — which is
+		// what makes a browser's request and the worker's projection of it one trace rather
+		// than two (NF-16). Extracted before the span is started, or the span would be a
+		// root and the caller's half would be orphaned.
+		ctx = tracing.Extract(ctx, headerCarrier(r.Header))
+		ctx, span := tracing.Start(ctx, r.Method+" "+r.URL.Path,
+			attribute.String("http.request.method", r.Method),
+			attribute.String("url.path", r.URL.Path),
+		)
+		defer span.End()
+
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// headerCarrier reads trace context out of HTTP headers.
+//
+// Canonical form matters: Go stores headers canonicalised and the propagator asks for
+// "traceparent" in lower case, so Header.Get is used rather than indexing the map.
+func headerCarrier(header http.Header) tracing.Carrier {
+	carrier := tracing.Carrier{}
+	for _, key := range []string{"traceparent", "tracestate", "baggage"} {
+		if value := header.Get(key); value != "" {
+			carrier[key] = value
+		}
+	}
+	return carrier
 }
 
 // LogRequests logs one line per completed request.
