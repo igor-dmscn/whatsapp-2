@@ -10,26 +10,34 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"comms/internal/platform/database"
+
 	"comms/internal/messaging/internal/domain"
 )
 
 // One repository type per aggregate root (ADR-0010).
 type (
 	// ConversationRepository stores Conversation aggregates.
-	ConversationRepository struct{ db *sql.DB }
+	ConversationRepository struct{ db database.Conn }
 
 	// MembershipRepository stores Membership aggregates.
-	MembershipRepository struct{ db *sql.DB }
+	MembershipRepository struct{ db database.Conn }
 
 	// EntryRepository reads entries.
-	EntryRepository struct{ db *sql.DB }
+	EntryRepository struct{ db database.Conn }
 )
 
 func NewConversationRepository(db *sql.DB) *ConversationRepository {
-	return &ConversationRepository{db}
+	return &ConversationRepository{database.NewConn(db)}
 }
-func NewMembershipRepository(db *sql.DB) *MembershipRepository { return &MembershipRepository{db} }
-func NewEntryRepository(db *sql.DB) *EntryRepository           { return &EntryRepository{db} }
+
+func NewMembershipRepository(db *sql.DB) *MembershipRepository {
+	return &MembershipRepository{database.NewConn(db)}
+}
+
+func NewEntryRepository(db *sql.DB) *EntryRepository {
+	return &EntryRepository{database.NewConn(db)}
+}
 
 var (
 	_ domain.ConversationRepository = (*ConversationRepository)(nil)
@@ -49,43 +57,35 @@ const (
 
 // Start writes a conversation and its initial memberships in one transaction.
 func (r *ConversationRepository) Start(ctx context.Context, conversation *domain.Conversation, memberships []*domain.Membership) error {
-	transaction, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer func() { _ = transaction.Rollback() }()
-
-	// Only direct conversations carry a pair key; for the others the column stays
-	// NULL so the partial unique index ignores them.
-	var directKey any
-	if conversation.Kind() == domain.KindDirect && len(memberships) == domain.DirectMemberCount {
-		directKey = domain.DirectKey(memberships[0].AccountID(), memberships[1].AccountID())
-	}
-
-	_, err = transaction.ExecContext(ctx,
-		`INSERT INTO conversations (id, kind, head, created_at, direct_key)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		string(conversation.ID()), string(conversation.Kind()), int64(conversation.Head()),
-		conversation.CreatedAt(), directKey,
-	)
-	if err != nil {
-		if constraintName(err) == directKeyIndex {
-			// Another writer created this pair's conversation first.
-			return domain.ErrAlreadyAMember
+	return r.db.InTransaction(ctx, func(ctx context.Context) error {
+		// Only direct conversations carry a pair key; for the others the column
+		// stays NULL so the partial unique index ignores them.
+		var directKey any
+		if conversation.Kind() == domain.KindDirect && len(memberships) == domain.DirectMemberCount {
+			directKey = domain.DirectKey(memberships[0].AccountID(), memberships[1].AccountID())
 		}
-		return fmt.Errorf("insert conversation: %w", err)
-	}
 
-	for _, membership := range memberships {
-		if err := insertMembership(ctx, transaction, membership); err != nil {
-			return err
+		_, err := r.db.ExecContext(ctx,
+			`INSERT INTO conversations (id, kind, head, created_at, direct_key)
+			 VALUES ($1, $2, $3, $4, $5)`,
+			string(conversation.ID()), string(conversation.Kind()), int64(conversation.Head()),
+			conversation.CreatedAt(), directKey,
+		)
+		if err != nil {
+			if constraintName(err) == directKeyIndex {
+				// Another writer created this pair's conversation first.
+				return domain.ErrAlreadyAMember
+			}
+			return fmt.Errorf("insert conversation: %w", err)
 		}
-	}
 
-	if err := transaction.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
-	}
-	return nil
+		for _, membership := range memberships {
+			if err := insertMembership(ctx, r.db, membership); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (r *ConversationRepository) ByID(ctx context.Context, id domain.ConversationID) (*domain.Conversation, error) {
@@ -113,61 +113,63 @@ func (r *ConversationRepository) AppendEntry(
 	id domain.ConversationID,
 	append domain.AppendFunc,
 ) (*domain.Entry, []domain.Event, error) {
-	transaction, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, nil, fmt.Errorf("begin transaction: %w", err)
-	}
-	defer func() { _ = transaction.Rollback() }()
-
-	conversation, err := scanConversation(transaction.QueryRowContext(ctx,
-		`SELECT id, kind, head, created_at FROM conversations WHERE id = $1 FOR UPDATE`,
-		string(id),
-	))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// The aggregate assigns the position. The repository's job is only to make sure
-	// nobody else is doing so at the same time.
-	entry, err := append(conversation)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	if _, err := transaction.ExecContext(ctx,
-		`UPDATE conversations SET head = $1 WHERE id = $2`,
-		int64(conversation.Head()), string(conversation.ID()),
-	); err != nil {
-		return nil, nil, fmt.Errorf("advance conversation head: %w", err)
-	}
-
-	_, err = transaction.ExecContext(ctx,
-		`INSERT INTO entries (id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		string(entry.ID()), string(entry.ConversationID()), int64(entry.Sequence()),
-		string(entry.AuthorID()), string(entry.ClientEntryID()), string(entry.Kind()),
-		entry.Payload().ContentType(), entry.Payload().Body(), entry.CreatedAt(),
+	var (
+		entry  *domain.Entry
+		events []domain.Event
 	)
-	if err != nil {
-		switch constraintName(err) {
-		case sequenceIndex:
-			// Unreachable while the lock is held. Named rather than surfaced as a
-			// driver error so that if it ever fires, the cause is unambiguous.
-			return nil, nil, domain.ErrSequenceAlreadyTaken
-		case clientIDIndex:
-			// The caller's idempotency check raced with an identical send. The entry
-			// that won is the right answer, so report it as already sent.
-			return nil, nil, domain.ErrEntryAlreadySent
+
+	err := r.db.InTransaction(ctx, func(ctx context.Context) error {
+		conversation, err := scanConversation(r.db.QueryRowContext(ctx,
+			`SELECT id, kind, head, created_at FROM conversations WHERE id = $1 FOR UPDATE`,
+			string(id),
+		))
+		if err != nil {
+			return err
 		}
-		return nil, nil, fmt.Errorf("insert entry: %w", err)
-	}
 
-	// Taken before commit so that phase 3 can write these to the outbox in this
-	// same transaction.
-	events := conversation.TakeEvents()
+		// The aggregate assigns the position. The repository's job is only to make
+		// sure nobody else is doing so at the same time.
+		entry, err = append(conversation)
+		if err != nil {
+			return err
+		}
 
-	if err := transaction.Commit(); err != nil {
-		return nil, nil, fmt.Errorf("commit: %w", err)
+		if _, err := r.db.ExecContext(ctx,
+			`UPDATE conversations SET head = $1 WHERE id = $2`,
+			int64(conversation.Head()), string(conversation.ID()),
+		); err != nil {
+			return fmt.Errorf("advance conversation head: %w", err)
+		}
+
+		_, err = r.db.ExecContext(ctx,
+			`INSERT INTO entries (id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			string(entry.ID()), string(entry.ConversationID()), int64(entry.Sequence()),
+			string(entry.AuthorID()), string(entry.ClientEntryID()), string(entry.Kind()),
+			entry.Payload().ContentType(), entry.Payload().Body(), entry.CreatedAt(),
+		)
+		if err != nil {
+			switch constraintName(err) {
+			case sequenceIndex:
+				// Unreachable while the lock is held. Named rather than surfaced as
+				// a driver error so that if it ever fires, the cause is unambiguous.
+				return domain.ErrSequenceAlreadyTaken
+			case clientIDIndex:
+				// The caller's idempotency check raced with an identical send. The
+				// entry that won is the right answer, so report it as already sent.
+				return domain.ErrEntryAlreadySent
+			}
+			return fmt.Errorf("insert entry: %w", err)
+		}
+
+		// Taken inside the transaction. The caller is already in one — Conn.
+		// InTransaction joins rather than nests — so the outbox rows it writes for
+		// these events commit with the entry or not at all.
+		events = conversation.TakeEvents()
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
 	}
 	return entry, events, nil
 }

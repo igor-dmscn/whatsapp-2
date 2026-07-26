@@ -136,6 +136,69 @@ func (m *Membership) CanSee(sequence Sequence) bool {
 	return sequence >= m.visibleFrom
 }
 
+// Read records that this member has read the conversation through a position.
+//
+// The cursor itself is not stored on the membership. It is projected from these
+// events (ADR-0002), which is also what enforces MS-12's forward-only rule: the
+// projection takes the greater of what it holds and what arrives, so an advance
+// that overtakes another, or arrives twice, or arrives late, all reach the same
+// state. An aggregate cannot enforce that rule, because the aggregate does not know
+// the current cursor — and pretending otherwise would mean reading the projection
+// to validate a write against it, which is a race dressed as a check.
+//
+// What the aggregate *can* enforce is the part that is about entitlement rather than
+// order: a member may not claim to have read a position that does not exist yet, or
+// one before their own join point.
+func (m *Membership) Read(through Sequence, head Sequence, now time.Time) error {
+	if err := m.acknowledgeable(through, head); err != nil {
+		return err
+	}
+	m.record(CursorAdvanced{
+		occurred:       occurred{now},
+		ConversationID: m.conversationID,
+		AccountID:      m.accountID,
+		Through:        through,
+	})
+	return nil
+}
+
+// Received records that this member's device has taken delivery through a position.
+//
+// Distinct from Read because MS-13 asks for three states and the middle one is the
+// useful one: it separates "the server accepted it" from "their device has it" from
+// "they looked at it".
+func (m *Membership) Received(through Sequence, head Sequence, now time.Time) error {
+	if err := m.acknowledgeable(through, head); err != nil {
+		return err
+	}
+	m.record(EntriesDelivered{
+		occurred:       occurred{now},
+		ConversationID: m.conversationID,
+		AccountID:      m.accountID,
+		Through:        through,
+	})
+	return nil
+}
+
+// acknowledgeable is the check both acknowledgements share.
+func (m *Membership) acknowledgeable(through Sequence, head Sequence) error {
+	if !m.Active() {
+		return ErrNotAMember
+	}
+	if through < FirstSequence {
+		return ValidationError{"through", "must be a position in the log"}
+	}
+	if through > head {
+		// Accepting this would let a client park its cursor past the end and never
+		// be told about anything again.
+		return ValidationError{"through", "is beyond the end of the conversation"}
+	}
+	if !m.CanSee(through) {
+		return ValidationError{"through", "is before your join point"}
+	}
+	return nil
+}
+
 // Leave marks the membership as no longer participating, and reports whether
 // anything changed.
 //

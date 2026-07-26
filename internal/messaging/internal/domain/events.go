@@ -76,6 +76,32 @@ type MemberJoined struct {
 
 func (MemberJoined) EventName() string { return "messaging.member_joined" }
 
+// CursorAdvanced is raised when a member reports having read through a position.
+//
+// Through, not "one more": a client that read fifty messages sends one event, and a
+// client whose earlier acknowledgement was lost is corrected by the next one. An
+// increment would need every event to arrive exactly once, which is the guarantee
+// this system does not have.
+type CursorAdvanced struct {
+	occurred
+	ConversationID ConversationID
+	AccountID      AccountID
+	Through        Sequence
+}
+
+func (CursorAdvanced) EventName() string { return "messaging.cursor_advanced" }
+
+// EntriesDelivered is raised when a member's device has taken delivery through a
+// position. The middle of MS-13's three states.
+type EntriesDelivered struct {
+	occurred
+	ConversationID ConversationID
+	AccountID      AccountID
+	Through        Sequence
+}
+
+func (EntriesDelivered) EventName() string { return "messaging.entries_delivered" }
+
 // MemberLeft is raised when a membership stops participating.
 type MemberLeft struct {
 	occurred

@@ -1,6 +1,9 @@
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // ConversationRepository stores Conversation aggregates.
 type ConversationRepository interface {
@@ -118,4 +121,76 @@ type Broadcaster interface {
 type IDs interface {
 	NewConversationID() ConversationID
 	NewEntryID() EntryID
+}
+
+// MemberState is the projected per-member view of a conversation (ADR-0002).
+//
+// Every field is eventually consistent. An entry can exist and be readable while
+// this still says nothing is unread, and clients must render that window correctly
+// rather than treating it as an error (NF-7).
+type MemberState struct {
+	ConversationID    ConversationID
+	AccountID         AccountID
+	ReadSequence      Sequence
+	DeliveredSequence Sequence
+	UnreadCount       int64
+	UpdatedAt         time.Time
+}
+
+// DeliveryState is what MS-13 asks to be observable, from the sender's side.
+type DeliveryState string
+
+const (
+	// DeliverySent means the entry is in the log and nothing more is known.
+	DeliverySent DeliveryState = "sent"
+	// DeliveryDelivered means every other member's device has taken it.
+	DeliveryDelivered DeliveryState = "delivered"
+	// DeliveryRead means every other member has read it.
+	DeliveryRead DeliveryState = "read"
+)
+
+// MemberStateStore maintains the projection.
+//
+// Not a repository: it stores no aggregate and enforces no invariant. It is a read
+// model, written only by the consumer that projects events and read only by queries
+// that would otherwise have to aggregate across the whole log.
+//
+// Every method is idempotent. That is a requirement of the port, not an accident of
+// the implementation — the consumer calling it is at-least-once (NF-8).
+type MemberStateStore interface {
+	// EnsureMember creates the row for a membership.
+	EnsureMember(ctx context.Context, conversationID ConversationID, accountID AccountID, at time.Time) error
+
+	// CountEntry increments the unread count of every member but the author.
+	CountEntry(ctx context.Context, conversationID ConversationID, sequence Sequence, author AccountID, at time.Time) error
+
+	// TouchAuthor advances the author's own marks to their own entry, because
+	// sending a message is reading it.
+	TouchAuthor(ctx context.Context, conversationID ConversationID, sequence Sequence, author AccountID, at time.Time) error
+
+	// MarkRead advances a member's read mark and recomputes their unread count.
+	MarkRead(ctx context.Context, conversationID ConversationID, accountID AccountID, through Sequence, at time.Time) error
+
+	// MarkDelivered advances a member's delivery mark.
+	MarkDelivered(ctx context.Context, conversationID ConversationID, accountID AccountID, through Sequence, at time.Time) error
+
+	// ForAccount returns the state of every conversation an account belongs to.
+	ForAccount(ctx context.Context, accountID AccountID) ([]MemberState, error)
+
+	// Of returns one member's state, zero-valued if the projection has not caught up.
+	Of(ctx context.Context, conversationID ConversationID, accountID AccountID) (MemberState, error)
+
+	// Others returns the lowest read and delivery marks among the other members,
+	// which is the position through which everyone else is up to date.
+	Others(ctx context.Context, conversationID ConversationID, excluding AccountID) (readThrough Sequence, deliveredThrough Sequence, err error)
+}
+
+// Transactor runs work atomically.
+//
+// Declared because the application layer owns transaction boundaries (ADR-0010) and
+// the transactional outbox depends on it: an event row must commit with the state
+// change it describes, so the use case — not the repository — decides what "together"
+// means.
+type Transactor interface {
+	InTransaction(ctx context.Context, work func(context.Context) error) error
 }
