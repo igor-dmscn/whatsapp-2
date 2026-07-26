@@ -31,6 +31,7 @@ import (
 	"comms/internal/messaging/internal/app"
 	"comms/internal/messaging/internal/broadcast"
 	"comms/internal/messaging/internal/postgres"
+	"comms/internal/platform/database"
 	"comms/internal/platform/database/testdb"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/id"
@@ -127,8 +128,13 @@ func newNode(t *testing.T, tokens *fakeAuthenticator) *node {
 		postgres.NewConversationRepository(db),
 		postgres.NewMembershipRepository(db),
 		postgres.NewEntryRepository(db),
+		postgres.NewMemberStateStore(db),
 		broadcast.NewRedisBroadcaster(redisClient),
-		app.NewLoggingPublisher(logger),
+		// The real outbox, not a double. These tests are what establish that an
+		// entry and its event commit together, which a recording publisher would
+		// assert nothing about.
+		postgres.NewOutboxPublisher(db),
+		database.NewConn(db),
 		app.IDs{},
 		time.Now,
 		logger,
