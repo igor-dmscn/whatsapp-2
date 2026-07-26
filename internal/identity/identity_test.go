@@ -12,10 +12,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/redis/go-redis/v9"
 
 	"comms/internal/identity/internal/domain"
 	"time"
@@ -28,6 +31,7 @@ import (
 	"comms/internal/platform/database/testdb"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/id"
+	"comms/internal/platform/ratelimit"
 )
 
 // harness is a running identity API backed by the test database.
@@ -68,11 +72,42 @@ func newHarness(t *testing.T) (*harness, *clock) {
 	)
 
 	mux := http.NewServeMux()
-	api.NewHandler(service, slog.New(slog.DiscardHandler)).Routes(mux)
+	// A real limiter over real Redis, which is what ID-5 now depends on: the limit is
+	// shared across nodes, so a per-process double would test something that no longer
+	// exists. Skipped along with the rest of the harness when Redis is unavailable.
+	api.NewHandler(service, ratelimit.New(openRedis(t), slog.New(slog.DiscardHandler)),
+		slog.New(slog.DiscardHandler)).Routes(mux)
 	server := httptest.NewServer(httpx.Chain(mux, httpx.Correlate))
 	t.Cleanup(server.Close)
 
 	return &harness{t: t, server: server, service: service, now: testClock.now, events: events}, testClock
+}
+
+// openRedis returns a client, skipping the test when Redis is unavailable.
+//
+// Identity needs Redis for one thing — ID-5's shared rate limit — which is why this appeared in
+// phase 10 and not in phase 1.
+func openRedis(t *testing.T) *redis.Client {
+	t.Helper()
+
+	url := os.Getenv("REDIS_URL")
+	if url == "" {
+		t.Skip("REDIS_URL not set, skipping integration test")
+	}
+
+	options, err := redis.ParseURL(url)
+	if err != nil {
+		t.Fatalf("parse redis url: %v", err)
+	}
+	client := redis.NewClient(options)
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		t.Fatalf("ping redis: %v", err)
+	}
+	return client
 }
 
 // recordingPublisher captures published domain events so tests can assert that

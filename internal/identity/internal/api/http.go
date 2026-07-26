@@ -16,24 +16,42 @@ import (
 	"comms/internal/identity/internal/domain"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/logging"
+	"comms/internal/platform/ratelimit"
 )
 
 // Handler serves the identity endpoints.
 type Handler struct {
 	service *app.Service
 	logger  *slog.Logger
-	lookups *RateLimiter
+	limiter *ratelimit.Limiter
 }
 
 // NewHandler returns a handler over service.
-func NewHandler(service *app.Service, logger *slog.Logger) *Handler {
-	return &Handler{
-		service: service,
-		logger:  logger,
-		// Thirty exact-handle lookups a minute is far above what using the app
-		// requires and far below what enumerating handles would need.
-		lookups: NewRateLimiter(30, time.Minute),
-	}
+func NewHandler(service *app.Service, limiter *ratelimit.Limiter, logger *slog.Logger) *Handler {
+	return &Handler{service: service, logger: logger, limiter: limiter}
+}
+
+// Handle lookups allowed per account per window (ID-5).
+//
+// Thirty a minute is far above what using the app requires and far below what enumerating a
+// namespace would need. Shared across nodes now, which is the change phase 10 makes: counted
+// per process, this limit was multiplied by the number of api nodes and loosened every time
+// the deployment grew.
+const (
+	lookupLimit  = 30
+	lookupWindow = time.Minute
+)
+
+// limitLookups bounds how often one account may resolve a handle.
+//
+// Keyed by caller, not by the handle being looked up: limiting per target would let one caller
+// sweep the whole namespace one handle at a time, which is precisely what ID-5 is about.
+func (h *Handler) limitLookups(next http.Handler) http.Handler {
+	return httpx.RateLimited(h.limiter, "handle-lookup", lookupLimit, lookupWindow,
+		func(r *http.Request) string {
+			accountID, _ := Caller(r.Context())
+			return string(accountID)
+		}, h.logger)(next)
 }
 
 // Routes registers identity endpoints on mux.
@@ -45,7 +63,7 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.Handle("GET /v1/me", h.Authenticated(http.HandlerFunc(h.me)))
 	mux.Handle("GET /v1/devices", h.Authenticated(http.HandlerFunc(h.listDevices)))
 	mux.Handle("DELETE /v1/devices/{deviceID}", h.Authenticated(http.HandlerFunc(h.revokeDevice)))
-	mux.Handle("GET /v1/accounts/{handle}", h.Authenticated(http.HandlerFunc(h.lookupHandle)))
+	mux.Handle("GET /v1/accounts/{handle}", h.Authenticated(h.limitLookups(http.HandlerFunc(h.lookupHandle))))
 }
 
 // --- request and response bodies ---
@@ -218,18 +236,6 @@ func (h *Handler) revokeDevice(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) lookupHandle(w http.ResponseWriter, r *http.Request) {
-	accountID, _ := Caller(r.Context())
-
-	// Keyed by caller, not by the handle being looked up: limiting per target
-	// would let one caller sweep the whole namespace one handle at a time.
-	if !h.lookups.Allow(string(accountID), time.Now()) {
-		httpx.WriteError(w, h.logger, http.StatusTooManyRequests, httpx.ErrorBody{
-			Code:    "rate_limited",
-			Message: "too many lookups, try again shortly",
-		})
-		return
-	}
-
 	account, err := h.service.LookupHandle(r.Context(), r.PathValue("handle"))
 	if err != nil {
 		h.writeDomainError(w, r, err)

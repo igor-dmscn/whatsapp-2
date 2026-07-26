@@ -374,7 +374,13 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
 
   **Verified across two nodes**, which is where a naive implementation is wrong — presence held in a node's memory is presence only that node can see. Three integration tests and three browser tests: the other person shows as here, shows as typing while they type, stops when they send, and disappears when they close the tab. A non-member asking gets silence rather than a refusal, so asking cannot be used to discover which conversations exist.
 - Push notifications as a Kafka consumer.
-- Rate limiting on send, handle search, and connect.
+- ~~Rate limiting on send, handle search, and connect.~~ **Done**, in Redis rather than in each process — which is the whole change, because a limit counted per node is multiplied by the node count and loosens every time the deployment grows. Phase 1's in-process limiter said so in a `ponytail:` comment and named this phase as its replacement; it is gone.
+
+  Sixty sends per ten seconds, thirty handle lookups per minute (ID-5), thirty connections per minute. All three are far above what a person does and far below what a loop does, which is the only band a useful limit occupies. Per account, not per device or per address: a device is something a client can make more of, and an address is shared by everyone behind one office router.
+
+  **It fails open, deliberately.** A limiter that cannot reach Redis allows the action, because this exists to stop abuse and accidents rather than to enforce anything correctness rests on — and refusing every send because a cache is unreachable is a far worse outage than the one it prevents. That is also this phase's own requirement: kill Redis and sends still succeed. It is stated as a test, because it is the kind of decision somebody later reads as a bug and "fixes".
+
+  One Lua script rather than INCR then EXPIRE, because a process dying between the two leaves a counter with no expiry — a caller permanently at their limit, with nothing to clear it and no reason anybody would look. A fixed window, whose flaw is named where it is chosen: a caller bursting across a window boundary gets twice the limit for an instant, which for the thing this actually guards against is not a different outcome.
 - OpenTelemetry traces spanning HTTP, WebSocket and Kafka on one correlation identifier (NF-16).
 - Backpressure: what happens to a slow socket consumer, and what happens when Redis or Kafka is unavailable.
 - A service worker, so the browser client's offline cold start is genuinely offline. Noted in phase 6 and still owed: the database survives a restart, the page it is loaded by does not.

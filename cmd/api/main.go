@@ -132,7 +132,9 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// they are behind a nested internal/ fence — so composition necessarily happens
 	// inside each context, and this file is left doing only what it should: choosing
 	// which contexts exist and how they are joined.
-	identityModule := identity.New(db, logger)
+	// Redis reaches Identity for one reason: ID-5's limit on handle lookups has to be the
+	// same limit however many api nodes there are.
+	identityModule := identity.New(db, redisClient, logger)
 
 	messagingModule := messaging.New(db, redisClient, identityModule, identityModule.Caller,
 		messaging.Options{AllowedOrigins: allowedOrigins()}, logger)

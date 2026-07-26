@@ -20,11 +20,14 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"comms/internal/identity/internal/api"
 	"comms/internal/identity/internal/app"
 	"comms/internal/identity/internal/hashing"
 	"comms/internal/identity/internal/postgres"
 	"comms/internal/platform/database"
+	"comms/internal/platform/ratelimit"
 )
 
 // Module is a wired Identity context.
@@ -36,7 +39,10 @@ type Module struct {
 // New wires the context. The composition root for Identity lives here rather than
 // in cmd/api, because cmd/api cannot see the packages being composed — which is
 // the point.
-func New(db *sql.DB, logger *slog.Logger) *Module {
+// New takes the Redis client because ID-5's limit on handle lookups is a property of the
+// account and not of whichever node it reached — see internal/platform/ratelimit. A nil client
+// means no limiting, which is what a single-process development machine wants.
+func New(db *sql.DB, redisClient *redis.Client, logger *slog.Logger) *Module {
 	service := app.NewService(
 		postgres.NewAccountRepository(db),
 		postgres.NewDeviceRepository(db),
@@ -50,7 +56,10 @@ func New(db *sql.DB, logger *slog.Logger) *Module {
 		time.Now,
 	)
 
-	return &Module{service: service, handler: api.NewHandler(service, logger)}
+	return &Module{
+		service: service,
+		handler: api.NewHandler(service, ratelimit.New(redisClient, logger), logger),
+	}
 }
 
 // Routes registers Identity's HTTP endpoints.

@@ -23,6 +23,7 @@ import (
 	"comms/internal/messaging/internal/projection"
 	"comms/internal/platform/database"
 	"comms/internal/platform/kafka"
+	"comms/internal/platform/ratelimit"
 )
 
 // Authenticator resolves an access token to the account and device presenting it.
@@ -100,7 +101,8 @@ func New(
 		hub:      hub,
 		notifier: broadcaster,
 		logger:   logger,
-		handler:  api.NewHandler(service, hub, authenticator, api.CallerResolver(caller), options.AllowedOrigins, logger),
+		handler: api.NewHandler(service, hub, authenticator, api.CallerResolver(caller),
+			options.AllowedOrigins, ratelimit.New(redisClient, logger), logger),
 	}
 }
 

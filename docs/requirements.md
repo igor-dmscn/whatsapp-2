@@ -14,7 +14,7 @@ Terminology is defined in the [context map](../CONTEXT-MAP.md) and the per-conte
 | ID-2 | An account may hold multiple credentials of different kinds. Adding a passkey later must not require altering existing credentials. |
 | ID-3 | An account may have many devices connected simultaneously. Each device authenticates independently and can be revoked independently. |
 | ID-4 | Revoking a device terminates its connection and invalidates its tokens within 30 seconds. |
-| ID-5 | Accounts are discoverable by exact handle. Partial-match search is rate limited per account. |
+| ID-5 | Accounts are discoverable by exact handle. Partial-match search is rate limited per account. Thirty lookups a minute, shared across api nodes: counted per process the limit was multiplied by the node count, which is the opposite of what a limit is for. |
 
 ### Messaging
 

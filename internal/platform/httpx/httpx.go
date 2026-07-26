@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"comms/internal/platform/id"
 	"comms/internal/platform/logging"
+	"comms/internal/platform/ratelimit"
 )
 
 // CorrelationHeader lets a client supply its own identifier so that a report of
@@ -60,6 +62,56 @@ func DecodeJSON(r *http.Request, target any) error {
 		return fmt.Errorf("decode body: %w", err)
 	}
 	return nil
+}
+
+// RateLimited refuses a request that exceeds a caller's allowance.
+//
+// Middleware rather than a check inside each handler, because a limit is a property of the
+// endpoint and not of what the endpoint does — and because a handler that has to remember to
+// call a limiter is a handler somebody will add without remembering.
+//
+// It must be wrapped *inside* whatever authenticates, since the key is usually the caller and
+// there is no caller before authentication. A limit keyed on nothing is a global limit, which is
+// a different and much blunter thing.
+//
+// 429 with Retry-After, which is what a client can act on: the header is a number of seconds a
+// well-behaved client waits, and the alternative — a bare refusal — invites an immediate retry
+// that is refused again.
+func RateLimited(
+	limiter *ratelimit.Limiter,
+	name string,
+	limit int,
+	window time.Duration,
+	key func(*http.Request) string,
+	logger *slog.Logger,
+) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			caller := key(r)
+			if caller == "" {
+				// Nothing to key on. Allowed rather than refused: an unidentifiable
+				// caller here means the authentication layer let something through, and
+				// that is a different bug to report than a rate limit.
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			decision := limiter.Allow(r.Context(), name+":"+caller, limit, window)
+			if !decision.Allowed {
+				seconds := int(decision.RetryAfter.Seconds())
+				if seconds < 1 {
+					seconds = 1
+				}
+				w.Header().Set("Retry-After", strconv.Itoa(seconds))
+				WriteError(w, logger, http.StatusTooManyRequests, ErrorBody{
+					Code:    "rate_limited",
+					Message: fmt.Sprintf("too many requests; try again in %ds", seconds),
+				})
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // Correlate assigns each request a correlation identifier, reusing the client's

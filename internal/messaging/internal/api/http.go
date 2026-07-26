@@ -19,6 +19,7 @@ import (
 	"comms/internal/messaging/internal/domain"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/logging"
+	"comms/internal/platform/ratelimit"
 )
 
 // CallerResolver reports the authenticated account and device on a request.
@@ -63,6 +64,7 @@ type Handler struct {
 	caller         CallerResolver
 	logger         *slog.Logger
 	allowedOrigins []string
+	limiter        *ratelimit.Limiter
 
 	// frameHandlers is what other contexts registered, by family.
 	frameMutex    sync.RWMutex
@@ -86,6 +88,7 @@ func NewHandler(
 	authenticator Authenticator,
 	caller CallerResolver,
 	allowedOrigins []string,
+	limiter *ratelimit.Limiter,
 	logger *slog.Logger,
 ) *Handler {
 	return &Handler{
@@ -95,8 +98,37 @@ func NewHandler(
 		caller:         caller,
 		logger:         logger,
 		allowedOrigins: allowedOrigins,
+		limiter:        limiter,
 		frameHandlers:  make(map[string]FrameHandler),
 	}
+}
+
+// Rate limits, and where each number comes from.
+//
+// All three are far above what a person does and far below what a loop does, which is the
+// only band a useful limit can sit in. They are per account rather than per device or per
+// address: a device is something a client can make more of, and an address is shared by
+// everyone behind one office router.
+const (
+	// sendLimit is generous because a person pasting a conversation into six messages is
+	// normal and a client resending a queue after being offline is normal. What it stops is
+	// a loop.
+	sendLimit  = 60
+	sendWindow = 10 * time.Second
+
+	// connectLimit allows for a client with exponential backoff reconnecting through a
+	// flapping network, and stops one that has no backoff at all — which is the failure
+	// this protects against, since a socket costs the server far more than a request.
+	connectLimit  = 30
+	connectWindow = time.Minute
+)
+
+// limitSends bounds how often one account may append to the log.
+func (h *Handler) limitSends(next http.Handler) http.Handler {
+	return httpx.RateLimited(h.limiter, "send", sendLimit, sendWindow, func(r *http.Request) string {
+		accountID, _ := h.caller(r.Context())
+		return accountID
+	}, h.logger)(next)
 }
 
 // Routes registers messaging endpoints. authenticated wraps handlers needing a
@@ -130,7 +162,10 @@ func (h *Handler) Routes(mux *http.ServeMux, authenticated func(http.Handler) ht
 	mux.Handle("POST /v1/conversations/direct", authenticated(http.HandlerFunc(h.startDirect)))
 	mux.Handle("GET /v1/conversations/{conversationID}", authenticated(http.HandlerFunc(h.getConversation)))
 	mux.Handle("GET /v1/conversations/{conversationID}/entries", authenticated(http.HandlerFunc(h.listEntries)))
-	mux.Handle("POST /v1/conversations/{conversationID}/entries", authenticated(http.HandlerFunc(h.send)))
+	// Limited inside the authentication, because the limit is per account and there is no
+	// account until the token has been read.
+	mux.Handle("POST /v1/conversations/{conversationID}/entries",
+		authenticated(h.limitSends(http.HandlerFunc(h.send))))
 }
 
 // --- bodies ---

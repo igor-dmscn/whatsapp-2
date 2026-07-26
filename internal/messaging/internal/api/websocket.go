@@ -199,6 +199,22 @@ func (h *Handler) handshake(ctx context.Context, socket *websocket.Conn, logger 
 		return nil, err //nolint:wrapcheck // caller only closes the socket.
 	}
 
+	// Limited here rather than at the upgrade, because the limit is per account and an
+	// unauthenticated socket has no account. The handshake timeout is what bounds the other
+	// case — somebody opening sockets and never proving anything.
+	//
+	// A socket is the most expensive thing a client can ask for: it is held, subscribed and
+	// remembered, where a request is answered and forgotten. So this refuses harder than the
+	// HTTP limits do, and says how long to wait.
+	if decision := h.limiter.Allow(authCtx,
+		"connect:"+accountID, connectLimit, connectWindow); !decision.Allowed {
+		writeFrameTo(authCtx, socket, errorFrame{
+			"error", "rate_limited",
+			fmt.Sprintf("too many connections; try again in %ds", int(decision.RetryAfter.Seconds())+1),
+		})
+		return nil, fmt.Errorf("connection rate limit reached for %s", accountID)
+	}
+
 	connection := NewConnection(socket, domain.AccountID(accountID), deviceID, logger)
 
 	if err := connection.WriteFrame(authCtx, readyFrame{"ready", accountID, deviceID}); err != nil {

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +37,7 @@ import (
 	"comms/internal/platform/database/testdb"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/id"
+	"comms/internal/platform/ratelimit"
 )
 
 // node is one api instance: its own hub and HTTP server, sharing Postgres and
@@ -184,7 +186,11 @@ func newNode(t *testing.T, tokens *fakeAuthenticator) *node {
 	}
 
 	mux := http.NewServeMux()
-	api.NewHandler(service, hub, tokens, resolveCaller, []string{"*"}, logger).Routes(mux, authenticated)
+	// A real limiter over real Redis. The limits are far above anything these tests do, so
+	// they are invisible here — which is the point: a limiter that changed the outcome of an
+	// ordinary test would be a limiter set too low.
+	api.NewHandler(service, hub, tokens, resolveCaller, []string{"*"},
+		ratelimit.New(redisClient, logger), logger).Routes(mux, authenticated)
 
 	server := httptest.NewServer(httpx.Chain(mux, httpx.Correlate))
 	t.Cleanup(server.Close)
@@ -267,6 +273,39 @@ func (n *node) startDirect(token, otherAccountID string) conversationBody {
 		n.t.Fatalf("start direct: status %d", status)
 	}
 	return conversation
+}
+
+// sendRaw posts an entry and returns the status and headers without asserting either.
+//
+// Needed because every other send helper fails the test on anything but 201, which is right for
+// tests about messaging and useless for a test about being refused.
+func (n *node) sendRaw(token, conversationID, text string) (int, http.Header) {
+	n.t.Helper()
+
+	body, err := json.Marshal(map[string]string{
+		"client_entry_id": id.New(),
+		"content_type":    "text/plain",
+		"body":            base64.StdEncoding.EncodeToString([]byte(text)),
+	})
+	if err != nil {
+		n.t.Fatal(err)
+	}
+
+	request, err := http.NewRequest(http.MethodPost,
+		n.server.URL+"/v1/conversations/"+conversationID+"/entries", bytes.NewReader(body))
+	if err != nil {
+		n.t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+token)
+
+	response, err := n.server.Client().Do(request)
+	if err != nil {
+		n.t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	return response.StatusCode, response.Header
 }
 
 func (n *node) send(token, conversationID, text string) entryBody {
@@ -1177,4 +1216,96 @@ func TestSomebodyElsesConversationHasNoPresence(t *testing.T) {
 	// conversations exist — the same rule Send follows.
 	outsider.write(map[string]any{"type": "presence.ask", "conversation_id": conversation.ID})
 	outsider.expectNothing()
+}
+
+// --- rate limits ---
+
+// TestSendingTooFastIsRefusedWithRetryAfter is the send limit.
+//
+// Sixty in ten seconds is far above what a person does and far below what a loop does, which is
+// the only band a useful limit can occupy. What is asserted is not the number but the shape: the
+// caller is refused with 429, told how long to wait, and — the part worth testing — allowed again
+// afterwards, because a limit that never lifts is a ban.
+func TestSendingTooFastIsRefusedWithRetryAfter(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+
+	ana, bruno := newAccountID(), newAccountID()
+	anaToken := tokens.issue(ana)
+	_ = tokens.issue(bruno)
+	conversation := node.startDirect(anaToken, bruno)
+
+	var refused, retryAfter string
+	sent := 0
+	for range 200 {
+		status, headers := node.sendRaw(anaToken, conversation.ID, fmt.Sprintf("burst %d", sent))
+		if status == http.StatusTooManyRequests {
+			refused = "yes"
+			retryAfter = headers.Get("Retry-After")
+			break
+		}
+		sent++
+	}
+
+	if refused == "" {
+		t.Fatalf("%d sends in a row were never refused", sent)
+	}
+	if sent < 10 {
+		t.Fatalf("refused after only %d sends, which is below anything a person would hit", sent)
+	}
+	// Retry-After is the part a client can act on. Without it the only advice a refusal
+	// carries is "not now", which invites an immediate retry that is refused again.
+	if retryAfter == "" {
+		t.Fatal("a 429 carried no Retry-After header")
+	}
+	seconds, err := strconv.Atoi(retryAfter)
+	if err != nil || seconds < 1 {
+		t.Fatalf("Retry-After = %q, want a positive number of seconds", retryAfter)
+	}
+
+	// Somebody else is unaffected, which is what "per account" means. A limiter keyed on
+	// the wrong thing passes everything above and fails here.
+	brunoToken := tokens.issue(bruno)
+	if status, _ := node.sendRaw(brunoToken, conversation.ID, "not my fault"); status != http.StatusCreated {
+		t.Fatalf("another account's send returned %d while ana was limited", status)
+	}
+}
+
+// TestReconnectingTooFastIsRefused is the connect limit.
+//
+// A socket is the most expensive thing a client can ask for — held, subscribed and remembered,
+// where a request is answered and forgotten — so this refuses before the connection is
+// established rather than after.
+func TestReconnectingTooFastIsRefused(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+
+	ana := newAccountID()
+	anaToken := tokens.issue(ana)
+
+	// Each dial is a fresh socket for the same account, which is what a client with no
+	// backoff does when a network flaps.
+	var refused bool
+	for attempt := range 60 {
+		client := node.dial(t)
+		client.write(map[string]string{"type": "authenticate", "token": anaToken})
+
+		frame := client.read()
+		if frame["type"] == "error" && frame["code"] == "rate_limited" {
+			refused = true
+			if message, _ := frame["message"].(string); !strings.Contains(message, "try again") {
+				t.Fatalf("refusal says %q, which tells the client nothing to do", message)
+			}
+			client.close()
+			break
+		}
+		if frame["type"] != "ready" {
+			t.Fatalf("attempt %d: got %v", attempt, frame)
+		}
+		client.close()
+	}
+
+	if !refused {
+		t.Fatal("sixty connections in a row were never refused")
+	}
 }
