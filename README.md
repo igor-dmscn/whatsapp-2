@@ -2,7 +2,7 @@
 
 Real-time messaging, media sharing, and live audio/video calling. A Go backend with React and CLI clients, built as a reference implementation — the codebase is meant to be read, so the reasoning is committed alongside the code.
 
-**Status: phases 0–5 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, the transactional outbox with Kafka and projections, groups and channels with invite links, edits, deletes, replies and reactions, and a browser client that covers all of it. Phase 6 is next. See [the plan](./docs/plan.md).
+**Status: phases 0–6 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, the transactional outbox with Kafka and projections, groups and channels with invite links, edits, deletes, replies and reactions, a terminal client, and both clients persisting locally with offline search. Phase 7 is next. See [the plan](./docs/plan.md).
 
 ## Running it
 
@@ -55,6 +55,7 @@ Three binaries, split by resource profile rather than by bounded context ([ADR-0
 | `api` | HTTP and WebSocket surface for Identity, Messaging and Media |
 | `worker` | Read-model projections and media processing |
 | `sfu` | Call media forwarding |
+| `cli` | Terminal client — messaging only ([why](./docs/adr/0006-custom-pion-sfu-with-simulcast.md)) |
 
 Contexts are packages inside `api`. Each exposes exactly one package and hides its layers behind a nested `internal/`, so **the compiler refuses cross-context access to a model** — not a linter, not a review convention ([ADR-0011](./docs/adr/0011-nested-internal-fences.md)). `cmd/api` imports two packages and wires them; each context composes itself.
 
@@ -68,5 +69,6 @@ These surprise people, so they are stated here rather than left to be discovered
 - **Kafka and Redis are both present on purpose.** Redis Pub/Sub delivers to sockets and is allowed to drop messages; clients recover by detecting gaps in sequence numbers. ([ADR-0005](./docs/adr/0005-redis-pubsub-for-socket-fanout.md))
 - **Nothing in the log is ever modified.** Edits and deletes append revisions, because clients sync strictly forward and an in-place edit would be invisible to any client that had already passed it. ([ADR-0008](./docs/adr/0008-mutations-are-log-entries.md))
 - **CQRS applies to Messaging only, and without event sourcing.** Elsewhere it would be ceremony.
+- **There is no server-side search, and there never will be.** The server does not read message text, so search is a client feature: both clients hold a local SQLite store with the same schema and the same full-text query, and a test asserts they answer identically. ([client sync contract](./docs/client-sync.md))
 - **The clients are trusted to detect their own missing messages.** The server does not track what each device holds; a client resumes from the highest sequence it has with no hole below it, and the server answers with what is missing. ([client sync contract](./docs/client-sync.md))
 - **The SFU is ours, built on Pion.** The expensive choice, made because the media path is the part of this system most worth learning from. ([ADR-0006](./docs/adr/0006-custom-pion-sfu-with-simulcast.md))

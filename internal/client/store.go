@@ -319,6 +319,20 @@ func (s *Store) SaveEntries(ctx context.Context, conversationID string, entries 
 	}
 	defer func() { _ = transaction.Rollback() }()
 
+	// A conversation row for anything we hold entries of, even if the list has not been
+	// fetched yet. Without it the mark cannot advance and a cold start finds nothing —
+	// entries stored, conversation not, an empty screen over a full database. Found in
+	// the browser client, which has the same shape and had the same bug.
+	//
+	// The kind is left empty and the join point assumed to be the first position: both
+	// are corrected by the next refresh, and a join point that is too low costs a
+	// refetch where one too high would skip messages.
+	if _, err := transaction.ExecContext(ctx,
+		`INSERT INTO conversations (id, kind, visible_from) VALUES (?, '', 1)
+		 ON CONFLICT (id) DO NOTHING`, conversationID); err != nil {
+		return fmt.Errorf("ensure conversation row: %w", err)
+	}
+
 	for _, entry := range entries {
 		if _, err := transaction.ExecContext(ctx,
 			`INSERT INTO entries

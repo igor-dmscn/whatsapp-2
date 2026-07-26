@@ -9,7 +9,9 @@
 // Deliberately free of React. The protocol is stateful and must survive re-renders,
 // StrictMode's double-mounted effects, and being tested with no DOM at all.
 
-import type { Entry, Reaction } from './api'
+import { decodeBody, encodeBody } from './api'
+import type { Conversation, Entry, Reaction } from './api'
+import type { LocalStore } from './store'
 import type { ReactionsBySequence } from './transcript'
 
 export type SyncStatus = 'connecting' | 'live' | 'offline'
@@ -39,6 +41,14 @@ export type SyncOptions = {
   token: () => Promise<string>
   /** fetchEntries returns what follows a sequence. This is how gaps are filled. */
   fetchEntries: (conversationID: string, after: number) => Promise<Entry[]>
+  /** postEntry sends an entry.
+   *
+   *  A dependency rather than an argument to send(), because a *reload* has to be able
+   *  to flush what a previous session left pending — and a poster remembered from an
+   *  earlier send() is null in a process that has not sent anything yet. That was the
+   *  first version of this, and it meant a message queued before a refresh stayed queued
+   *  forever. */
+  postEntry?: (conversationID: string, clientEntryID: string, text: string, replyTo: number) => Promise<Entry>
   /** open connects. Defaults to a real WebSocket at the current origin.
    *
    *  It takes no URL: the default computes one from location, and a caller that
@@ -48,6 +58,13 @@ export type SyncOptions = {
   open?: () => Socket
   /** onFatal reports a failure reconnecting cannot fix, such as an expired session. */
   onFatal?: (error: unknown) => void
+  /** store persists what is synced, so a cold start renders before connecting.
+   *
+   *  Optional. Without it the client behaves exactly as it did before phase 6 —
+   *  everything in memory, a reload refetches — which is also what happens when OPFS is
+   *  unavailable. Persistence is an optimisation of the cold start, not a requirement
+   *  for correctness, and the code says so by making it possible to leave out. */
+  store?: LocalStore
 }
 
 /** heartbeat keeps the connection warm through anything that drops idle
@@ -199,6 +216,8 @@ export class Sync {
     accountID: string,
     removed: boolean,
   ): void {
+    this.options.store?.setReaction(conversationID, sequence, accountID, emoji, removed)
+
     let bySequence = this.reactions.get(conversationID)
     if (!bySequence) {
       bySequence = new Map()
@@ -215,6 +234,106 @@ export class Sync {
     if (removed) accounts.delete(accountID)
     else accounts.add(accountID)
     byEmoji.set(emoji, accounts)
+  }
+
+  /**
+   * send records a pending entry, then attempts it.
+   *
+   * Recorded first, deliberately, and this is the browser half of what the CLI does. A
+   * send attempted before being written is lost if the tab closes waiting for the
+   * response — and its client identifier with it, so the retry would create a second
+   * entry rather than being recognised as the same one (MS-2).
+   *
+   * The poster is passed in rather than the API being a dependency here: this file owns
+   * the protocol, not the HTTP surface.
+   */
+  async send(conversationID: string, clientEntryID: string, text: string, replyTo: number): Promise<void> {
+    const post = this.options.postEntry
+    if (!post) throw new Error('this client was not built with a way to send')
+
+    this.options.store?.addPending({ clientEntryID, conversationID, body: text, replyTo })
+
+    const entry = await post(conversationID, clientEntryID, text, replyTo)
+    // Storing it clears the pending row, matched by client identifier — so the socket
+    // echo reconciles it too, even if this response were lost.
+    this.accept(entry)
+  }
+
+  /**
+   * flushPending retries everything unacknowledged.
+   *
+   * Every retry carries its original identifier, which is what makes "send while the
+   * server is unreachable, come back, and the message arrives exactly once" true rather
+   * than hopeful.
+   */
+  async flushPending(): Promise<void> {
+    const store = this.options.store
+    const post = this.options.postEntry
+    if (!store || !post) return
+
+    for (const pending of store.pendingSends()) {
+      try {
+        const entry = await post(
+          pending.conversation_id, pending.client_entry_id, pending.body, pending.reply_to)
+        this.accept(entry)
+      } catch (failure) {
+        // Still unreachable, or refused. Left pending: the next connection tries again,
+        // and a permanently refused send is dropped by the CLI's rule rather than
+        // silently blocking the queue — which is phase 10's work for this client.
+        this.options.onFatal?.(failure)
+        return
+      }
+    }
+  }
+
+  /** hydrate loads what a previous session stored, before any network call.
+   *
+   *  This is NF-5: the conversation list and the open conversation render from local
+   *  storage with the network disabled. Called before start(), so the first paint owes
+   *  nothing to a socket.
+   *
+   *  The mark comes back with the entries, which is the part that matters beyond
+   *  rendering — resuming from what was stored rather than from zero is what stops a
+   *  cold start refetching the whole history. */
+  hydrate(): void {
+    const store = this.options.store
+    if (!store) return
+
+    for (const [conversationID, contiguous] of Object.entries(store.cursor())) {
+      const log = this.logOf(conversationID)
+      log.contiguous = contiguous
+      for (const held of store.entries(conversationID)) {
+        log.entries.set(held.sequence, {
+          id: held.id,
+          conversation_id: held.conversation_id,
+          sequence: held.sequence,
+          author_id: held.author_id,
+          client_entry_id: held.client_entry_id,
+          kind: held.kind,
+          content_type: 'text/plain; charset=utf-8',
+          // Stored decoded, so re-encoded on the way in: the snapshot's entries carry
+          // the wire form, and one representation through the render path is worth an
+          // encode per cold start.
+          body: encodeBody(held.body),
+          created_at: held.created_at,
+          target_sequence: held.target_sequence || undefined,
+          reply_to: held.reply_to || undefined,
+        })
+      }
+
+      for (const reaction of store.reactions(conversationID)) {
+        this.setReaction(conversationID, reaction.sequence, reaction.emoji, reaction.account_id, false)
+      }
+    }
+
+    this.publish()
+  }
+
+  /** rememberConversations persists what the server said about the list. */
+  rememberConversations(conversations: Conversation[]): void {
+    const store = this.options.store
+    if (!store) return
+    for (const conversation of conversations) store.saveConversation(conversation)
   }
 
   /** follow makes a conversation known before any entry arrives, so opening one
@@ -344,6 +463,9 @@ export class Sync {
         this.attempt = 0
         this.resume()
         this.startHeartbeat()
+        // A connection is the moment to retry what could not be sent while there was
+        // none.
+        void this.flushPending()
         break
 
       case 'gaps':
@@ -426,7 +548,45 @@ export class Sync {
 
     log.entries.set(entry.sequence, entry)
     while (log.entries.has(log.contiguous + 1)) log.contiguous++
+
+    this.persist(conversationID, entry)
     return true
+  }
+
+  /** persist mirrors an entry into the local store, amendments included.
+   *
+   *  The in-memory map stays the render source because React needs a synchronous read;
+   *  the store is what survives a reload. Mirrored rather than read back through, so a
+   *  storage failure degrades to the pre-phase-6 behaviour instead of breaking the
+   *  screen. */
+  private persist(conversationID: string, entry: Entry): void {
+    const store = this.options.store
+    if (!store) return
+
+    try {
+      store.saveEntries(conversationID, [
+        {
+          conversation_id: conversationID,
+          sequence: entry.sequence,
+          id: entry.id,
+          author_id: entry.author_id,
+          client_entry_id: entry.client_entry_id,
+          kind: entry.kind,
+          body: decodeBody(entry.body),
+          target_sequence: entry.target_sequence ?? 0,
+          reply_to: entry.reply_to ?? 0,
+          created_at: entry.created_at,
+        },
+      ])
+
+      // An amendment updates its target's stored row, so search reflects what a message
+      // now says rather than what it said (ADR-0008).
+      if (entry.target_sequence) {
+        store.applyAmendment(conversationID, entry.target_sequence, entry.kind, decodeBody(entry.body))
+      }
+    } catch (failure) {
+      this.options.onFatal?.(failure)
+    }
   }
 
   private onEntry(frame: entryFrame): void {
@@ -473,7 +633,10 @@ export class Sync {
           // member who joined a conversation late from treating the history
           // before their join point as a permanent gap and refetching forever.
           const first = page[0]!
-          if (first.sequence > log.contiguous + 1) log.contiguous = first.sequence - 1
+          if (first.sequence > log.contiguous + 1) {
+            log.contiguous = first.sequence - 1
+            this.options.store?.closeOver(conversationID, log.contiguous)
+          }
 
           for (const entry of page) this.store(conversationID, entry)
 

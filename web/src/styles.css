@@ -480,3 +480,34 @@ aside {
   color: var(--muted);
   font-size: 0.8rem;
 }
+
+/* --- search (phase 6) --- */
+
+.search {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.search input {
+  margin-top: 0;
+}
+
+.hits {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  max-height: 12rem;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  font-size: 0.8rem;
+}
+
+.hits button {
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

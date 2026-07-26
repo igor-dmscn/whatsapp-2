@@ -32,10 +32,11 @@ func main() {
 		email      = flag.String("email", "", "email, when registering")
 		register   = flag.Bool("register", false, "create the account rather than signing in")
 		search     = flag.String("search", "", "search the local store and exit, without connecting")
+		syncOnce   = flag.Bool("sync", false, "sync once and exit, without starting the interface")
 	)
 	flag.Parse()
 
-	if err := run(*apiURL, *storePath, *handle, *passphrase, *email, *register, *search); err != nil {
+	if err := run(*apiURL, *storePath, *handle, *passphrase, *email, *register, *search, *syncOnce); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -55,7 +56,7 @@ func defaultStorePath() string {
 	return filepath.Join(directory, "comms", "comms.db")
 }
 
-func run(apiURL, storePath, handle, passphrase, email string, register bool, search string) error {
+func run(apiURL, storePath, handle, passphrase, email string, register bool, search string, syncOnce bool) error {
 	if storePath != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(storePath), 0o700); err != nil {
 			return fmt.Errorf("create store directory: %w", err)
@@ -85,6 +86,13 @@ func run(apiURL, storePath, handle, passphrase, email string, register bool, sea
 		return store.SaveSession(ctx, rotated)
 	})
 	syncer := client.NewSyncer(api, store)
+
+	// Sync once and exit. For scripts and for the cross-client test that asserts this
+	// client and the browser answer the same search identically — which needs both to
+	// have synced the same conversation without either being driven by hand.
+	if syncOnce {
+		return syncer.Refresh(ctx)
+	}
 
 	program := tea.NewProgram(newModel(ctx, api, store, syncer), tea.WithAltScreen())
 

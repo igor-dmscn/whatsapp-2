@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { ApiError, Client, deliveryOf, login, register, SessionExpired } from './api'
 import type { Conversation, DeliveryState, Invite, Member, Role, Session } from './api'
 import { Sync } from './sync'
+import { LocalStore, type Hit } from './store'
 import { resolve, summarise, type Message, type ReactionsBySequence } from './transcript'
 
 // sessionStorage, not localStorage, and the difference matters here: sessionStorage
@@ -43,6 +44,26 @@ function describe(error: unknown): string {
 
 export function App() {
   const [session, setSession] = useState<Session | null>(loadSession)
+  // undefined while SQLite is still loading, null when it could not be opened.
+  const [store, setStore] = useState<LocalStore | null | undefined>(undefined)
+
+  useEffect(() => {
+    let live = true
+    LocalStore.open()
+      .then((opened) => {
+        if (live) setStore(opened)
+        else opened.close()
+      })
+      .catch(() => {
+        // No local store. The client then behaves as it did before phase 6 — in
+        // memory, refetching on reload — which is a worse experience and a working
+        // one. Refusing to start would be the wrong trade.
+        if (live) setStore(null)
+      })
+    return () => {
+      live = false
+    }
+  }, [])
 
   const remember = useCallback((next: Session | null) => {
     if (next) sessionStorage.setItem(sessionKey, JSON.stringify(next))
@@ -55,9 +76,21 @@ export function App() {
   const signOut = useCallback(() => remember(null), [remember])
 
   if (!session) return <SignIn onSignedIn={remember} />
+
+  // Waiting on SQLite rather than rendering an empty conversation list and filling it
+  // in: the whole point of the store is that the first paint is the real one, and a
+  // flash of "no conversations" would undo it.
+  if (store === undefined) {
+    return (
+      <main className="centred">
+        <p className="muted">Opening local store…</p>
+      </main>
+    )
+  }
+
   // Keyed by device so signing out and back in builds a fresh Client and Sync
   // rather than reusing ones holding a revoked token.
-  return <Workspace key={session.device_id} session={session} onSignOut={signOut} />
+  return <Workspace key={session.device_id} session={session} store={store} onSignOut={signOut} />
 }
 
 // --- sign in ---
@@ -158,7 +191,15 @@ function SignIn({ onSignedIn }: { onSignedIn: (session: Session) => void }) {
 
 // --- workspace ---
 
-function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => void }) {
+function Workspace({
+  session,
+  store,
+  onSignOut,
+}: {
+  session: Session
+  store: LocalStore | null
+  onSignOut: () => void
+}) {
   const [error, setError] = useState<string | null>(null)
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [selected, setSelected] = useState<string | null>(null)
@@ -191,12 +232,18 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
       new Sync({
         token: () => client.token(),
         fetchEntries: (conversationID, after) => client.entries(conversationID, after),
+        postEntry: (conversationID, clientEntryID, text, replyTo) =>
+          client.send(conversationID, clientEntryID, text, replyTo),
         onFatal: (failure) => fatal.current(failure),
+        store: store ?? undefined,
       }),
-    [client],
+    [client, store],
   )
 
   useEffect(() => {
+    // Hydrate first, connect second. NF-5 is exactly this ordering: what a previous
+    // session stored is on screen before any request leaves.
+    sync.hydrate()
     sync.start()
     return () => sync.stop()
   }, [sync])
@@ -206,6 +253,7 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
   const load = useCallback(async () => {
     try {
       const found = await client.conversations()
+      sync.rememberConversations(found)
       setConversations(found)
       for (const conversation of found) sync.follow(conversation.id)
       setSelected((current) => current ?? found[0]?.id ?? null)
@@ -213,6 +261,31 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
       fatal.current(failure)
     }
   }, [client, sync])
+
+  // The stored list first, so an offline cold start shows conversations rather than
+  // nothing while the request that will never succeed is in flight.
+  useEffect(() => {
+    if (!store) return
+    const held = store.conversations()
+    if (held.length === 0) return
+
+    setConversations(
+      held.map((conversation) => ({
+        id: conversation.id,
+        kind: conversation.kind,
+        head: conversation.head,
+        role: conversation.role,
+        visible_from: conversation.visible_from,
+        created_at: '',
+        unread: conversation.unread,
+        read_through: 0,
+        delivered_through: 0,
+        others_read_through: conversation.others_read,
+        others_delivered_through: conversation.others_delivered,
+      })),
+    )
+    setSelected((current) => current ?? held[0]?.id ?? null)
+  }, [store])
 
   // The socket reports gaps for conversations that have entries; one with none
   // would go unmentioned. The list is what makes those visible.
@@ -336,6 +409,7 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
 
       <div className="panes">
         <aside>
+          <Search store={store} onOpen={setSelected} />
           <StartDirect onStart={startDirect} />
           <NewConversation
             onGroup={async () => {
@@ -426,8 +500,9 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
                 replyTo={replyTo}
                 onCancelReply={() => setReplyTo(0)}
                 onSend={async (text, clientEntryID) => {
-                  const entry = await client.send(selected, clientEntryID, text, replyTo)
-                  sync.accept(entry)
+                  // Through the syncer, so the send is recorded as pending before it is
+                  // attempted and retried on the next connection if it fails.
+                  await sync.send(selected, clientEntryID, text, replyTo)
                   setReplyTo(0)
                 }}
                 onError={setError}
@@ -665,6 +740,58 @@ function Members({
         </div>
       )}
     </section>
+  )
+}
+
+/** Search queries the local store, and only the local store.
+ *
+ *  There is no server-side search and there never will be: the server does not read
+ *  message text (ADR-0001). So this works offline, and it is the only search this system
+ *  has. The CLI runs the same query against the same schema — see store.ts. */
+function Search({ store, onOpen }: { store: LocalStore | null; onOpen: (id: string) => void }) {
+  const [query, setQuery] = useState('')
+  const [hits, setHits] = useState<Hit[]>([])
+
+  useEffect(() => {
+    if (!store || query.trim() === '') {
+      setHits([])
+      return
+    }
+    // Synchronous: SQLite here is WebAssembly on this thread, so there is nothing to
+    // await and no loading state to render. That is a property of the choice, not an
+    // oversight.
+    setHits(store.search(query, 20))
+  }, [store, query])
+
+  if (!store) {
+    return (
+      <p className="muted hint">
+        Search needs a local store, which this browser would not provide.
+      </p>
+    )
+  }
+
+  return (
+    <div className="search">
+      <input
+        value={query}
+        onChange={(event) => setQuery(event.target.value)}
+        placeholder="search messages"
+        aria-label="Search messages"
+      />
+      {query.trim() !== '' && (
+        <ul className="hits">
+          {hits.length === 0 && <li className="muted">no matches</li>}
+          {hits.map((hit) => (
+            <li key={`${hit.conversation_id}-${hit.sequence}`}>
+              <button type="button" className="link" onClick={() => onOpen(hit.conversation_id)}>
+                #{hit.sequence} {hit.body.slice(0, 40)}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   )
 }
 

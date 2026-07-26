@@ -10,6 +10,11 @@ import { defineConfig } from 'vitest/config'
 // value or the server sees Origin and Host disagree and rejects the upgrade.
 export default defineConfig({
   plugins: [react()],
+  // SQLite's WebAssembly is fetched at runtime by a `new URL(..., import.meta.url)`
+  // inside the package. Vite's dependency pre-bundling rewrites that module, which
+  // breaks the resolution and leaves the wasm 404ing — excluding it keeps the package's
+  // own layout intact. Found by the store silently falling back to memory.
+  optimizeDeps: { exclude: ['@sqlite.org/sqlite-wasm'] },
   server: {
     port: 5173,
     proxy: {

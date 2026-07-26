@@ -50,8 +50,10 @@ waitFor() {
   return 1
 }
 
-echo "building api and worker"
-go build -o bin/ ./cmd/api ./cmd/worker
+echo "building api, worker and cli"
+# The cli is built because the browser suite runs it: one of phase 6's verifications is
+# that both clients answer the same search identically, which needs both to exist.
+go build -o bin/ ./cmd/api ./cmd/worker ./cmd/cli
 
 echo "starting two api nodes"
 API_ADDR=:8080 ./bin/api >"$logs/api-8080.log" 2>&1 &

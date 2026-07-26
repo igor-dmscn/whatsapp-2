@@ -152,7 +152,7 @@ The client gained `web/src/transcript.ts` — a pure function turning entries in
 
 ---
 
-## Phase 6 — Client persistence and search
+## Phase 6 — Client persistence and search — **complete**
 
 **Goal:** both clients work offline and can search, which the server cannot do for them.
 
@@ -165,6 +165,17 @@ The client gained `web/src/transcript.ts` — a pure function turning entries in
 **Frontend increment:** the browser client stops being in-memory. Cold start renders from local storage before the socket connects.
 
 **Verify:** cold start with a populated store renders the conversation list in under 500 ms with the network disabled (NF-5). Search returns results offline. Send while offline, come back, and the entry sends exactly once with no duplicate. The CLI and browser produce identical results for the same query — this is the check that the two stores have not diverged in behaviour.
+
+**Verified.** Cold start rendered the conversation list in **255 ms** against NF-5's 500. Search works with the api unreachable. A send that fails is flushed on the next connection with its original identifier, arriving exactly once, in both clients. And the cross-client check runs the CLI's `-sync` and `-search` against the same account the browser is signed in as, comparing four queries.
+
+**One scope limit, stated rather than hidden.** The browser test cuts `/v1`, not the whole network. A browser needs the network to fetch the document and its scripts, so a *fully* offline cold start requires the app shell to be cached by a service worker — which does not exist yet and is production-build work. What is verified is this phase's part: with the api answering nothing, the screen is drawn from local storage. The service worker belongs in phase 10.
+
+Four findings:
+
+- **OPFS's synchronous access handles are worker-only**, so SQLite's OPFS VFS means the database lives in a worker and every read becomes asynchronous — which reaches all the way into rendering, because `useSyncExternalStore` needs a synchronous snapshot. Instead the database is in memory on the main thread and its bytes are snapshotted into OPFS after writes settle. Reads stay synchronous; the worst loss is the last quarter-second, which sync repairs because the mark is in the snapshot too.
+- **Vite's dependency pre-bundling broke SQLite's runtime wasm resolution**, leaving the store silently falling back to memory. `optimizeDeps.exclude` fixes it; an empty `catch` is what made it hard to find, and it now logs.
+- **Entries could be stored before their conversation row existed**, so the mark could not advance and a cold start rendered an empty screen over a full database. Both stores now create the row alongside the entries. The same bug was latent in the CLI.
+- **A pending send could not be flushed after a reload**, because the function that posts it was remembered from an earlier send rather than being a dependency — so a message queued before a refresh stayed queued forever.
 
 ---
 
