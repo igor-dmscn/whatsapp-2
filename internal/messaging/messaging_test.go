@@ -134,9 +134,18 @@ func testLogger() *slog.Logger {
 // newNode starts an api instance sharing the given authenticator.
 func newNode(t *testing.T, tokens *fakeAuthenticator) *node {
 	t.Helper()
+	return newNodeWith(t, tokens, openRedis(t))
+}
+
+// newNodeWith starts an api instance over a given Redis client.
+//
+// Separate so that one test can hand it a client pointing at nothing, which is how the
+// requirement "kill Redis and sends still succeed" is checked without killing the Redis every
+// other test is using.
+func newNodeWith(t *testing.T, tokens *fakeAuthenticator, redisClient *redis.Client) *node {
+	t.Helper()
 
 	db := testdb.Open(t)
-	redisClient := openRedis(t)
 	logger := testLogger()
 
 	service := app.NewService(
@@ -1307,5 +1316,173 @@ func TestReconnectingTooFastIsRefused(t *testing.T) {
 
 	if !refused {
 		t.Fatal("sixty connections in a row were never refused")
+	}
+}
+
+// --- backpressure ---
+
+// TestASlowConsumerIsDisconnectedRatherThanBuffered is phase 10's stated verification.
+//
+// A client that stops reading must not become the server's problem. The alternative to closing
+// it is an unbounded queue per socket, which is a memory incident with a delay: one unresponsive
+// client, a busy conversation, and the node dies for everybody.
+//
+// Closing is safe *because* of the sync protocol. The client reconnects, resumes with what it
+// holds, and is told what it missed — which is the same mechanism that already covers being
+// offline, so a dropped slow consumer costs one fetch and no correctness.
+func TestASlowConsumerIsDisconnectedRatherThanBuffered(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+
+	// A group with three senders, not a direct conversation with one. The queue is bounded
+	// at sixty-four *messages* and one account may send sixty in ten seconds — so a single
+	// sender cannot overflow it without waiting out a rate window, and the first version of
+	// this test sat at exactly that ceiling and concluded the buffer was unbounded.
+	sluggish := newAccountID()
+	sluggishToken := tokens.issue(sluggish)
+	conversation := node.startGroup(sluggishToken)
+
+	senders := make([]string, 0, 6)
+	for range 6 {
+		account := newAccountID()
+		token := tokens.issue(account)
+		if _, status := node.addMember(sluggishToken, conversation.ID, account); status != http.StatusCreated {
+			t.Fatalf("adding a sender returned %d", status)
+		}
+		senders = append(senders, token)
+	}
+
+	// The slow client connects and then never reads again. Nothing here reads from its
+	// socket after this point, which is exactly what a wedged client looks like.
+	quiet := node.dial(t)
+	quiet.authenticate(sluggishToken)
+	quiet.resume(nil)
+
+	awaitConnections(t, node, 1)
+
+	// Large bodies on purpose, and this took two attempts to get right. The server's queue
+	// is bounded in *messages*, but the socket underneath it buffers in the kernel and the
+	// kernel autotunes upward — so filling the queue means putting more bytes in flight than
+	// the socket will absorb, not more messages than the queue holds. Thirty-two kilobytes
+	// times the sixty sends the rate limit allows was not enough.
+	//
+	// Sixty kilobytes, just under the sixty-four an entry's payload is capped at — anything
+	// bigger belongs in an attachment, which is a domain rule and refused the first attempt
+	// at this with a 422. Three hundred of them is eighteen megabytes in flight, which is
+	// past anything the kernel will buffer on either side however it autotunes.
+	filler := strings.Repeat("x", 60*1024)
+	sent := 0
+	for _, token := range senders {
+		for range 50 {
+			if status, _ := node.sendRaw(token, conversation.ID, filler); status != http.StatusCreated {
+				break
+			}
+			sent++
+		}
+	}
+	if sent <= outboundQueue {
+		t.Fatalf("only %d entries were sent, which cannot overflow a queue of %d",
+			sent, outboundQueue)
+	}
+
+	// Dropped, and dropped *quickly*, which is the part that says which mechanism did it.
+	//
+	// There are two, and this test is about the first: the bounded queue closes the
+	// connection as soon as a frame cannot be queued, while the ten-second write deadline
+	// closes it eventually regardless. Asserting only "dropped" passes on either — the first
+	// version of this test did, and still passed with the queue made unbounded, because the
+	// write timeout was quietly doing the work. A few seconds can only be the queue.
+	dropped := time.Now()
+	awaitConnections(t, node, 0)
+
+	if elapsed := time.Since(dropped); elapsed > queueMustCloseWithin {
+		t.Fatalf("the connection took %s to close, which is the write deadline expiring "+
+			"rather than the queue filling", elapsed.Round(time.Millisecond))
+	}
+
+	// And nothing was lost. He reconnects, resumes with nothing, and the server tells him
+	// there is a gap — which is the whole reason closing him was acceptable.
+	recovered := node.dial(t)
+	recovered.authenticate(sluggishToken)
+	gaps := recovered.resume(nil)
+	if len(gaps) == 0 {
+		t.Fatal("after being dropped, a reconnect reported no gap to fill")
+	}
+}
+
+// outboundQueue mirrors the server's per-connection queue depth, so this test can say what
+// it is trying to exceed rather than exceeding it by accident.
+const outboundQueue = 64
+
+// queueMustCloseWithin is how long the queue is allowed to take to notice. Comfortably under
+// the ten-second write deadline, which is the other thing that would eventually close the same
+// connection and would otherwise make this test pass for the wrong reason.
+const queueMustCloseWithin = 5 * time.Second
+
+// awaitConnections waits for a node to hold a given number of sockets.
+func awaitConnections(t *testing.T, node *node, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if got := node.hub.ConnectionCount(); got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the node holds %d connections, want %d", node.hub.ConnectionCount(), want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestSendsSurviveRedisBeingUnreachable is the other half of phase 10's backpressure
+// requirement: kill Redis and sends still succeed, with delivery falling back to gap sync.
+//
+// A client pointed at a closed port rather than stopping the real Redis, because every other
+// test in this package is using it. What that exercises is every Redis-dependent path at once —
+// the broadcast, presence, and the rate limiter, which is designed to fail open and would
+// otherwise refuse everything the moment the cache went away.
+func TestSendsSurviveRedisBeingUnreachable(t *testing.T) {
+	// Port 1: nothing listens there, and a connection is refused rather than hanging, which
+	// is what a dead Redis looks like to a client that has not yet noticed.
+	//
+	// MaxRetries -1 disables the client's own retrying, which is both quieter and a better
+	// model of the situation: a cache that is gone is gone, and five attempts per command
+	// only multiplies the log lines. This test does print go-redis's pool failures, and that
+	// is what a node with no cache genuinely logs — worth seeing rather than hiding.
+	dead := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1})
+	t.Cleanup(func() { _ = dead.Close() })
+
+	tokens := newFakeAuthenticator()
+	node := newNodeWith(t, tokens, dead)
+
+	ana, bruno := newAccountID(), newAccountID()
+	anaToken, brunoToken := tokens.issue(ana), tokens.issue(bruno)
+	conversation := node.startDirect(anaToken, bruno)
+
+	// The durable path is untouched: the entry commits and is acknowledged.
+	first := node.send(anaToken, conversation.ID, "sent with no cache at all")
+	if first.Sequence != 1 {
+		t.Fatalf("first entry has sequence %d, want 1", first.Sequence)
+	}
+	node.send(anaToken, conversation.ID, "and another")
+
+	// Nothing was delivered live — there is no Redis to carry it — so the recipient
+	// discovers both by resuming, which is the fallback the ephemeral path is allowed to
+	// rely on (ADR-0005, NF-9).
+	recipient := node.dial(t)
+	recipient.authenticate(brunoToken)
+	gaps := recipient.resume(nil)
+
+	if len(gaps) != 1 {
+		t.Fatalf("got %d gaps with Redis unreachable, want 1", len(gaps))
+	}
+	if gaps[0]["to"] != float64(2) {
+		t.Fatalf("gap ends at %v, want 2", gaps[0]["to"])
+	}
+
+	fetched := node.entriesAfter(brunoToken, conversation.ID, 0)
+	if len(fetched) != 2 {
+		t.Fatalf("fetched %d entries, want 2", len(fetched))
 	}
 }

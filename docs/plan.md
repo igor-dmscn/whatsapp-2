@@ -382,7 +382,15 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
 
   One Lua script rather than INCR then EXPIRE, because a process dying between the two leaves a counter with no expiry — a caller permanently at their limit, with nothing to clear it and no reason anybody would look. A fixed window, whose flaw is named where it is chosen: a caller bursting across a window boundary gets twice the limit for an instant, which for the thing this actually guards against is not a different outcome.
 - OpenTelemetry traces spanning HTTP, WebSocket and Kafka on one correlation identifier (NF-16).
-- Backpressure: what happens to a slow socket consumer, and what happens when Redis or Kafka is unavailable.
+- ~~Backpressure: what happens to a slow socket consumer, and what happens when Redis or Kafka is unavailable.~~ **Done**, and mostly already built: the bounded per-socket queue is phase 2's, the outbox surviving Kafka is phase 3's. What this phase added is the tests that say so, and one of them found that the mechanism it was meant to check was not the one doing the work.
+
+  **A slow consumer is closed, not buffered.** Closing is safe *because* of the sync protocol — the client reconnects, resumes, and is told what it missed, which is the same mechanism that already covers being offline. So a dropped slow consumer costs one fetch and no correctness, where an unbounded queue per socket is a memory incident with a delay.
+
+  The test took four attempts and each failure was informative. A 400 KB payload is refused with 422, because an entry is capped at 64 KB and larger content is an attachment. A single sender cannot overflow a 64-message queue when its own rate limit is 60 per 10 seconds — so it takes several. And **asserting only "the client was dropped" passed with the queue made unbounded**, because the ten-second write deadline was quietly doing the work; the assertion is now on *how quickly*, which only the queue can achieve.
+
+  **Redis unreachable: sends still succeed.** Verified against a client pointed at a closed port, which exercises every Redis-dependent path at once — the broadcast, presence, and the rate limiter, which is designed to fail open and would otherwise refuse everything the moment the cache went away. Delivery falls back to gap sync, which is what ADR-0005 and NF-9 already say it must.
+
+  **Kafka unreachable** was already covered by phase 3: an entry and its outbox row commit together, a failed publish leaves rows to retry, and stopping the relay delays events rather than losing them (NF-6).
 - A service worker, so the browser client's offline cold start is genuinely offline. Noted in phase 6 and still owed: the database survives a restart, the page it is loaded by does not.
 - A dead-letter topic for records a consumer skips as permanently unprocessable. They are logged today, which is a record nobody reads.
 - **A flake in the media tests. Found, and it was the same bug NF-14 exposed** — worth recording because of how it was found, which was not by looking for it.
