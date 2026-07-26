@@ -250,6 +250,7 @@ func (s *Syncer) apply(ctx context.Context, conversationID string, entries []Ent
 			Body:           entry.Text(),
 			TargetSequence: entry.TargetSequence,
 			ReplyTo:        entry.ReplyTo,
+			AttachmentID:   entry.AttachmentID,
 			CreatedAt:      entry.CreatedAt.Format(time.RFC3339Nano),
 		})
 	}
@@ -305,6 +306,7 @@ func (s *Syncer) applyEntry(ctx context.Context, frame map[string]any) error {
 		Body:           stringOf(frame["body"]),
 		TargetSequence: int64Of(frame["target_sequence"]),
 		ReplyTo:        int64Of(frame["reply_to"]),
+		AttachmentID:   stringOf(frame["attachment_id"]),
 		CreatedAt:      time.Now(),
 	}
 	if entry.ConversationID == "" || entry.Sequence == 0 {

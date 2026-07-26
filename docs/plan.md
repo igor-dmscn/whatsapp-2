@@ -179,7 +179,7 @@ Four findings:
 
 ---
 
-## Phase 7 — Media
+## Phase 7 — Media — **complete**
 
 **Goal:** send photos and video.
 
@@ -192,6 +192,26 @@ Four findings:
 **Frontend increment:** attach an image or video, placeholder while pending, thumbnail on ready, full-size on demand.
 
 **Verify:** an entry referencing a large video is readable immediately while the attachment is still pending. Kill the worker mid-processing: the job replays and the attachment does not stay pending forever (MD-3). Process the same attachment twice and assert one set of variants. Upload 101 MB and assert rejection before the transfer completes.
+
+**Verified.** Twelve integration tests drive the use cases against real Postgres and real MinIO, and six browser tests drive two browsers on two nodes.
+
+- **Readable while pending (MD-1):** the recipient's transcript shows the caption before the photo exists, then the placeholder becomes a thumbnail with no action on their part. Proven load-bearing by disabling the readiness notification — four browser tests then fail, because the placeholder never resolves.
+- **Replayable job (MD-3):** the store is made unreachable at the point a worker would die — after the job is published, before the variants exist. `Process` returns the error rather than swallowing it, which is what leaves the Kafka offset uncommitted; the attachment stays `uploaded` rather than being marked failed, and the retry completes it. Swallowing the error instead makes that test fail.
+- **One set of variants (MD-2):** processed three times, two variants. This is a primary key on `(attachment, name)` rather than the worker remembering, and the test catches a variant name that varies per pass.
+- **101 MB rejected (MD-4):** refused with 413 in under two seconds through the browser, on a request carrying one JSON field. And a client that *lies* about the size cannot transfer more than it declared, because the length is part of the signature — MinIO returns 403 and stores nothing.
+
+**Signature Version 4 by hand.** Everything needed is four verbs against one bucket plus a presigned URL, and the whole algorithm is one HMAC chain — against forty modules of AWS SDK for a deployment with one endpoint and one static key. It worked against real MinIO on the first attempt, and a deliberately corrupted signing key fails every test in that package, which is a better guarantee than a dependency's reputation.
+
+**Two deliberate limits, stated rather than hidden.**
+
+- **Video gets no derived renditions.** A poster frame or a smaller copy needs a transcoder: a native dependency, a process pool, and a queue that scales differently from everything else here. Video keeps the identical lifecycle — pending, uploaded, ready — so clients have one shape of state to handle, and is played from the retained original with the browser's own controls. Deferred rather than faked.
+- **Photo orientation is not applied.** A phone records rotation in EXIF and a re-encoded rendition loses the tag, so a sideways photo gets a sideways thumbnail. The fix is bounded — read the orientation tag, apply one of eight transforms before scaling — and it is not done.
+
+Three findings:
+
+- **`.composer input` matched the attach control**, which broke every send in the browser suite at once: fifteen tests failed on a strict-mode violation from one added element. The selector is now `.composer input:not([type=file])` — the second time a composer selector has been ambiguous, so the reason is written next to it.
+- **A swapped image `src` is not a loaded image.** The open-the-larger-rendition test measured `naturalWidth` after waiting for the source to change and read zero. Waiting on the decoded size is the assertion that was meant.
+- **A UUIDv7 prefix is a timestamp, so it does not vary.** The first attempt to prove the idempotency test could fail used `id.New()[:4]` as a per-pass suffix — identical every time, so nothing broke and the test looked untrustworthy when it was fine. The same property bit a handle generator in phase 5.
 
 ---
 

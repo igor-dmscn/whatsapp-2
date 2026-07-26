@@ -389,6 +389,17 @@ func (m model) viewConversation() string {
 		if entry.Kind == "retracted" {
 			body = mutedStyle.Render("(deleted)")
 		}
+		// A marker, not the photo. A terminal cannot show one and this does not pretend
+		// to — but a caption-less photo would otherwise render as a blank line, which
+		// reads as a bug rather than as a message this client cannot display.
+		if entry.AttachmentID != "" && entry.Kind != "retracted" {
+			marker := mutedStyle.Render("[attachment]")
+			if body == "" {
+				body = marker
+			} else {
+				body = marker + " " + body
+			}
+		}
 
 		line := fmt.Sprintf("%s %-10s %s", mutedStyle.Render(fmt.Sprintf("#%-4d", entry.Sequence)), who, body)
 		if entry.ReplyTo != 0 {

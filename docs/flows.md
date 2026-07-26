@@ -137,18 +137,26 @@ sequenceDiagram
 
     K->>W: consume upload accepted
     W->>B: read original
-    W->>W: thumbnail + size variants + normalise
+    W->>W: thumbnail + display variant
     W->>B: write variants
     W->>PG: mark ready
-    W->>K: variants ready
-    K->>W: consume ready
-    W->>RC: push attachment ready
+    W->>A: attachment changed (Redis)
+    A-->>RC: look at this attachment again
+    RC->>A: GET attachment
+    A-->>RC: ready + signed variant URLs
+    RC->>B: GET thumbnail
     Note over RC: swaps placeholder for thumbnail
 ```
 
 The entry and its attachment are deliberately decoupled. A message referencing a 90 MB video is readable the instant it is sent; the video becomes displayable when it is ready. Coupling them would mean either blocking the send on transcoding or hiding the message until processing completed — both worse.
 
-Processing must be idempotent, because at-least-once delivery means the worker will occasionally process the same attachment twice, and a crashed worker must leave the job replayable rather than the attachment permanently pending (MD-2, MD-3).
+Processing must be idempotent, because at-least-once delivery means the worker will occasionally process the same attachment twice, and a crashed worker must leave the job replayable rather than the attachment permanently pending (MD-2, MD-3). Both are constraints rather than code: the job is an outbox row committed with the upload it describes, so a crash leaves it uncommitted and redelivered; and the variants have a primary key of `(attachment, name)`, so a second pass overwrites the first rather than adding to it.
+
+**Readiness goes over Redis, not Kafka.** The original design had the worker publish a `variants ready` event, consume it back, and push from there. What that event would be *for* is reaching an open socket — Redis Pub/Sub is already the socket fanout ([ADR-0005](./adr/0005-redis-pubsub-for-socket-fanout.md)), and a client that misses the notification discovers the change the next time it renders the attachment, which it must fetch anyway for the URLs. A durable event with no durable consumer is a promise nothing needs.
+
+The notification carries no state. Variant URLs are signed and expire within the hour, so a frame containing them would be stale by the time a client acted on it; "look again" is the whole message. This is also why a client cannot use the notification to see something it should not: the frame names an opaque identifier, and the fetch it prompts is authorised by asking Messaging whether the entry referencing that attachment is visible to the asker.
+
+**What the bytes never touch.** The api process signs URLs and serves metadata. It reads no attachment on the way in and proxies none on the way out — the only process that ever holds attachment bytes is the worker, deriving variants off the request path.
 
 ## 4. Starting a group call
 

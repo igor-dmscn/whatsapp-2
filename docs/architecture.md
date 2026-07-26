@@ -125,7 +125,7 @@ This is **CQRS without event sourcing**. Entries are real rows and the log is qu
 |-------|-----|---------|
 | `messaging.entries` | conversation id | entry appended, entry revised |
 | `messaging.receipts` | conversation id | delivered, read |
-| `media.attachments` | attachment id | upload accepted, variants ready, processing failed |
+| `media.attachments` | attachment id | upload accepted |
 | `identity.events` | device id, or account id where there is no device | account registered, credential added, device registered, device revoked, session started, session rotated |
 
 Keying entry and receipt topics by conversation gives per-conversation ordering, which is the only ordering that means anything — sequence numbers are meaningless across conversations.
@@ -133,6 +133,10 @@ Keying entry and receipt topics by conversation gives per-conversation ordering,
 Identity's topic is keyed by **subject** rather than uniformly by account: the device where an event has one, the account otherwise. Session does not model an account — it belongs to a device — and adding one to the aggregate to satisfy a partitioning scheme would let the transport dictate the model. The ordering that results is per-device, which is what Messaging relies on when it disconnects a revoked device. Account-level events are not ordered against device-level ones, and nothing needs them to be.
 
 Receipts have their own topic rather than sharing `messaging.entries`. Someone scrolling a year of history produces a burst of cursor advances; behind entries on one topic, that burst would delay the projection of new messages — the badge that matters most held up by the badges being cleared.
+
+`media.attachments` is a work queue rather than a stream of facts other contexts observe, and it carries one event. Readiness and failure were on it in the original design and are not: their only purpose is to reach an open socket, Redis is already the socket fanout, and a client that misses the notification discovers the change on the next fetch — so a durable event with no durable consumer would be a promise nothing needs. It is keyed by attachment rather than by conversation, because two uploads in one conversation have nothing to say to each other and processing them in parallel is the point.
+
+Attachments also get their own consumer group. Deriving variants from a large photo occupies a consumer for as long as it takes to decode, and sharing a group with the projections would make every unread badge in the system wait behind it.
 
 ## The outbox
 
@@ -170,6 +174,38 @@ What that buys and what it costs:
 - **Ordered per key.** The relay claims rows with `FOR UPDATE`, not `SKIP LOCKED`. Skipping locked rows would let a second relay publish row 20 while the first still holds 19, reordering two events for one conversation. One relay at a time is the price of ordering, and it is recorded as a known ceiling in the code.
 - **Kafka being down costs delay, not data.** Rows accumulate and drain on recovery (NF-6).
 - **Writing an event outside a transaction is refused**, not reviewed for. It compiles and runs and silently reintroduces exactly the split-brain the outbox exists to prevent.
+
+## Attachments
+
+The one flow where the server opens a payload ([ADR-0001](./adr/0001-content-opaque-server-e2ee-deferred.md)), arranged so that it happens in exactly one process.
+
+```mermaid
+flowchart LR
+    C[Client] -->|"1. POST attachment<br/>declares type and size"| A[api]
+    A -->|"2. row, state pending"| PG[(Postgres)]
+    A -->|"3. presigned PUT"| C
+    C -->|"4. bytes, direct"| S[(Object store)]
+    C -->|"5. POST completion"| A
+    A -->|"6. state uploaded<br/>+ outbox row, one transaction"| PG
+    PG -->|"7. relay"| K[["media.attachments"]]
+    K -->|8| W[worker]
+    W -->|"9. read original"| S
+    W -->|"10. write variants"| S
+    W -->|"11. state ready"| PG
+    W -->|"12. attachment changed"| R[[Redis]]
+    R -->|13| A
+    A -->|"14. look again"| C
+```
+
+**api never holds a byte of it**, in either direction. Step 4 is the client to the store; a viewer's fetch is the store to the client. What api does is sign URLs and answer questions about state.
+
+**The size cap is enforced twice and read nowhere.** The declared size is refused at step 1 if it is over 100 MB, before a URL exists. It is also signed into the URL, so a client that lies is refused by the store on a request api never sees (MD-4).
+
+**The identifier is issued before the bytes exist**, which is the whole point of steps 1–3 being separate from 4. An entry can reference an attachment that is still uploading, so a message carrying a 90 MB video is readable immediately and displayable later (MD-1).
+
+**Idempotency is two constraints, not two code paths.** Completion is idempotent because the aggregate refuses to raise a second job for an upload it has already accepted; variant generation is idempotent because the variants' primary key is `(attachment, name)`, so a second pass overwrites the first (MD-2). And the job cannot be lost, because it is an outbox row in the same transaction as the state change it describes — a crash leaves it uncommitted and redelivered (MD-3).
+
+**Media holds no access rules.** Whether an account may attach, and whether it may view, are asked of Messaging: an attachment is exactly as visible as the entry that references it, which keeps the join-point history policy in the context that owns it. A second copy of that rule here is the thing most likely to drift.
 
 ## Projections
 

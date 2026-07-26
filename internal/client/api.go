@@ -60,6 +60,13 @@ type Entry struct {
 	CreatedAt      time.Time `json:"created_at"`
 	TargetSequence int64     `json:"target_sequence"`
 	ReplyTo        int64     `json:"reply_to"`
+	// AttachmentID is the photo or video this entry carries, empty for none.
+	//
+	// Carried so the terminal can say a message has one. It cannot show it, and does not
+	// try: rendering a photo in a terminal is a different project. What matters is that
+	// the two clients agree about what a conversation contains — a caption-less photo
+	// must not read as a blank line.
+	AttachmentID string `json:"attachment_id"`
 }
 
 // Text decodes the payload. The wire form is base64 because the server does not

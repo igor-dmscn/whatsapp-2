@@ -145,6 +145,10 @@ var migrations = []string{
 		attempts        INTEGER NOT NULL DEFAULT 0
 	)`,
 
+	// Added as a migration rather than folded into the entries table above: a store
+	// created before this phase must gain the column without discarding what it holds.
+	`ALTER TABLE entries ADD COLUMN attachment_id TEXT NOT NULL DEFAULT ''`,
+
 	`CREATE TABLE reactions (
 		conversation_id TEXT NOT NULL,
 		sequence        INTEGER NOT NULL,
@@ -299,7 +303,11 @@ type LocalEntry struct {
 	Body           string
 	TargetSequence int64
 	ReplyTo        int64
-	CreatedAt      string
+	// AttachmentID is the photo or video this entry carries, empty for none. Only the
+	// reference is stored: variant URLs are signed and expire, so a cached one is a
+	// broken link waiting to happen.
+	AttachmentID string
+	CreatedAt    string
 }
 
 // SaveEntries stores entries and advances the contiguous mark, in one transaction.
@@ -336,11 +344,12 @@ func (s *Store) SaveEntries(ctx context.Context, conversationID string, entries 
 	for _, entry := range entries {
 		if _, err := transaction.ExecContext(ctx,
 			`INSERT INTO entries
-			     (conversation_id, sequence, id, author_id, client_entry_id, kind, body, target_sequence, reply_to, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			     (conversation_id, sequence, id, author_id, client_entry_id, kind, body, target_sequence, reply_to, attachment_id, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT (conversation_id, sequence) DO NOTHING`,
 			entry.ConversationID, entry.Sequence, entry.ID, entry.AuthorID, entry.ClientEntryID,
-			entry.Kind, entry.Body, entry.TargetSequence, entry.ReplyTo, entry.CreatedAt,
+			entry.Kind, entry.Body, entry.TargetSequence, entry.ReplyTo, entry.AttachmentID,
+			entry.CreatedAt,
 		); err != nil {
 			return fmt.Errorf("insert entry %d: %w", entry.Sequence, err)
 		}
@@ -431,7 +440,8 @@ func (s *Store) CloseOver(ctx context.Context, conversationID string, through in
 // Entries returns a conversation's entries in order.
 func (s *Store) Entries(ctx context.Context, conversationID string) ([]LocalEntry, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT conversation_id, sequence, id, author_id, client_entry_id, kind, body, target_sequence, reply_to, created_at
+		`SELECT conversation_id, sequence, id, author_id, client_entry_id, kind, body,
+		        target_sequence, reply_to, attachment_id, created_at
 		   FROM entries WHERE conversation_id = ? ORDER BY sequence`, conversationID)
 	if err != nil {
 		return nil, fmt.Errorf("list entries: %w", err)
@@ -447,7 +457,7 @@ func scanEntries(rows *sql.Rows) ([]LocalEntry, error) {
 		var entry LocalEntry
 		if err := rows.Scan(&entry.ConversationID, &entry.Sequence, &entry.ID, &entry.AuthorID,
 			&entry.ClientEntryID, &entry.Kind, &entry.Body, &entry.TargetSequence,
-			&entry.ReplyTo, &entry.CreatedAt); err != nil {
+			&entry.ReplyTo, &entry.AttachmentID, &entry.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan entry: %w", err)
 		}
 		entries = append(entries, entry)
