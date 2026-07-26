@@ -364,7 +364,15 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
 **Goal:** the things that make it survivable, none of which are features.
 
 **Deliverables**
-- Presence and typing indicators over Redis with TTLs — ephemeral, never persisted.
+- ~~Presence and typing indicators over Redis with TTLs — ephemeral, never persisted.~~ **Done.** Redis only, with expiry, and the expiry is the design rather than an optimisation: both facts are false within seconds, and expiry is also what makes a node dying safe. A node holding a socket renews a claim every ten seconds and a claim lasts thirty; a node that stops renewing stops claiming, with no cleanup to run and nobody to run it. The alternative — a set added to on connect and removed on disconnect — leaves a permanently online ghost every time a process is killed.
+
+  Sorted sets rather than keys with a TTL, because an account has several devices on several nodes: each device is a member scored by when it was last seen, so a dead node's device ages out of the window while its live sibling keeps the account online. One key with one expiry cannot do that — whichever node refreshed last would keep the dead device alive.
+
+  **Presence is asked for; typing is pushed.** Not an inconsistency: a typing indicator has to appear instantly for somebody already looking, and presence is soft state a client polls while it has a conversation open — eight seconds, on a socket it is already holding. Pushing presence would fan every connect and disconnect out to every member of every conversation that account belongs to, which is the same work moved to the moment somebody opens a laptop and paid for conversations nobody is looking at.
+
+  Typing is *both* recorded and broadcast, and both are needed: the broadcast makes it appear for people already there, the record makes it appear for somebody who opens the conversation a second later and asks. Every answer is a whole snapshot rather than a delta, so a lost push, a reconnect and a first render all repair themselves the same way.
+
+  **Verified across two nodes**, which is where a naive implementation is wrong — presence held in a node's memory is presence only that node can see. Three integration tests and three browser tests: the other person shows as here, shows as typing while they type, stops when they send, and disappears when they close the tab. A non-member asking gets silence rather than a refusal, so asking cannot be used to discover which conversations exist.
 - Push notifications as a Kafka consumer.
 - Rate limiting on send, handle search, and connect.
 - OpenTelemetry traces spanning HTTP, WebSocket and Kafka on one correlation identifier (NF-16).

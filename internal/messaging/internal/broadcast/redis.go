@@ -116,6 +116,21 @@ type CallMessage struct {
 	CallID         string `json:"call_id"`
 }
 
+// TypingMessage tells a conversation that somebody started or stopped typing.
+//
+// On the conversation's channel like an entry, and with no sequence — so the hub cannot apply
+// its per-connection visibility check, and does not need to. Typing is a fact about a person
+// now, not about a position in the log, and there is no join point it could predate.
+//
+// Started and stopped in one shape, with a flag, because a client applies both the same way:
+// add or remove one account from one set.
+type TypingMessage struct {
+	Type           string `json:"type"`
+	ConversationID string `json:"conversation_id"`
+	AccountID      string `json:"account_id"`
+	Typing         bool   `json:"typing"`
+}
+
 // ControlMessage tells a node something about an account rather than a
 // conversation.
 type ControlMessage struct {
@@ -207,6 +222,28 @@ func (b *RedisBroadcaster) CallChanged(ctx context.Context, conversationID, call
 
 	if err := b.client.Publish(ctx, entriesChannel(domain.ConversationID(conversationID)), encoded).Err(); err != nil {
 		return fmt.Errorf("publish call change: %w", err)
+	}
+	return nil
+}
+
+func (b *RedisBroadcaster) BroadcastTyping(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	accountID domain.AccountID,
+	typing bool,
+) error {
+	encoded, err := json.Marshal(TypingMessage{
+		Type:           "typing",
+		ConversationID: string(conversationID),
+		AccountID:      string(accountID),
+		Typing:         typing,
+	})
+	if err != nil {
+		return fmt.Errorf("encode typing broadcast: %w", err)
+	}
+
+	if err := b.client.Publish(ctx, entriesChannel(conversationID), encoded).Err(); err != nil {
+		return fmt.Errorf("publish typing: %w", err)
 	}
 	return nil
 }

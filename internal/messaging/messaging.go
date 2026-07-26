@@ -17,7 +17,9 @@ import (
 	"comms/internal/messaging/internal/api"
 	"comms/internal/messaging/internal/app"
 	"comms/internal/messaging/internal/broadcast"
+	"comms/internal/messaging/internal/domain"
 	"comms/internal/messaging/internal/postgres"
+	"comms/internal/messaging/internal/presence"
 	"comms/internal/messaging/internal/projection"
 	"comms/internal/platform/database"
 	"comms/internal/platform/kafka"
@@ -56,6 +58,7 @@ type Module struct {
 	// separately because Media reaches it directly, without a use case in between:
 	// "look at this attachment again" is not a messaging decision.
 	notifier *broadcast.RedisBroadcaster
+	logger   *slog.Logger
 }
 
 // New wires the context.
@@ -76,6 +79,9 @@ func New(
 		postgres.NewInviteRepository(db),
 		postgres.NewReactionStore(db),
 		postgres.NewMemberStateStore(db),
+		// Presence and typing live only in Redis, with expiry, because both are false
+		// within seconds and worthless once stale (see internal/presence).
+		presence.NewStore(redisClient),
 		broadcaster,
 		// Events go to the outbox, in the same transaction as the change they
 		// describe (ADR-0003). The relay in cmd/worker publishes them to Kafka, and
@@ -93,6 +99,7 @@ func New(
 		service:  service,
 		hub:      hub,
 		notifier: broadcaster,
+		logger:   logger,
 		handler:  api.NewHandler(service, hub, authenticator, api.CallerResolver(caller), options.AllowedOrigins, logger),
 	}
 }
@@ -102,7 +109,38 @@ func New(
 // One goroutine per process reads from Redis regardless of how many sockets the
 // node holds.
 func (m *Module) Run(ctx context.Context) {
+	// The presence heartbeat alongside the broadcast reader, because both are "one
+	// goroutine per process serving every socket it holds".
+	go m.renewPresence(ctx)
+
 	m.hub.Run(ctx)
+}
+
+// renewPresence tells Redis, repeatedly, which devices this node is holding sockets for.
+//
+// Repeatedly and not once, which is the whole mechanism: presence is a claim with an expiry, so
+// a node that stops — crashes, is deployed over, loses its network — stops making it, and the
+// people it was holding go offline without anybody having to notice or clean up. A set that were
+// added to on connect and removed on disconnect would leave a permanently online ghost for every
+// process ever killed.
+func (m *Module) renewPresence(ctx context.Context) {
+	ticker := time.NewTicker(presence.Heartbeat)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, held := range m.hub.Connected() {
+				accountID, deviceID := held[0], held[1]
+				if err := m.service.Connected(ctx, domain.AccountID(accountID), deviceID); err != nil {
+					m.logger.Warn("renew presence",
+						slog.String("account_id", accountID), slog.Any("error", err))
+				}
+			}
+		}
+	}
 }
 
 // Routes registers Messaging's HTTP and WebSocket endpoints. authenticated wraps

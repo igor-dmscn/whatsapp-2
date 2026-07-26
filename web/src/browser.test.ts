@@ -901,6 +901,83 @@ describe.skipIf(!live)('local persistence and search', () => {
   }, timeout * 4)
 })
 
+// Phase 10: presence and typing. Both are ephemeral, both cross nodes, and neither has any
+// durable record to fall back on — so the only honest test is two real browsers on two nodes,
+// one of them watching what the other does.
+describe.skipIf(!live)('presence and typing', () => {
+  let browser: Browser
+  let watcher: Person
+  let typist: Person
+
+  beforeAll(async () => {
+    const { chromium } = await import('playwright-core')
+    browser = await chromium.launch({ headless: true, executablePath: chromiumPath() })
+
+    watcher = await join_(browser, nodeAURL, `rosa${unique}`)
+    typist = await join_(browser, nodeBURL, `silas${unique}`)
+
+    // A conversation between them, opened on both sides.
+    await watcher.page.getByLabel('Handle to message').fill(typist.handle)
+    await watcher.page.getByRole('button', { name: 'Start', exact: true }).click()
+    await watcher.page.waitForSelector(composerText, { timeout })
+    await send(watcher.page, 'hello')
+
+    await typist.page.waitForSelector('.conversations button', { timeout })
+    await typist.page.click('.conversations button')
+    await typist.page.waitForSelector(composerText, { timeout })
+  }, timeout * 4)
+
+  afterAll(async () => {
+    await browser?.close()
+  })
+
+  it('shows the other person as here, across nodes', async () => {
+    // Polled by the client every few seconds, so this waits rather than asserting once.
+    // What it proves is cross-node: the two sockets are on different processes, and
+    // presence held in either one's memory would be invisible to the other.
+    await watcher.page.waitForFunction(
+      (handle) => document.querySelector('.presence .online')?.textContent?.includes(handle) ?? false,
+      typist.handle,
+      { timeout },
+    )
+  }, timeout * 2)
+
+  it('shows typing while the other person types, and stops after they send', async () => {
+    // Typed rather than filled: `fill` sets the value in one step and React sees one
+    // change event, which is enough here but would not be if the client ever debounced on
+    // keystroke count rather than on time.
+    await typist.page.locator(composerText).type('composing something', { delay: 20 })
+
+    await watcher.page.waitForFunction(
+      (handle) => document.querySelector('.presence .typing')?.textContent?.includes(handle) ?? false,
+      typist.handle,
+      { timeout },
+    )
+
+    // Sending clears it at once. Without the client saying so, the indicator would
+    // survive the message by the whole server-side window — which reads as another
+    // message coming that never arrives.
+    await typist.page.locator('.composer button[type=submit]').click()
+    await watcher.page.waitForFunction(
+      () => document.querySelector('.presence .typing') === null,
+      undefined,
+      { timeout },
+    )
+  }, timeout * 3)
+
+  it('shows the other person leaving when they close the tab', async () => {
+    await typist.page.close()
+
+    // Withdrawn on a clean close rather than left to expire, which is the difference
+    // between a dot disappearing now and in thirty seconds.
+    await watcher.page.waitForFunction(
+      (handle) => !(document.querySelector('.presence .online')?.textContent?.includes(handle) ?? false),
+      typist.handle,
+      { timeout },
+    )
+  }, timeout * 2)
+})
+
 // Phase 7: photos and video. Two browsers again, because the interesting part is the
 // recipient's placeholder becoming a thumbnail without them doing anything.
 describe.skipIf(!live)('attachments', () => {

@@ -472,6 +472,31 @@ aside {
   flex-wrap: wrap;
 }
 
+/* Presence sits between the transcript and the composer, where a person's eye already is
+   when they are about to reply. Fixed height so an indicator appearing does not shift the
+   composer down and move the send button under the cursor. */
+.presence {
+  min-height: 1.25rem;
+  margin: 0 0 0.25rem;
+  padding: 0 0.75rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.presence .online,
+.presence .typing {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.presence .dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: #22c55e;
+}
+
 .replying {
   display: flex;
   flex-basis: 100%;

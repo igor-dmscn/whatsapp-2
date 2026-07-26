@@ -57,6 +57,8 @@ export type SyncOptions = {
   onAttachmentChanged?: (attachmentID: string) => void
   /** onCallFrame receives call signalling, forwarded without being understood. */
   onCallFrame?: (frame: CallFrame) => void
+  /** onPresence receives who is present and who is typing. Never persisted. */
+  onPresence?: (frame: PresenceFrame) => void
   /** onCallChanged fires when a conversation's call changed and this client should ask
    *  what it now is. */
   onCallChanged?: (conversationID: string) => void
@@ -151,6 +153,15 @@ type attachmentFrame = {
   conversation_id: string
   attachment_id: string
 }
+
+/** PresenceFrame is either the whole state of a conversation or one person's typing change.
+ *
+ *  Two shapes under one name because a caller applies them the same way — replace what is known
+ *  about a conversation, or patch one entry of it — and the discriminator is which fields are
+ *  present. A `presence` frame carries the lists; a `typing` frame carries one account. */
+export type PresenceFrame =
+  | { type: 'presence'; conversation_id: string; online: string[]; typing: string[] }
+  | { type: 'typing'; conversation_id: string; account_id: string; typing: boolean }
 
 type readyFrame = { type: 'ready'; account_id: string; device_id: string }
 type errorFrame = { type: 'error'; code: string; message: string }
@@ -534,6 +545,14 @@ export class Sync {
         // one (ADR-0004), and this file deliberately does not learn what an SDP is — the
         // protocol lives in call.ts, which can be driven without a socket at all.
         this.options.onCallFrame?.(frame as unknown as CallFrame)
+        break
+
+      case 'presence':
+      case 'typing':
+        // Forwarded, never stored. Both are true for seconds and the local store is for
+        // things worth keeping — writing "was typing" to SQLite would be recording
+        // something already false by the time it is read back.
+        this.options.onPresence?.(frame as unknown as PresenceFrame)
         break
 
       case 'attachment':

@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { ApiError, Client, deliveryOf, login, register, SessionExpired } from './api'
 import type { Attachment, Conversation, DeliveryState, Invite, Member, Role, Session } from './api'
 import { Sync } from './sync'
+import type { PresenceFrame } from './sync'
 import { LocalStore, type Hit } from './store'
 import { resolve, summarise, type Message, type ReactionsBySequence } from './transcript'
 import { Call, type CallFrame, type CallState } from './call'
@@ -237,6 +238,28 @@ function Workspace({
   bump.current = (attachmentID) =>
     setEpochs((held) => ({ ...held, [attachmentID]: (held[attachmentID] ?? 0) + 1 }))
 
+  // Presence, and it is deliberately not in the local store: both halves of it are false
+  // within seconds, and a database is for things worth keeping. Held per conversation so
+  // switching between two does not show the wrong people as typing.
+  const [present, setPresent] = useState<Record<string, { online: string[]; typing: string[] }>>({})
+  // When this client last said it was typing, so keystrokes do not become frames.
+  const lastTyped = useRef(0)
+  const presence = useRef<(frame: PresenceFrame) => void>(() => {})
+  presence.current = (frame) =>
+    setPresent((held) => {
+      if (frame.type === 'presence') {
+        return { ...held, [frame.conversation_id]: { online: frame.online, typing: frame.typing } }
+      }
+
+      // A typing change patches one name. The snapshot from the next poll is what
+      // corrects this if a push was lost, which is why the poll exists at all.
+      const current = held[frame.conversation_id] ?? { online: [], typing: [] }
+      const typing = frame.typing
+        ? [...new Set([...current.typing, frame.account_id])]
+        : current.typing.filter((accountID) => accountID !== frame.account_id)
+      return { ...held, [frame.conversation_id]: { ...current, typing } }
+    })
+
   const sync = useMemo(
     () =>
       new Sync({
@@ -248,10 +271,23 @@ function Workspace({
         onAttachmentChanged: (attachmentID) => bump.current(attachmentID),
         onCallFrame: (frame) => callFrame.current(frame),
         onCallChanged: (conversationID) => callChanged.current(conversationID),
+        onPresence: (frame) => presence.current(frame),
         store: store ?? undefined,
       }),
     [client, store],
   )
+
+  // Asked on a timer while a conversation is open, which is what makes presence soft
+  // state rather than something to keep in step. Every answer is a whole snapshot, so a
+  // missed push, a reconnect and a first render all repair themselves the same way.
+  useEffect(() => {
+    if (!selected) return
+
+    const ask = () => sync.sendFrame({ type: 'presence.ask', conversation_id: selected })
+    ask()
+    const timer = setInterval(ask, presenceInterval)
+    return () => clearInterval(timer)
+  }, [selected, sync])
 
   // The call, and the same ref trick for the same reason: the socket must not be rebuilt
   // because a callback identity changed, and dropping it mid-call would look like the
@@ -554,6 +590,11 @@ function Workspace({
                 client={client}
                 epochs={epochs}
               />
+              <Presence
+                present={present[selected]}
+                me={client.accountID}
+                handles={handles}
+              />
               <Composer
                 replyTo={replyTo}
                 onCancelReply={() => setReplyTo(0)}
@@ -573,6 +614,15 @@ function Workspace({
                   const entry = await client.send(selected, clientEntryID, text, replyTo, attachmentID)
                   sync.accept(entry)
                   setReplyTo(0)
+                }}
+                onTyping={(typing) => {
+                  // Coalesced by the client rather than sent per keystroke: the claim
+                  // lasts several seconds on the server, so renewing it once a second
+                  // is enough and a frame per character is not.
+                  const now = Date.now()
+                  if (typing && now - lastTyped.current < typingInterval) return
+                  lastTyped.current = typing ? now : 0
+                  sync.sendFrame({ type: 'typing', conversation_id: selected, typing })
                 }}
                 onError={setError}
               />
@@ -1314,11 +1364,65 @@ function AttachmentView({
   )
 }
 
+/** presenceInterval is how often a client asks who is present in the conversation it has open.
+ *
+ *  Well inside the server's thirty-second online window, so somebody who leaves is noticed
+ *  within one poll rather than at the end of theirs. */
+const presenceInterval = 8_000
+
+/** typingInterval is the shortest gap between two typing claims from this client.
+ *
+ *  The server's claim lasts several seconds, so renewing it once a second keeps it true while
+ *  keys are being pressed. A frame per keystroke would be the same statement forty times. */
+const typingInterval = 1_000
+
+/**
+ * Presence shows who is here and who is typing.
+ *
+ * Typing takes precedence over the dots: somebody typing is present by definition, and showing
+ * both lines at once would say the same thing twice. Nothing renders when nobody else is here,
+ * because an empty row that appears and disappears is worse than one that is simply absent.
+ */
+function Presence({
+  present,
+  me,
+  handles,
+}: {
+  present?: { online: string[]; typing: string[] }
+  me: string
+  handles: Record<string, string>
+}) {
+  // Excluding this account from both. Being told you are online is noise, and being told you
+  // are typing while you type is the kind of detail that makes an interface feel wrong.
+  const typing = (present?.typing ?? []).filter((accountID) => accountID !== me)
+  const online = (present?.online ?? []).filter((accountID) => accountID !== me)
+
+  if (typing.length === 0 && online.length === 0) return null
+
+  const name = (accountID: string) => handles[accountID] ?? accountID.slice(0, 8)
+
+  return (
+    <p className="presence">
+      {typing.length > 0 ? (
+        <span className="typing">
+          {typing.map(name).join(', ')} {typing.length === 1 ? 'is' : 'are'} typing…
+        </span>
+      ) : (
+        <span className="online">
+          <span className="dot" aria-hidden="true" />
+          {online.map(name).join(', ')} {online.length === 1 ? 'is' : 'are'} here
+        </span>
+      )}
+    </p>
+  )
+}
+
 function Composer({
   replyTo,
   onCancelReply,
   onSend,
   onAttach,
+  onTyping,
   onError,
 }: {
   replyTo: number
@@ -1330,6 +1434,7 @@ function Composer({
     text: string,
     onProgress: (fraction: number) => void,
   ) => Promise<void>
+  onTyping: (typing: boolean) => void
   onError: (message: string) => void
 }) {
   const [draft, setDraft] = useState('')
@@ -1362,6 +1467,9 @@ function Composer({
       }
       setDraft('')
       setClientEntryID(crypto.randomUUID())
+      // Sent, so no longer typing. Without this the indicator survives the message by
+      // its whole window, which reads as a second message coming that never does.
+      onTyping(false)
     } catch (failure) {
       // The draft, the file and the identifier are all kept, so pressing send again is a
       // retry of the same entry rather than a new one.
@@ -1409,7 +1517,13 @@ function Composer({
       />
       <input
         value={draft}
-        onChange={(event) => setDraft(event.target.value)}
+        onChange={(event) => {
+          setDraft(event.target.value)
+          // Typing while there is something in the box, not typing when it is empty:
+          // a cleared draft is somebody who changed their mind, and leaving the
+          // indicator up for the remaining seconds of its window says otherwise.
+          onTyping(event.target.value.trim() !== '')
+        }}
         placeholder={chosen ? 'Caption (optional)' : 'Message'}
         aria-label="Message"
         autoFocus

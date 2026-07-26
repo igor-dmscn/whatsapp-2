@@ -31,6 +31,7 @@ import (
 	"comms/internal/messaging/internal/app"
 	"comms/internal/messaging/internal/broadcast"
 	"comms/internal/messaging/internal/postgres"
+	"comms/internal/messaging/internal/presence"
 	"comms/internal/platform/database"
 	"comms/internal/platform/database/testdb"
 	"comms/internal/platform/httpx"
@@ -143,6 +144,9 @@ func newNode(t *testing.T, tokens *fakeAuthenticator) *node {
 		postgres.NewInviteRepository(db),
 		postgres.NewReactionStore(db),
 		postgres.NewMemberStateStore(db),
+		// Real Redis, like the broadcaster below: presence is expiry-based, and a double
+		// would agree with whatever this code believes about when a claim lapses.
+		presence.NewStore(redisClient),
 		broadcast.NewRedisBroadcaster(redisClient),
 		// The real outbox, not a double. These tests are what establish that an
 		// entry and its event commit together, which a recording publisher would
@@ -1015,4 +1019,162 @@ func TestRevokedDeviceIsDisconnected(t *testing.T) {
 	if count := node.hub.ConnectionCount(); count != 0 {
 		t.Errorf("node still holds %d connections after revocation", count)
 	}
+}
+
+// --- presence and typing ---
+
+// ask requests who is present in a conversation and returns the answer.
+func (s *socket) ask(conversationID string) map[string]any {
+	s.t.Helper()
+
+	s.write(map[string]any{"type": "presence.ask", "conversation_id": conversationID})
+	return s.readOfType("presence")
+}
+
+// strings pulls a list of identifiers out of a frame field.
+func strings_(frame map[string]any, field string) []string {
+	raw, _ := frame[field].([]any)
+	values := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if value, ok := item.(string); ok {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPresenceFollowsWhoIsConnected: a socket makes its account online, and closing it makes
+// the account offline again — without waiting for anything to expire.
+//
+// Across two nodes, because that is where a naive implementation is wrong. Presence held in a
+// node's memory is presence only that node can see, and the person asking is almost never on
+// the node holding the answer.
+func TestPresenceFollowsWhoIsConnected(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	first, second := newNode(t, tokens), newNode(t, tokens)
+
+	ana, bruno := newAccountID(), newAccountID()
+	anaToken, brunoToken := tokens.issue(ana), tokens.issue(bruno)
+	conversation := first.startDirect(anaToken, bruno)
+
+	watcher := first.dial(t)
+	watcher.authenticate(anaToken)
+	watcher.resume(nil)
+
+	// Ana is online because she is holding this socket. Bruno is not.
+	present := watcher.ask(conversation.ID)
+	if online := strings_(present, "online"); !contains(online, ana) {
+		t.Fatalf("ana is not online while holding a socket: %v", online)
+	} else if contains(online, bruno) {
+		t.Fatalf("bruno is online with no socket: %v", online)
+	}
+
+	// Bruno connects to the *other* node.
+	brunoSocket := second.dial(t)
+	brunoSocket.authenticate(brunoToken)
+	brunoSocket.resume(nil)
+
+	present = watcher.ask(conversation.ID)
+	if online := strings_(present, "online"); !contains(online, bruno) {
+		t.Fatalf("bruno is not online from the other node: %v", online)
+	}
+
+	// And gone at once when he closes, rather than in thirty seconds.
+	brunoSocket.close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		present = watcher.ask(conversation.ID)
+		if !contains(strings_(present, "online"), bruno) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bruno is still online after closing: %v", strings_(present, "online"))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// TestTypingReachesTheOtherSideAndCanBeAskedFor is both halves of a typing indicator.
+//
+// The push is what makes it appear immediately for somebody already looking. The record is what
+// makes it appear for somebody who opens the conversation a moment later, and it is the reason
+// this is stored at all rather than only broadcast.
+func TestTypingReachesTheOtherSideAndCanBeAskedFor(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	first, second := newNode(t, tokens), newNode(t, tokens)
+
+	ana, bruno := newAccountID(), newAccountID()
+	anaToken, brunoToken := tokens.issue(ana), tokens.issue(bruno)
+	conversation := first.startDirect(anaToken, bruno)
+
+	watching := second.dial(t)
+	watching.authenticate(brunoToken)
+	watching.resume(nil)
+
+	typing := first.dial(t)
+	typing.authenticate(anaToken)
+	typing.resume(nil)
+
+	typing.write(map[string]any{
+		"type": "typing", "conversation_id": conversation.ID, "typing": true,
+	})
+
+	// Pushed, across nodes.
+	pushed := watching.readOfType("typing")
+	if pushed["account_id"] != ana {
+		t.Fatalf("typing frame names %v, want ana", pushed["account_id"])
+	}
+	if pushed["typing"] != true {
+		t.Fatal("typing frame says not typing")
+	}
+
+	// And recorded, so a client that was not listening finds out by asking.
+	late := second.dial(t)
+	late.authenticate(brunoToken)
+	late.resume(nil)
+	if who := strings_(late.ask(conversation.ID), "typing"); !contains(who, ana) {
+		t.Fatalf("ana is not recorded as typing: %v", who)
+	}
+
+	// Stopping is pushed and cleared.
+	typing.write(map[string]any{
+		"type": "typing", "conversation_id": conversation.ID, "typing": false,
+	})
+	stopped := watching.readOfType("typing")
+	if stopped["typing"] != false {
+		t.Fatal("stop frame says typing")
+	}
+	if who := strings_(late.ask(conversation.ID), "typing"); contains(who, ana) {
+		t.Fatalf("ana is still recorded as typing after stopping: %v", who)
+	}
+}
+
+// TestSomebodyElsesConversationHasNoPresence: presence is information about people, and which
+// people are in a conversation is exactly as private as the conversation.
+func TestSomebodyElsesConversationHasNoPresence(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+
+	ana, bruno, stranger := newAccountID(), newAccountID(), newAccountID()
+	anaToken, strangerToken := tokens.issue(ana), tokens.issue(stranger)
+	_ = tokens.issue(bruno)
+	conversation := node.startDirect(anaToken, bruno)
+
+	outsider := node.dial(t)
+	outsider.authenticate(strangerToken)
+	outsider.resume(nil)
+
+	// Silence rather than a refusal, so that asking cannot be used to discover which
+	// conversations exist — the same rule Send follows.
+	outsider.write(map[string]any{"type": "presence.ask", "conversation_id": conversation.ID})
+	outsider.expectNothing()
 }

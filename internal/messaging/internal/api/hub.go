@@ -96,6 +96,20 @@ func (h *Hub) dispatch(ctx context.Context, message *redis.Message) {
 			return
 		}
 
+		if envelope.Type == "typing" {
+			var typing broadcast.TypingMessage
+			if err := json.Unmarshal([]byte(message.Payload), &typing); err != nil {
+				h.logger.Warn("decode typing", slog.Any("error", err))
+				return
+			}
+			// Every follower, with no visibility check and no filtering of the person
+			// who typed. Their own client showing them as typing is a bug the client
+			// fixes by ignoring itself, and filtering here would mean this frame could
+			// not also serve a second device of the same account — which does want it.
+			h.deliverToFollowers(domain.ConversationID(typing.ConversationID), typing)
+			return
+		}
+
 		if envelope.Type == "attachment" {
 			var attachment broadcast.AttachmentMessage
 			if err := json.Unmarshal([]byte(message.Payload), &attachment); err != nil {
@@ -396,6 +410,24 @@ func (h *Hub) ConnectionCount() int {
 		count += len(connections)
 	}
 	return count
+}
+
+// Connected returns every account and device this node currently holds a socket for.
+//
+// What the presence heartbeat renews. A pair per connection rather than per account, because
+// presence is claimed per device: two tabs are two claims, and one closing must not withdraw
+// the other's.
+func (h *Hub) Connected() [][2]string {
+	h.mutex.RLock()
+	defer h.mutex.RUnlock()
+
+	held := make([][2]string, 0, len(h.connections))
+	for accountID, connections := range h.connections {
+		for connection := range connections {
+			held = append(held, [2]string{string(accountID), connection.DeviceID()})
+		}
+	}
+	return held
 }
 
 func entriesChannelFor(id domain.ConversationID) string { return "entries:" + string(id) }

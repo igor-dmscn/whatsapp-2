@@ -28,6 +28,7 @@ type Service struct {
 	invites       domain.InviteRepository
 	reactions     domain.ReactionStore
 	state         domain.MemberStateStore
+	presence      domain.Presence
 	broadcaster   domain.Broadcaster
 	events        domain.EventPublisher
 	transactor    domain.Transactor
@@ -44,6 +45,7 @@ func NewService(
 	invites domain.InviteRepository,
 	reactions domain.ReactionStore,
 	state domain.MemberStateStore,
+	presence domain.Presence,
 	broadcaster domain.Broadcaster,
 	events domain.EventPublisher,
 	transactor domain.Transactor,
@@ -55,9 +57,138 @@ func NewService(
 		now = time.Now
 	}
 	return &Service{
-		conversations, memberships, entries, invites, reactions, state,
+		conversations, memberships, entries, invites, reactions, state, presence,
 		broadcaster, events, transactor, ids, now, logger,
 	}
+}
+
+// Presence is who is in a conversation right now, as far as anybody can tell.
+//
+// Two lists rather than a state per member, because that is what a screen renders: a dot beside
+// some names and "typing…" beside others. Both are sets of account identifiers, and a client
+// that holds a name not in either shows neither.
+type Presence struct {
+	// Online is who has at least one device connected.
+	Online []string
+	// Typing is who has typed recently enough to still count.
+	Typing []string
+}
+
+// PresenceIn reports who is online and who is typing in a conversation.
+//
+// Authorised like anything else about a conversation: presence is information about people, and
+// which people are in a conversation is exactly as private as the conversation. Answered as
+// absence rather than refusal for a non-member, for the same reason Send is — so that asking
+// cannot be used to discover which conversations exist.
+func (s *Service) PresenceIn(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	reader domain.AccountID,
+) (Presence, error) {
+	if _, err := s.readerMembership(ctx, conversationID, reader); err != nil {
+		return Presence{}, err
+	}
+
+	members, err := s.memberships.In(ctx, conversationID)
+	if err != nil {
+		return Presence{}, fmt.Errorf("list members: %w", err)
+	}
+
+	// Only active members. Somebody who left is not offline, they are gone, and showing
+	// them greyed out beside the people who are actually there is a different statement.
+	accounts := make([]string, 0, len(members))
+	for _, member := range members {
+		if member.Active() {
+			accounts = append(accounts, string(member.AccountID()))
+		}
+	}
+
+	now := s.now()
+	online, err := s.presence.OnlineAmong(ctx, accounts, now)
+	if err != nil {
+		return Presence{}, fmt.Errorf("read presence: %w", err)
+	}
+	typing, err := s.presence.TypingIn(ctx, string(conversationID), now)
+	if err != nil {
+		return Presence{}, fmt.Errorf("read typing: %w", err)
+	}
+
+	present := Presence{Online: make([]string, 0, len(online)), Typing: make([]string, 0, len(typing))}
+	// Ordered by the member list rather than by however the map iterates, so a client
+	// comparing two answers sees a change only when something changed.
+	for _, accountID := range accounts {
+		if online[accountID] {
+			present.Online = append(present.Online, accountID)
+		}
+	}
+	// Filtered against the member list too: a claim left behind by somebody who has since
+	// left the conversation must not be reported to the people still in it.
+	stillMembers := make(map[string]bool, len(accounts))
+	for _, accountID := range accounts {
+		stillMembers[accountID] = true
+	}
+	for _, accountID := range typing {
+		if stillMembers[accountID] {
+			present.Typing = append(present.Typing, accountID)
+		}
+	}
+	return present, nil
+}
+
+// Typing records that somebody is or is not typing, and tells the conversation.
+//
+// Recorded *and* broadcast, which is two mechanisms for one fact and both are needed. The
+// broadcast is what makes an indicator appear immediately for people already looking; the
+// record is what makes it appear for somebody who opens the conversation a second later and
+// asks. Neither can do the other's job.
+//
+// Failure to record is returned; failure to broadcast is not. A client whose typing was
+// recorded but not announced is showing as typing to whoever asks, which is most of the value
+// and none of the cost of failing a keystroke.
+func (s *Service) Typing(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	actor domain.AccountID,
+	typing bool,
+) error {
+	membership, err := s.readerMembership(ctx, conversationID, actor)
+	if err != nil {
+		return err
+	}
+	// Somebody who may not write cannot be typing. A channel reader showing as typing to
+	// fifty thousand people would be a claim about something they cannot do.
+	if !membership.MayWrite() {
+		return domain.ErrNotPermittedToWrite
+	}
+
+	if typing {
+		err = s.presence.Typing(ctx, string(conversationID), string(actor), s.now())
+	} else {
+		err = s.presence.StoppedTyping(ctx, string(conversationID), string(actor))
+	}
+	if err != nil {
+		return fmt.Errorf("record typing: %w", err)
+	}
+
+	if err := s.broadcaster.BroadcastTyping(ctx, conversationID, actor, typing); err != nil {
+		logging.With(ctx, s.logger).Warn("broadcast typing",
+			slog.String("conversation_id", string(conversationID)), slog.Any("error", err))
+	}
+	return nil
+}
+
+// Connected and Disconnected record that a device has a socket on this node.
+//
+// Thin, and deliberately on the service rather than reaching the store from the socket layer:
+// api talks to use cases and adapters are wired behind ports, and one exception for the easy
+// case is how that stops being true. There is no rule to apply — the socket is already
+// authenticated, and a device saying it is connected is not a claim that can be wrong.
+func (s *Service) Connected(ctx context.Context, accountID domain.AccountID, deviceID string) error {
+	return s.presence.Renew(ctx, string(accountID), deviceID, s.now()) //nolint:wrapcheck // named where it happens.
+}
+
+func (s *Service) Disconnected(ctx context.Context, accountID domain.AccountID, deviceID string) error {
+	return s.presence.Gone(ctx, string(accountID), deviceID) //nolint:wrapcheck // named where it happens.
 }
 
 // maxRangeLimit caps how many entries one fetch returns.

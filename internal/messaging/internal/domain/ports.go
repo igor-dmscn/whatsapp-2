@@ -139,6 +139,44 @@ type Broadcaster interface {
 	// this a newly created conversation would deliver nothing live until the
 	// recipient reconnected.
 	NotifyConversationStarted(ctx context.Context, accountID AccountID, conversationID ConversationID) error
+
+	// BroadcastTyping tells a conversation that somebody started or stopped typing.
+	//
+	// The weakest thing on the ephemeral path, and the only one with no recovery at all:
+	// there is no gap to notice and nothing to re-read, because by the time a client could
+	// ask, the answer has changed. A lost start shows nothing; a lost stop is cleared by
+	// the client's own timer. That is the whole reason this is allowed to be a broadcast
+	// rather than anything more careful.
+	BroadcastTyping(ctx context.Context, conversationID ConversationID, accountID AccountID, typing bool) error
+}
+
+// Presence is who is connected and who is typing, held only for as long as it is true.
+//
+// Never persisted, and the interface says so by taking the current time on every write: every
+// fact here expires, and a store that did not expire them would be recording that somebody was
+// online at a moment that has passed. See internal/presence for why expiry is also what makes
+// a node dying safe.
+type Presence interface {
+	// Renew records that a device is connected. Called on a heartbeat by whichever node
+	// holds the socket, which is what makes the claim expire when that node stops.
+	Renew(ctx context.Context, accountID, deviceID string, now time.Time) error
+
+	// Gone forgets a device whose socket closed cleanly.
+	Gone(ctx context.Context, accountID, deviceID string) error
+
+	// OnlineAmong returns which of these accounts have a device connected. In bulk,
+	// because the question is asked about every name on a screen at once.
+	OnlineAmong(ctx context.Context, accountIDs []string, now time.Time) (map[string]bool, error)
+
+	// Typing records that an account is typing in a conversation. Per account rather than
+	// per device, like a read cursor: which device somebody typed on is nobody's business.
+	Typing(ctx context.Context, conversationID, accountID string, now time.Time) error
+
+	// StoppedTyping clears a claim before it would expire.
+	StoppedTyping(ctx context.Context, conversationID, accountID string) error
+
+	// TypingIn returns who is currently typing in a conversation.
+	TypingIn(ctx context.Context, conversationID string, now time.Time) ([]string, error)
 }
 
 // IDs generates the identifiers the domain requires but does not produce.

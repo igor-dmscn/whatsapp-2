@@ -76,6 +76,41 @@ type gapEntry struct {
 	To             int64  `json:"to"`
 }
 
+// typingFrame is a client saying it is or is not typing, and is also the shape the server
+// pushes to everyone else — one type in both directions, because it says the same thing either
+// way and a second name for it would be a second thing to keep in step.
+type typingFrame struct {
+	Type           string `json:"type"`
+	ConversationID string `json:"conversation_id"`
+	// AccountID is set only on the way out. A client cannot claim somebody else is typing:
+	// inbound, this is whoever the socket is authenticated as.
+	AccountID string `json:"account_id,omitempty"`
+	Typing    bool   `json:"typing"`
+}
+
+// presenceAskFrame is a client asking who is present in a conversation.
+//
+// Asked rather than pushed, and that is the trade: presence is soft state that a client polls
+// while it has a conversation open, which costs a request every few seconds on a socket it is
+// already holding. Pushing it would mean every connect and disconnect fanning out to every
+// member of every conversation that account belongs to — the same work, moved to the moment a
+// person opens their laptop, and paid for conversations nobody is looking at.
+type presenceAskFrame struct {
+	Type           string `json:"type"`
+	ConversationID string `json:"conversation_id"`
+}
+
+// presenceFrame is the answer: the whole state of a conversation, not a change to it.
+//
+// A snapshot because a client can then replace what it holds, which needs no reconciliation and
+// cannot drift. It also repairs the typing set, whose pushes are allowed to be lost.
+type presenceFrame struct {
+	Type           string   `json:"type"`
+	ConversationID string   `json:"conversation_id"`
+	Online         []string `json:"online"`
+	Typing         []string `json:"typing"`
+}
+
 type errorFrame struct {
 	Type    string `json:"type"`
 	Code    string `json:"code"`
@@ -112,6 +147,11 @@ func (h *Handler) Socket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.hub.Register(ctx, connection)
+	// Online from now, rather than from the first heartbeat up to ten seconds later. The
+	// heartbeat's job is keeping the claim true, not making it.
+	if err := h.service.Connected(ctx, connection.AccountID(), connection.DeviceID()); err != nil {
+		logger.Warn("record presence", slog.Any("error", err))
+	}
 	defer h.hub.Unregister(ctx, connection)
 	defer connection.Close("closed")
 	// Registered handlers are told the socket has gone, on a context of their own: this
@@ -208,6 +248,12 @@ func (h *Handler) read(ctx context.Context, connection *Connection, logger *slog
 			// connection warm and to learn it is dead.
 			_ = connection.WriteFrame(ctx, clientFrame{Type: "pong"})
 
+		case "typing":
+			h.handleTyping(ctx, connection, raw, logger)
+
+		case "presence.ask":
+			h.handlePresenceAsk(ctx, connection, raw, logger)
+
 		default:
 			// Frames Messaging does not own are offered to whoever registered for
 			// them — call signalling, so far (ADR-0004: one socket per client, for
@@ -256,6 +302,14 @@ func (s session) Send(frame any) error {
 // A client that crashed said nothing, and something has to notice: without this a call
 // keeps a participant nobody can see forever, and CL-3 never fires.
 func (h *Handler) closed(ctx context.Context, connection *Connection) {
+	// Presence withdrawn at once rather than left to expire. Not required for correctness
+	// — the claim ages out either way — and worth doing because thirty seconds of a dot
+	// beside somebody who closed their laptop reads as a broken feature rather than as a
+	// window.
+	if err := h.service.Disconnected(ctx, connection.AccountID(), connection.DeviceID()); err != nil {
+		h.logger.Debug("clear presence", slog.Any("error", err))
+	}
+
 	h.frameMutex.RLock()
 	handlers := make([]FrameHandler, 0, len(h.frameHandlers))
 	for _, handler := range h.frameHandlers {
@@ -354,6 +408,60 @@ func (h *Handler) handleResume(ctx context.Context, connection *Connection, raw 
 	if err := connection.WriteFrame(ctx, response); err != nil {
 		connection.Close("write failed")
 	}
+}
+
+// handleTyping records a client's typing claim and tells the conversation.
+//
+// Errors are logged rather than sent back. A refused typing claim is not something a person can
+// act on, and an error frame for it would put "you may not type" on screen in the one case it
+// legitimately happens — a channel reader whose client asked anyway.
+func (h *Handler) handleTyping(
+	ctx context.Context,
+	connection *Connection,
+	raw []byte,
+	logger *slog.Logger,
+) {
+	var frame typingFrame
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		_ = connection.WriteFrame(ctx, errorFrame{"error", "malformed_frame", "typing frame was not valid JSON"})
+		return
+	}
+
+	if err := h.service.Typing(ctx,
+		domain.ConversationID(frame.ConversationID), connection.AccountID(), frame.Typing); err != nil {
+		logger.Debug("typing", slog.Any("error", err))
+	}
+}
+
+// handlePresenceAsk answers who is present in a conversation.
+func (h *Handler) handlePresenceAsk(
+	ctx context.Context,
+	connection *Connection,
+	raw []byte,
+	logger *slog.Logger,
+) {
+	var frame presenceAskFrame
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		_ = connection.WriteFrame(ctx, errorFrame{"error", "malformed_frame", "presence frame was not valid JSON"})
+		return
+	}
+
+	present, err := h.service.PresenceIn(ctx,
+		domain.ConversationID(frame.ConversationID), connection.AccountID())
+	if err != nil {
+		// Silence rather than an error, for a question about something ephemeral: a client
+		// that gets no answer shows nobody, which is the same thing it showed before it
+		// asked. Reporting it would put a banner on screen for a dot.
+		logger.Debug("presence", slog.Any("error", err))
+		return
+	}
+
+	_ = connection.WriteFrame(ctx, presenceFrame{
+		Type:           "presence",
+		ConversationID: frame.ConversationID,
+		Online:         present.Online,
+		Typing:         present.Typing,
+	})
 }
 
 // writeFrameTo sends a frame on a socket that has no Connection yet.
