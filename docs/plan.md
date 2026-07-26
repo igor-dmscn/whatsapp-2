@@ -251,7 +251,7 @@ Three findings, all from running it:
 
 ---
 
-## Phase 9 — SFU
+## Phase 9 — SFU — **partly done: the model and the media plane**
 
 **Goal:** live audio and video calls. The largest and riskiest phase ([ADR-0006](./adr/0006-custom-pion-sfu-with-simulcast.md)).
 
@@ -261,6 +261,33 @@ Three findings, all from running it:
 3. **Only then** simulcast: per-receiver bandwidth estimation, layer selection, keyframe on switch (CL-5).
 
 Step 2 is a shippable product on its own. If schedule pressure arrives, stop after it — that retreat is recorded in ADR-0006 and taking it is not a failure.
+
+### Where this actually stands
+
+**Done and verified.**
+
+- **The call lifecycle**, as an aggregate with 11 tests. CL-2 and CL-3 are rules of the model: a second presence makes a call active, and the last departure ends it terminally. A participant is per device, because one person on a laptop and a phone is two transports and one tile. Joining twice from a device is idempotent.
+- **The media plane** — `internal/calling/internal/sfu` — with 6 tests driven by the phase-8 harness. A three-party call forwards in every direction in **0.44 s**. A keyframe request reaches the publisher in **21 ms**, against CL-6's two seconds. Two calls on one node cannot hear each other. A departing participant's transport is released and an empty call is forgotten. Race-clean under `-race`.
+
+**Not done.** Named precisely, because "phase 9" is not one thing:
+
+- Signalling over the existing WebSocket, and the `call.*` frames it would carry. The SFU's interface exists and is exercised in-process; nothing carries it to a browser yet.
+- Persistence for calls — there is no migration and no repository, so the aggregate is not yet loadable.
+- The `MediaNodes` and `Conversations` ports are declared and unimplemented, so entitlement from membership (CL-1) is designed and not wired.
+- `cmd/sfu`, and the api-to-node hop.
+- The frontend call UI.
+- Simulcast (CL-5) — step 3, which the plan itself says to stop before under pressure.
+
+**Two decisions, both forced by running it.**
+
+- **Renegotiation cannot be avoided.** A two-party call is asymmetric: the second to join receives the first's tracks in the answer to their own offer, and the first learns of the second's only if something offers the other way. The alternative — clients pre-declaring a receive slot per possible participant — removes renegotiation at the cost of a participant limit baked into every client and a demuxing scheme that varies by browser. So the server re-offers, and `Renegotiator` is the callback the signalling layer will fill in.
+- **A NACK is answered here, not relayed.** The packet is in this server's send buffer, and the publisher's sequence numbers mean something different. CL-6's retransmission therefore works because the server buffers, not because the publisher does. A PLI *is* relayed, because only a publisher can make a keyframe.
+
+Three findings:
+
+- **Renegotiating inline wedges a three-party call.** It runs on Pion's `OnTrack` callback, and the RTP read loop does not start until that returns — so an inline exchange waits for ICE gathering and the client's answer before forwarding a packet. With two participants it merely delays the first frame; with three, each new publisher blocks behind the previous one's exchange and the whole suite hangs with no output.
+- **The harness was miscounting, and the SFU was right.** Every publisher's video track is called `video`, and the harness keyed arrivals by name — so two publishers collapsed into one entry and a three-party call looked like a server that renegotiated once and stopped. Keyed by SSRC now. Worth noting which way this went: the instinct was to distrust the new code.
+- **Phase 8's `Signaller` had a hole.** The stub never re-offered, so the interface never needed to carry an offer from the server — which is the one thing the harness-first approach got wrong. Added as an optional `Renegotiable` rather than folded in, so the stub stays as simple as it was.
 
 **Frontend increment:** call UI — start, ring, accept, decline, mute, participant tiles, hang up.
 
