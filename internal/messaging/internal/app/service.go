@@ -26,6 +26,7 @@ type Service struct {
 	memberships   domain.MembershipRepository
 	entries       domain.EntryRepository
 	invites       domain.InviteRepository
+	reactions     domain.ReactionStore
 	state         domain.MemberStateStore
 	broadcaster   domain.Broadcaster
 	events        domain.EventPublisher
@@ -41,6 +42,7 @@ func NewService(
 	memberships domain.MembershipRepository,
 	entries domain.EntryRepository,
 	invites domain.InviteRepository,
+	reactions domain.ReactionStore,
 	state domain.MemberStateStore,
 	broadcaster domain.Broadcaster,
 	events domain.EventPublisher,
@@ -53,7 +55,7 @@ func NewService(
 		now = time.Now
 	}
 	return &Service{
-		conversations, memberships, entries, invites, state,
+		conversations, memberships, entries, invites, reactions, state,
 		broadcaster, events, transactor, ids, now, logger,
 	}
 }
@@ -159,6 +161,7 @@ func (s *Service) Send(
 	clientEntryID string,
 	contentType string,
 	body []byte,
+	replyTo domain.Sequence,
 ) (*domain.Entry, error) {
 	// Authorisation before content. The aggregate checks this again in Append and
 	// that is where the rule lives — MayWrite is the membership's own method, called
@@ -199,7 +202,7 @@ func (s *Service) Send(
 	err = s.atomically(ctx, func(ctx context.Context) error {
 		appended, events, err := s.conversations.AppendEntry(ctx, conversationID,
 			func(conversation *domain.Conversation) (*domain.Entry, error) {
-				return conversation.Append(s.ids.NewEntryID(), membership, parsedClientID, payload, s.now())
+				return conversation.Append(s.ids.NewEntryID(), membership, parsedClientID, payload, replyTo, s.now())
 			},
 		)
 		if err != nil {
@@ -906,4 +909,249 @@ func (s *Service) Invites(
 		return nil, fmt.Errorf("list invites: %w", err)
 	}
 	return invites, nil
+}
+
+// --- revisions and reactions ---
+
+// Revise edits an entry by appending a revision to the log (MS-8).
+//
+// Author only, enforced by the aggregate. What this adds is the check the aggregate
+// cannot make: it does not hold the log, so it cannot know whether the target has
+// already been retracted.
+func (s *Service) Revise(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	author domain.AccountID,
+	target domain.Sequence,
+	clientEntryID string,
+	contentType string,
+	body []byte,
+) (*domain.Entry, error) {
+	membership, targetEntry, err := s.amendable(ctx, conversationID, author, target)
+	if err != nil {
+		return nil, err
+	}
+
+	parsedClientID, err := domain.ParseClientEntryID(clientEntryID)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := domain.NewPayload(contentType, body)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.appendAmendment(ctx, conversationID, author, parsedClientID,
+		func(conversation *domain.Conversation) (*domain.Entry, error) {
+			return conversation.Revise(
+				s.ids.NewEntryID(), membership, targetEntry, parsedClientID, payload, s.now())
+		})
+}
+
+// Retract deletes an entry for everyone by appending a retraction (MS-9).
+func (s *Service) Retract(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	actor domain.AccountID,
+	target domain.Sequence,
+	clientEntryID string,
+) (*domain.Entry, error) {
+	membership, targetEntry, err := s.amendable(ctx, conversationID, actor, target)
+	if err != nil {
+		return nil, err
+	}
+
+	parsedClientID, err := domain.ParseClientEntryID(clientEntryID)
+	if err != nil {
+		return nil, err
+	}
+
+	return s.appendAmendment(ctx, conversationID, actor, parsedClientID,
+		func(conversation *domain.Conversation) (*domain.Entry, error) {
+			return conversation.Retract(s.ids.NewEntryID(), membership, targetEntry, parsedClientID, s.now())
+		})
+}
+
+// amendable loads what an amendment needs and refuses the cases the aggregate cannot
+// see.
+func (s *Service) amendable(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	actor domain.AccountID,
+	target domain.Sequence,
+) (*domain.Membership, *domain.Entry, error) {
+	membership, err := s.readerMembership(ctx, conversationID, actor)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	targetEntry, err := s.entries.AtSequence(ctx, conversationID, target)
+	if err != nil {
+		return nil, nil, fmt.Errorf("look up target entry: %w", err)
+	}
+
+	// Whether the target is already retracted is a fact about the log, which the
+	// Conversation aggregate does not hold — it holds only the head. So the check
+	// lives here rather than being faked in the aggregate with data passed in.
+	latest, err := s.entries.LatestAmendmentFor(ctx, conversationID, target)
+	switch {
+	case err == nil && latest.Kind() == domain.KindRetraction:
+		// Terminal. Editing something already withdrawn would put content back on
+		// screen for any client that applied the retraction and then the edit.
+		return nil, nil, domain.ErrEntryRetracted
+	case err != nil && !errors.Is(err, domain.ErrEntryNotFound):
+		return nil, nil, fmt.Errorf("look up amendments: %w", err)
+	}
+
+	return membership, targetEntry, nil
+}
+
+// appendAmendment runs an amendment through the same path as a send.
+//
+// Deliberately the same path: an amendment takes a position in the log, so it needs
+// the conversation's row lock, the outbox row in the same transaction, and the
+// broadcast afterwards — exactly as an ordinary message does. Anything else would be
+// a second way to write to the log, with its own chances of being wrong.
+func (s *Service) appendAmendment(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	author domain.AccountID,
+	clientEntryID domain.ClientEntryID,
+	amend domain.AppendFunc,
+) (*domain.Entry, error) {
+	var entry *domain.Entry
+
+	err := s.atomically(ctx, func(ctx context.Context) error {
+		appended, events, err := s.conversations.AppendEntry(ctx, conversationID, amend)
+		if err != nil {
+			return err
+		}
+		entry = appended
+		return s.publish(ctx, events)
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrEntryAlreadySent) {
+			existing, lookupErr := s.entries.ByClientEntryID(ctx, conversationID, author, clientEntryID)
+			if lookupErr != nil {
+				return nil, fmt.Errorf("look up amendment after conflict: %w", lookupErr)
+			}
+			return existing, nil
+		}
+		return nil, fmt.Errorf("append amendment: %w", err)
+	}
+
+	if err := s.broadcaster.BroadcastEntry(ctx, entry); err != nil {
+		logging.With(ctx, s.logger).Warn("broadcast amendment",
+			slog.String("conversation_id", string(conversationID)),
+			slog.Any("error", err),
+		)
+	}
+	return entry, nil
+}
+
+// React adds a reaction to an entry (MS-10).
+//
+// No sequence number is taken and the conversation's head does not move. That is the
+// point: reacting is high-churn, and a position per tap would wake every connected
+// client and cost every client a gap to fill (ADR-0008).
+func (s *Service) React(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	accountID domain.AccountID,
+	sequence domain.Sequence,
+	emoji string,
+) error {
+	membership, err := s.readerMembership(ctx, conversationID, accountID)
+	if err != nil {
+		return err
+	}
+	conversation, err := s.conversations.ByID(ctx, conversationID)
+	if err != nil {
+		return fmt.Errorf("look up conversation: %w", err)
+	}
+
+	reaction, err := domain.NewReaction(membership, sequence, conversation.Head(), emoji, s.now())
+	if err != nil {
+		return err
+	}
+
+	// No outbox row and no transaction. A reaction is not in the log, so there is no
+	// event for a projection to build from and nothing for the state to be atomic
+	// with — writing one would be ceremony that also spends a Kafka partition's
+	// throughput on taps.
+	if err := s.reactions.Add(ctx, reaction); err != nil {
+		return fmt.Errorf("add reaction: %w", err)
+	}
+
+	if err := s.broadcaster.BroadcastReaction(ctx, reaction, false); err != nil {
+		logging.With(ctx, s.logger).Warn("broadcast reaction", slog.Any("error", err))
+	}
+	return nil
+}
+
+// Unreact withdraws a reaction. Withdrawing one that is not there is not an error:
+// with several devices on one account it is an ordinary race, not a mistake.
+func (s *Service) Unreact(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	accountID domain.AccountID,
+	sequence domain.Sequence,
+	emoji string,
+) error {
+	membership, err := s.readerMembership(ctx, conversationID, accountID)
+	if err != nil {
+		return err
+	}
+	conversation, err := s.conversations.ByID(ctx, conversationID)
+	if err != nil {
+		return fmt.Errorf("look up conversation: %w", err)
+	}
+
+	// Validated through the same constructor, so an emoji that could never have been
+	// stored cannot be used to probe which entries exist.
+	reaction, err := domain.NewReaction(membership, sequence, conversation.Head(), emoji, s.now())
+	if err != nil {
+		return err
+	}
+
+	if err := s.reactions.Remove(ctx, conversationID, sequence, accountID, reaction.Emoji); err != nil {
+		return fmt.Errorf("remove reaction: %w", err)
+	}
+
+	if err := s.broadcaster.BroadcastReaction(ctx, reaction, true); err != nil {
+		logging.With(ctx, s.logger).Warn("broadcast reaction removal", slog.Any("error", err))
+	}
+	return nil
+}
+
+// Reactions returns the reactions on a stretch of entries.
+//
+// A range rather than a cursor, and that is the whole light sync path: a client asks
+// about what is on screen. If this ever needs ordering or history, ADR-0008 says
+// reactions belong in the log after all.
+func (s *Service) Reactions(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	reader domain.AccountID,
+	from, to domain.Sequence,
+) ([]domain.Reaction, error) {
+	membership, err := s.readerMembership(ctx, conversationID, reader)
+	if err != nil {
+		return nil, err
+	}
+
+	// Clamped to what this member may see, so asking about position 1 in a group
+	// joined at 40 reveals nothing about who reacted to what before they arrived.
+	if from < membership.VisibleFrom() {
+		from = membership.VisibleFrom()
+	}
+	if to < from {
+		return nil, nil
+	}
+
+	reactions, err := s.reactions.Range(ctx, conversationID, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("list reactions: %w", err)
+	}
+	return reactions, nil
 }

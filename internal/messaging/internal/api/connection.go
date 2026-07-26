@@ -9,7 +9,6 @@ import (
 
 	"github.com/coder/websocket"
 
-	"comms/internal/messaging/internal/broadcast"
 	"comms/internal/messaging/internal/domain"
 )
 
@@ -37,7 +36,14 @@ type Connection struct {
 	deviceID  string
 	logger    *slog.Logger
 
-	outbound chan broadcast.BroadcastMessage
+	// outbound carries already-encoded frames.
+	//
+	// Bytes rather than a message type, for two reasons. The hub encodes one
+	// broadcast once and hands the same bytes to every local connection, where a
+	// typed channel made each connection marshal an identical payload separately.
+	// And entries and reactions travel the same path — a connection does not need to
+	// know which it is forwarding.
+	outbound chan []byte
 
 	// closeOnce guards against the several paths that can end a connection at
 	// once: client close, write failure, buffer overflow, device revocation.
@@ -58,7 +64,7 @@ func NewConnection(socket *websocket.Conn, accountID domain.AccountID, deviceID 
 		accountID:  accountID,
 		deviceID:   deviceID,
 		logger:     logger,
-		outbound:   make(chan broadcast.BroadcastMessage, outboundBuffer),
+		outbound:   make(chan []byte, outboundBuffer),
 		done:       make(chan struct{}),
 		visibility: make(map[domain.ConversationID]domain.Sequence),
 	}
@@ -103,14 +109,14 @@ func (c *Connection) Sees(conversationID domain.ConversationID, sequence domain.
 	return following && sequence >= visibleFrom
 }
 
-// Send queues a message, or closes the connection if it cannot keep up.
+// Send queues an encoded frame, or closes the connection if it cannot keep up.
 //
 // Non-blocking on purpose. The alternative — blocking until the socket drains —
 // would let one unresponsive client stall the hub goroutine and stop delivery for
 // everyone on the node.
-func (c *Connection) Send(message broadcast.BroadcastMessage) {
+func (c *Connection) Send(encoded []byte) {
 	select {
-	case c.outbound <- message:
+	case c.outbound <- encoded:
 	case <-c.done:
 	default:
 		// Dropping a message silently would leave the client believing it is
@@ -132,8 +138,8 @@ func (c *Connection) Write(ctx context.Context) {
 			return
 		case <-c.done:
 			return
-		case message := <-c.outbound:
-			if err := c.writeJSON(ctx, message); err != nil {
+		case encoded := <-c.outbound:
+			if err := c.write(ctx, encoded); err != nil {
 				c.Close("write failed")
 				return
 			}
@@ -155,7 +161,10 @@ func (c *Connection) writeJSON(ctx context.Context, message any) error {
 		c.logger.Error("encode outbound message", slog.Any("error", err))
 		return nil
 	}
+	return c.write(ctx, encoded)
+}
 
+func (c *Connection) write(ctx context.Context, encoded []byte) error {
 	writeCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 

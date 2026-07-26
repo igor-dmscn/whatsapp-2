@@ -142,11 +142,18 @@ func (r *ConversationRepository) AppendEntry(
 		}
 
 		_, err = r.db.ExecContext(ctx,
-			`INSERT INTO entries (id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, created_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			`INSERT INTO entries (id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, created_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 			string(entry.ID()), string(entry.ConversationID()), int64(entry.Sequence()),
 			string(entry.AuthorID()), string(entry.ClientEntryID()), string(entry.Kind()),
-			entry.Payload().ContentType(), entry.Payload().Body(), entry.CreatedAt(),
+			// body is NOT NULL, and a retraction has none. Zero bytes rather than
+			// NULL: "carries no content" and "content unknown" are different claims,
+			// and only the first is true.
+			entry.Payload().ContentType(), storedBody(entry.Payload()),
+			// NULL rather than zero for "none": a zero sequence would be a position,
+			// and the partial index on target_sequence exists to skip these rows.
+			nullableSequence(entry.Target()), nullableSequence(entry.ReplyTo()),
+			entry.CreatedAt(),
 		)
 		if err != nil {
 			switch constraintName(err) {
@@ -307,7 +314,7 @@ func (r *EntryRepository) Range(
 	limit int,
 ) ([]*domain.Entry, error) {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, created_at
+		`SELECT id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, created_at
 		   FROM entries
 		  WHERE conversation_id = $1 AND sequence >= $2 AND sequence <= $3
 		  ORDER BY sequence
@@ -340,7 +347,7 @@ func (r *EntryRepository) ByClientEntryID(
 	clientEntryID domain.ClientEntryID,
 ) (*domain.Entry, error) {
 	entry, err := scanEntry(r.db.QueryRowContext(ctx,
-		`SELECT id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, created_at
+		`SELECT id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, created_at
 		   FROM entries
 		  WHERE conversation_id = $1 AND author_id = $2 AND client_entry_id = $3`,
 		string(conversationID), string(authorID), string(clientEntryID),
@@ -354,6 +361,22 @@ func (r *EntryRepository) ByClientEntryID(
 	return entry, nil
 }
 
+// storedBody maps an absent payload onto the NOT NULL column.
+func storedBody(payload domain.Payload) []byte {
+	if body := payload.Body(); body != nil {
+		return body
+	}
+	return []byte{}
+}
+
+// nullableSequence maps a zero sequence to NULL.
+func nullableSequence(sequence domain.Sequence) any {
+	if sequence == 0 {
+		return nil
+	}
+	return int64(sequence)
+}
+
 func scanEntry(row scanner) (*domain.Entry, error) {
 	var (
 		id             domain.EntryID
@@ -364,24 +387,76 @@ func scanEntry(row scanner) (*domain.Entry, error) {
 		kind           domain.EntryKind
 		contentType    string
 		body           []byte
+		target         sql.NullInt64
+		replyTo        sql.NullInt64
 		createdAt      time.Time
 	)
-	if err := row.Scan(&id, &conversationID, &sequence, &authorID, &clientEntryID, &kind, &contentType, &body, &createdAt); err != nil {
+	if err := row.Scan(&id, &conversationID, &sequence, &authorID, &clientEntryID, &kind,
+		&contentType, &body, &target, &replyTo, &createdAt); err != nil {
 		return nil, err
 	}
 
-	payload, err := domain.NewPayload(contentType, body)
-	if err != nil {
-		// Stored rows were valid when written. Reaching here means the row is
-		// corrupt or a rule changed, and silently returning an empty payload
-		// would hide that.
-		return nil, fmt.Errorf("reconstitute payload for entry %s: %w", id, err)
-	}
+	// Reconstituted, not constructed: loading re-runs no validation (ADR-0010). A
+	// retraction has no content type and no bytes, which NewPayload rightly refuses —
+	// and a rule tightened later must not make older history unreadable.
+	payload := domain.ReconstitutePayload(contentType, body)
 
 	return domain.ReconstituteEntry(
-		id, conversationID, domain.Sequence(sequence), authorID, clientEntryID, kind, payload, createdAt,
+		id, conversationID, domain.Sequence(sequence), authorID, clientEntryID, kind, payload,
+		domain.Sequence(target.Int64), domain.Sequence(replyTo.Int64), createdAt,
 	), nil
 }
+
+func (r *EntryRepository) AtSequence(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	sequence domain.Sequence,
+) (*domain.Entry, error) {
+	entry, err := scanEntry(r.db.QueryRowContext(ctx,
+		`SELECT `+entryColumns+`
+		   FROM entries
+		  WHERE conversation_id = $1 AND sequence = $2`,
+		string(conversationID), int64(sequence),
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, domain.ErrEntryNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select entry at sequence: %w", err)
+	}
+	return entry, nil
+}
+
+// LatestAmendmentFor returns the newest entry amending a position.
+//
+// Newest by sequence rather than by time: the log's order is the sequence, and two
+// amendments written in the same millisecond would otherwise resolve arbitrarily.
+func (r *EntryRepository) LatestAmendmentFor(
+	ctx context.Context,
+	conversationID domain.ConversationID,
+	target domain.Sequence,
+) (*domain.Entry, error) {
+	entry, err := scanEntry(r.db.QueryRowContext(ctx,
+		`SELECT `+entryColumns+`
+		   FROM entries
+		  WHERE conversation_id = $1 AND target_sequence = $2
+		  ORDER BY sequence DESC
+		  LIMIT 1`,
+		string(conversationID), int64(target),
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, domain.ErrEntryNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select latest amendment: %w", err)
+	}
+	return entry, nil
+}
+
+// entryColumns is the projection every entry query shares. One constant, because a
+// column added to the table and to scanEntry but forgotten in one query is a runtime
+// scan error rather than a compile error.
+const entryColumns = `id, conversation_id, sequence, author_id, client_entry_id, kind, content_type, body, target_sequence, reply_to, created_at`
 
 // scanner is what *sql.Row and *sql.Rows have in common.
 type scanner interface {

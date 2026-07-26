@@ -67,6 +67,8 @@ func route(event domain.Event) (topic string, key string, err error) {
 		return kafka.TopicMessagingEntries, string(typed.ConversationID), nil
 	case domain.EntryAppended:
 		return kafka.TopicMessagingEntries, string(typed.ConversationID), nil
+	case domain.EntryAmended:
+		return kafka.TopicMessagingEntries, string(typed.ConversationID), nil
 	case domain.MemberJoined:
 		return kafka.TopicMessagingEntries, string(typed.ConversationID), nil
 	case domain.MemberLeft:

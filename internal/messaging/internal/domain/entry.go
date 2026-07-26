@@ -16,11 +16,22 @@ const (
 	// KindMessage carries a payload from its author.
 	KindMessage EntryKind = "message"
 
-	// KindRevision amends or retracts an earlier entry. Created in phase 5; named
-	// here so that clients written now must already tolerate an unfamiliar kind
-	// rather than assuming every entry is renderable.
+	// KindRevision replaces an earlier entry's content with its own.
 	KindRevision EntryKind = "revision"
+
+	// KindRetraction withdraws an earlier entry's content — delete for everyone.
+	//
+	// A separate kind from KindRevision rather than a revision with an empty
+	// payload. "Empty means deleted" is an encoding a client can get wrong in a way
+	// that shows withdrawn content, and the two are different acts with different
+	// permissions (MS-9).
+	KindRetraction EntryKind = "retraction"
 )
+
+// Amends reports whether this kind refers to an earlier entry.
+func (k EntryKind) Amends() bool {
+	return k == KindRevision || k == KindRetraction
+}
 
 // Entry is an aggregate root: one position in a conversation's log.
 //
@@ -38,7 +49,11 @@ type Entry struct {
 	clientEntryID  ClientEntryID
 	kind           EntryKind
 	payload        Payload
-	createdAt      time.Time
+	// target is the position this entry amends, zero for an ordinary message.
+	target Sequence
+	// replyTo is the position this entry replies to, zero for none.
+	replyTo   Sequence
+	createdAt time.Time
 }
 
 func newEntry(
@@ -49,6 +64,8 @@ func newEntry(
 	clientEntryID ClientEntryID,
 	kind EntryKind,
 	payload Payload,
+	target Sequence,
+	replyTo Sequence,
 	now time.Time,
 ) (*Entry, error) {
 	if id == "" {
@@ -63,6 +80,12 @@ func newEntry(
 	if clientEntryID == "" {
 		return nil, ValidationError{"client_entry_id", "must not be empty"}
 	}
+	if kind.Amends() && target < FirstSequence {
+		return nil, ValidationError{"target_sequence", "must name the entry being amended"}
+	}
+	if !kind.Amends() && target != 0 {
+		return nil, ValidationError{"target_sequence", "only a revision or retraction amends an entry"}
+	}
 
 	return &Entry{
 		id:             id,
@@ -72,6 +95,8 @@ func newEntry(
 		clientEntryID:  clientEntryID,
 		kind:           kind,
 		payload:        payload,
+		target:         target,
+		replyTo:        replyTo,
 		createdAt:      now,
 	}, nil
 }
@@ -86,6 +111,8 @@ func ReconstituteEntry(
 	clientEntryID ClientEntryID,
 	kind EntryKind,
 	payload Payload,
+	target Sequence,
+	replyTo Sequence,
 	createdAt time.Time,
 ) *Entry {
 	return &Entry{
@@ -96,6 +123,8 @@ func ReconstituteEntry(
 		clientEntryID:  clientEntryID,
 		kind:           kind,
 		payload:        payload,
+		target:         target,
+		replyTo:        replyTo,
 		createdAt:      createdAt,
 	}
 }
@@ -108,6 +137,12 @@ func (e *Entry) ClientEntryID() ClientEntryID   { return e.clientEntryID }
 func (e *Entry) Kind() EntryKind                { return e.kind }
 func (e *Entry) Payload() Payload               { return e.payload }
 func (e *Entry) CreatedAt() time.Time           { return e.createdAt }
+
+// Target is the position this entry amends, or zero if it amends nothing.
+func (e *Entry) Target() Sequence { return e.target }
+
+// ReplyTo is the position this entry replies to, or zero for none.
+func (e *Entry) ReplyTo() Sequence { return e.replyTo }
 
 // String reports position and shape, never content.
 func (e *Entry) String() string {

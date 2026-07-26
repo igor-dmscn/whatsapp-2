@@ -26,6 +26,16 @@ var (
 	// rather than leaving.
 	ErrCannotRemoveSelf = errors.New("leave the conversation rather than removing yourself")
 
+	// ErrNotTheAuthor means only the entry's author may do this (MS-8, MS-9).
+	ErrNotTheAuthor = errors.New("only the author may amend this entry")
+
+	// ErrCannotAmendAnAmendment means the target is itself a revision or retraction.
+	// A second edit amends the original, not the first edit.
+	ErrCannotAmendAnAmendment = errors.New("amendments target the original entry")
+
+	// ErrEntryRetracted means the target has been withdrawn and cannot be edited.
+	ErrEntryRetracted = errors.New("this entry has been retracted")
+
 	ErrInviteNotFound  = errors.New("invite not found")
 	ErrInviteExpired   = errors.New("invite has expired")
 	ErrInviteRevoked   = errors.New("invite has been revoked")

@@ -70,6 +70,28 @@ func (h *Hub) Run(ctx context.Context) {
 func (h *Hub) dispatch(ctx context.Context, message *redis.Message) {
 	switch {
 	case isEntriesChannel(message.Channel):
+		// Two shapes share this channel. Peeked at rather than given separate
+		// channels, because a reaction is about a conversation exactly as an entry is
+		// and a second channel would double every node's subscription count for
+		// information the same connections already want.
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(message.Payload), &envelope); err != nil {
+			h.logger.Warn("decode broadcast", slog.Any("error", err))
+			return
+		}
+
+		if envelope.Type == "reaction" {
+			var reaction broadcast.ReactionMessage
+			if err := json.Unmarshal([]byte(message.Payload), &reaction); err != nil {
+				h.logger.Warn("decode reaction", slog.Any("error", err))
+				return
+			}
+			h.deliverReaction(reaction)
+			return
+		}
+
 		var broadcast broadcast.BroadcastMessage
 		if err := json.Unmarshal([]byte(message.Payload), &broadcast); err != nil {
 			h.logger.Warn("decode broadcast", slog.Any("error", err))
@@ -105,10 +127,55 @@ func (h *Hub) deliverEntry(broadcast broadcast.BroadcastMessage) {
 	}
 	h.mutex.RUnlock()
 
+	if len(targets) == 0 {
+		return
+	}
+
+	// Encoded once for every recipient on this node. The payload is identical, and
+	// re-marshalling it per connection was pure waste on a channel with many local
+	// readers.
+	encoded, err := json.Marshal(broadcast)
+	if err != nil {
+		h.logger.Error("encode entry frame", slog.Any("error", err))
+		return
+	}
+
 	// Sent outside the lock: a slow socket must not block the hub, and the send
 	// itself is non-blocking — see Connection.Send.
 	for _, connection := range targets {
-		connection.Send(broadcast)
+		connection.Send(encoded)
+	}
+}
+
+// deliverReaction sends a reaction to every local connection entitled to see the
+// entry it is about.
+func (h *Hub) deliverReaction(message broadcast.ReactionMessage) {
+	conversationID := domain.ConversationID(message.ConversationID)
+
+	h.mutex.RLock()
+	targets := make([]*Connection, 0, 8)
+	for _, connections := range h.connections {
+		for connection := range connections {
+			// The same visibility check as an entry, for the same reason: a reaction
+			// on position 39 tells you position 39 exists.
+			if connection.Sees(conversationID, domain.Sequence(message.Sequence)) {
+				targets = append(targets, connection)
+			}
+		}
+	}
+	h.mutex.RUnlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	encoded, err := json.Marshal(message)
+	if err != nil {
+		h.logger.Error("encode reaction frame", slog.Any("error", err))
+		return
+	}
+	for _, connection := range targets {
+		connection.Send(encoded)
 	}
 }
 

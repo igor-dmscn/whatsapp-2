@@ -84,6 +84,14 @@ type EntryRepository interface {
 	// becomes a lookup instead of a duplicate (MS-2).
 	// Returns ErrEntryNotFound if there is none.
 	ByClientEntryID(ctx context.Context, conversationID ConversationID, authorID AccountID, clientEntryID ClientEntryID) (*Entry, error)
+
+	// AtSequence returns the entry at a position, which is what an amendment names.
+	AtSequence(ctx context.Context, conversationID ConversationID, sequence Sequence) (*Entry, error)
+
+	// LatestAmendmentFor returns the most recent entry amending a position, or
+	// ErrEntryNotFound if there is none. Used to refuse editing something already
+	// retracted.
+	LatestAmendmentFor(ctx context.Context, conversationID ConversationID, target Sequence) (*Entry, error)
 }
 
 // EventPublisher carries recorded domain events out of the context.
@@ -109,6 +117,15 @@ type EventPublisher interface {
 type Broadcaster interface {
 	// BroadcastEntry announces an entry to a conversation's listeners.
 	BroadcastEntry(ctx context.Context, entry *Entry) error
+
+	// BroadcastReaction announces a reaction on the conversation's channel.
+	//
+	// The same ephemeral path as entries and allowed to fail the same way — but the
+	// recovery is different, and weaker: a client that misses a reaction has no gap
+	// to notice, and learns of it the next time it reads the range. That is the price
+	// ADR-0008 accepted for keeping reactions out of the log, and it is the right
+	// trade for something nobody loses work over.
+	BroadcastReaction(ctx context.Context, reaction Reaction, removed bool) error
 
 	// NotifyConversationStarted tells an account's listeners that it has been
 	// added to a conversation, so their node can begin listening to it. Without
@@ -199,6 +216,25 @@ type MemberStateStore interface {
 // means.
 type Transactor interface {
 	InTransaction(ctx context.Context, work func(context.Context) error) error
+}
+
+// ReactionStore holds reaction state.
+//
+// Not a repository: reactions are values, not aggregates, and this stores no
+// invariant. Named a store for the same reason MemberStateStore is — calling it a
+// repository would imply an aggregate root that does not exist.
+//
+// Both writes are idempotent. Tapping twice is one reaction, and un-tapping something
+// already gone is not an error: with several devices on one account, both cases are
+// ordinary rather than exceptional.
+type ReactionStore interface {
+	Add(ctx context.Context, reaction Reaction) error
+	Remove(ctx context.Context, conversationID ConversationID, sequence Sequence, accountID AccountID, emoji Emoji) error
+
+	// Range returns the reactions on a stretch of entries. The read a client makes
+	// for what is on screen, which is the whole of the light sync path — no cursor,
+	// no ordering, no history (ADR-0008).
+	Range(ctx context.Context, conversationID ConversationID, from, to Sequence) ([]Reaction, error)
 }
 
 // InviteRepository stores Invite aggregates.

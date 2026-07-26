@@ -58,6 +58,31 @@ type BroadcastMessage struct {
 	ContentType    string    `json:"content_type"`
 	Body           string    `json:"body"`
 	CreatedAt      time.Time `json:"created_at"`
+	// TargetSequence and ReplyTo travel with the broadcast so a live client can
+	// apply an edit without a round trip. Omitting them would make every revision
+	// cost the recipient a fetch to discover what it amends — which is the one thing
+	// carrying the body was meant to avoid.
+	TargetSequence int64 `json:"target_sequence,omitempty"`
+	ReplyTo        int64 `json:"reply_to,omitempty"`
+}
+
+// ReactionMessage is the wire form of a reaction on the ephemeral path.
+//
+// On the conversation's channel, like an entry, so the hub's existing per-connection
+// visibility check applies unchanged: a member who joined at position 40 must not be
+// told about a reaction on 39.
+//
+// Removed rather than a separate message type, because a client applies both the same
+// way — set or clear one (account, emoji) pair on one entry — and two types would be
+// two code paths for one idea.
+type ReactionMessage struct {
+	Type           string    `json:"type"`
+	ConversationID string    `json:"conversation_id"`
+	Sequence       int64     `json:"sequence"`
+	AccountID      string    `json:"account_id"`
+	Emoji          string    `json:"emoji"`
+	Removed        bool      `json:"removed"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // ControlMessage tells a node something about an account rather than a
@@ -80,6 +105,8 @@ func (b *RedisBroadcaster) BroadcastEntry(ctx context.Context, entry *domain.Ent
 		ContentType:    entry.Payload().ContentType(),
 		Body:           base64.StdEncoding.EncodeToString(entry.Payload().Body()),
 		CreatedAt:      entry.CreatedAt(),
+		TargetSequence: int64(entry.Target()),
+		ReplyTo:        int64(entry.ReplyTo()),
 	})
 	if err != nil {
 		return fmt.Errorf("encode entry broadcast: %w", err)
@@ -87,6 +114,26 @@ func (b *RedisBroadcaster) BroadcastEntry(ctx context.Context, entry *domain.Ent
 
 	if err := b.client.Publish(ctx, entriesChannel(entry.ConversationID()), encoded).Err(); err != nil {
 		return fmt.Errorf("publish entry: %w", err)
+	}
+	return nil
+}
+
+func (b *RedisBroadcaster) BroadcastReaction(ctx context.Context, reaction domain.Reaction, removed bool) error {
+	encoded, err := json.Marshal(ReactionMessage{
+		Type:           "reaction",
+		ConversationID: string(reaction.ConversationID),
+		Sequence:       int64(reaction.Sequence),
+		AccountID:      string(reaction.AccountID),
+		Emoji:          string(reaction.Emoji),
+		Removed:        removed,
+		CreatedAt:      reaction.CreatedAt,
+	})
+	if err != nil {
+		return fmt.Errorf("encode reaction broadcast: %w", err)
+	}
+
+	if err := b.client.Publish(ctx, entriesChannel(reaction.ConversationID), encoded).Err(); err != nil {
+		return fmt.Errorf("publish reaction: %w", err)
 	}
 	return nil
 }

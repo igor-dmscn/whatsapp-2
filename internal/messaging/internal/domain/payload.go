@@ -34,7 +34,29 @@ func NewPayload(contentType string, body []byte) (Payload, error) {
 	return Payload{contentType: contentType, body: append([]byte(nil), body...)}, nil
 }
 
+// ReconstitutePayload rebuilds a payload from storage without validating it. Only a
+// repository should call this.
+//
+// Loading is not constructing (ADR-0010). Two reasons it matters here: a retraction
+// legitimately has no content type and no bytes, which NewPayload rightly refuses; and
+// re-validating on load would make a tightened rule retroactively corrupt history that
+// was acceptable when it was written.
+func ReconstitutePayload(contentType string, body []byte) Payload {
+	return Payload{contentType: contentType, body: body}
+}
+
+// NoPayload is what a retraction carries: nothing.
+//
+// Named rather than left as a zero value, so a call site saying "this entry has no
+// content" reads as a decision instead of an omission.
+func NoPayload() Payload {
+	return Payload{}
+}
+
 func (p Payload) ContentType() string { return p.contentType }
+
+// Empty reports whether there is no content at all.
+func (p Payload) Empty() bool { return p.contentType == "" && len(p.body) == 0 }
 
 // Body returns a copy of the bytes.
 func (p Payload) Body() []byte {

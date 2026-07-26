@@ -65,6 +65,23 @@ type EntryAppended struct {
 
 func (EntryAppended) EventName() string { return "messaging.entry_appended" }
 
+// EntryAmended is raised when an entry revises or retracts an earlier one.
+//
+// One event for both, distinguished by Kind, because every consumer cares about the
+// same thing: a position in the log now says something different about an earlier
+// position. It names the target so a projection can act without reading the entry.
+type EntryAmended struct {
+	occurred
+	ConversationID ConversationID
+	EntryID        EntryID
+	Sequence       Sequence
+	TargetSequence Sequence
+	AuthorID       AccountID
+	Kind           EntryKind
+}
+
+func (EntryAmended) EventName() string { return "messaging.entry_amended" }
+
 // MemberJoined is raised when an account gains a membership.
 type MemberJoined struct {
 	occurred

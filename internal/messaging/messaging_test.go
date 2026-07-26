@@ -116,19 +116,32 @@ func openRedis(t *testing.T) *redis.Client {
 	return client
 }
 
+// testLogger discards by default and writes to stderr when COMMS_TEST_LOG is set.
+//
+// Worth the three lines: a handler that answers 500 logs the cause and returns a body
+// that reveals nothing, which is right in production and blinding in a test. Without
+// this the only way to see why is to edit the harness.
+func testLogger() *slog.Logger {
+	if os.Getenv("COMMS_TEST_LOG") == "" {
+		return slog.New(slog.DiscardHandler)
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
 // newNode starts an api instance sharing the given authenticator.
 func newNode(t *testing.T, tokens *fakeAuthenticator) *node {
 	t.Helper()
 
 	db := testdb.Open(t)
 	redisClient := openRedis(t)
-	logger := slog.New(slog.DiscardHandler)
+	logger := testLogger()
 
 	service := app.NewService(
 		postgres.NewConversationRepository(db),
 		postgres.NewMembershipRepository(db),
 		postgres.NewEntryRepository(db),
 		postgres.NewInviteRepository(db),
+		postgres.NewReactionStore(db),
 		postgres.NewMemberStateStore(db),
 		broadcast.NewRedisBroadcaster(redisClient),
 		// The real outbox, not a double. These tests are what establish that an
@@ -220,12 +233,15 @@ type conversationBody struct {
 }
 
 type entryBody struct {
-	ID            string `json:"id"`
-	Sequence      int64  `json:"sequence"`
-	AuthorID      string `json:"author_id"`
-	ClientEntryID string `json:"client_entry_id"`
-	ContentType   string `json:"content_type"`
-	Body          string `json:"body"`
+	ID             string `json:"id"`
+	Sequence       int64  `json:"sequence"`
+	AuthorID       string `json:"author_id"`
+	ClientEntryID  string `json:"client_entry_id"`
+	Kind           string `json:"kind"`
+	ContentType    string `json:"content_type"`
+	Body           string `json:"body"`
+	TargetSequence int64  `json:"target_sequence"`
+	ReplyTo        int64  `json:"reply_to"`
 }
 
 func (e entryBody) text(t *testing.T) string {

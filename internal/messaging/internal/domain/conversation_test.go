@@ -58,6 +58,7 @@ func TestAppendAssignsGaplessSequences(t *testing.T) {
 			membership,
 			domain.ClientEntryID("client-"+string(rune('a'+index))),
 			payload(t, "hello"),
+			0,
 			now,
 		)
 		if err != nil {
@@ -86,7 +87,7 @@ func TestFirstEntryIsSequenceOne(t *testing.T) {
 		t.Errorf("new conversation head = %d, want 0", conversation.Head())
 	}
 
-	entry, err := conversation.Append("entry-1", membership, "client-1", payload(t, "hi"), time.Now())
+	entry, err := conversation.Append("entry-1", membership, "client-1", payload(t, "hi"), 0, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func TestAppendRejectsMembershipOfAnotherConversation(t *testing.T) {
 
 	// Without this check, a caller holding any membership at all could write
 	// anywhere — the conversation must verify the membership is its own.
-	_, err = conversation.Append("entry-1", stranger, "client-1", payload(t, "hi"), time.Now())
+	_, err = conversation.Append("entry-1", stranger, "client-1", payload(t, "hi"), 0, time.Now())
 	if !errors.Is(err, domain.ErrNotAMember) {
 		t.Errorf("got %v, want ErrNotAMember", err)
 	}
@@ -119,7 +120,7 @@ func TestAppendRejectsMembershipOfAnotherConversation(t *testing.T) {
 func TestAppendRejectsNilMembership(t *testing.T) {
 	conversation, _ := directWithMember(t)
 
-	_, err := conversation.Append("entry-1", nil, "client-1", payload(t, "hi"), time.Now())
+	_, err := conversation.Append("entry-1", nil, "client-1", payload(t, "hi"), 0, time.Now())
 	if !errors.Is(err, domain.ErrNotAMember) {
 		t.Errorf("got %v, want ErrNotAMember", err)
 	}
@@ -137,7 +138,7 @@ func TestAppendRejectsReaders(t *testing.T) {
 	}
 
 	// MS-7: a channel subscriber may read and nothing else.
-	_, err = channel.Append("entry-1", reader, "client-1", payload(t, "hi"), now)
+	_, err = channel.Append("entry-1", reader, "client-1", payload(t, "hi"), 0, now)
 	if !errors.Is(err, domain.ErrNotPermittedToWrite) {
 		t.Errorf("got %v, want ErrNotPermittedToWrite", err)
 	}
@@ -147,7 +148,7 @@ func TestAppendRejectsDepartedMembers(t *testing.T) {
 	conversation, membership := directWithMember(t)
 	membership.Leave(time.Now())
 
-	_, err := conversation.Append("entry-1", membership, "client-1", payload(t, "hi"), time.Now())
+	_, err := conversation.Append("entry-1", membership, "client-1", payload(t, "hi"), 0, time.Now())
 	if !errors.Is(err, domain.ErrNotPermittedToWrite) {
 		t.Errorf("got %v, want ErrNotPermittedToWrite", err)
 	}
@@ -158,7 +159,7 @@ func TestRejectedAppendRecordsNoEvent(t *testing.T) {
 	membership.Leave(time.Now())
 	membership.TakeEvents()
 
-	_, _ = conversation.Append("entry-1", membership, "client-1", payload(t, "hi"), time.Now())
+	_, _ = conversation.Append("entry-1", membership, "client-1", payload(t, "hi"), 0, time.Now())
 
 	if names := eventNames(conversation.TakeEvents()); len(names) != 0 {
 		t.Errorf("rejected append recorded %v, want nothing", names)
@@ -168,7 +169,7 @@ func TestRejectedAppendRecordsNoEvent(t *testing.T) {
 func TestAppendRecordsEntryAppended(t *testing.T) {
 	conversation, membership := directWithMember(t)
 
-	if _, err := conversation.Append("entry-1", membership, "client-1", payload(t, "hi"), time.Now()); err != nil {
+	if _, err := conversation.Append("entry-1", membership, "client-1", payload(t, "hi"), 0, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -246,7 +247,7 @@ func TestJoiningPositionEncodesTheHistoryPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for index := range 10 {
-		if _, err := group.Append(domain.EntryID("e"+string(rune('a'+index))), member, domain.ClientEntryID("c"+string(rune('a'+index))), payload(t, "x"), now); err != nil {
+		if _, err := group.Append(domain.EntryID("e"+string(rune('a'+index))), member, domain.ClientEntryID("c"+string(rune('a'+index))), payload(t, "x"), 0, now); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -63,6 +63,12 @@ func (h *Handler) Routes(mux *http.ServeMux, authenticated func(http.Handler) ht
 	mux.Handle("GET /v1/conversations", authenticated(http.HandlerFunc(h.listConversations)))
 	mux.Handle("POST /v1/conversations/{conversationID}/receipt", authenticated(http.HandlerFunc(h.acknowledge)))
 
+	mux.Handle("POST /v1/conversations/{conversationID}/entries/{sequence}/revision", authenticated(http.HandlerFunc(h.revise)))
+	mux.Handle("POST /v1/conversations/{conversationID}/entries/{sequence}/retraction", authenticated(http.HandlerFunc(h.retract)))
+	mux.Handle("GET /v1/conversations/{conversationID}/reactions", authenticated(http.HandlerFunc(h.listReactions)))
+	mux.Handle("PUT /v1/conversations/{conversationID}/entries/{sequence}/reactions", authenticated(http.HandlerFunc(h.react)))
+	mux.Handle("DELETE /v1/conversations/{conversationID}/entries/{sequence}/reactions", authenticated(http.HandlerFunc(h.unreact)))
+
 	mux.Handle("POST /v1/conversations/group", authenticated(http.HandlerFunc(h.startGroup)))
 	mux.Handle("POST /v1/conversations/channel", authenticated(http.HandlerFunc(h.startChannel)))
 	mux.Handle("GET /v1/conversations/{conversationID}/members", authenticated(http.HandlerFunc(h.listMembers)))
@@ -96,6 +102,30 @@ type sendRequest struct {
 	// it as a JSON string would force an encoding decision the server has no
 	// business making (ADR-0001).
 	Body string `json:"body"`
+	// ReplyTo is the position this entry replies to, zero for none. A reference
+	// field and nothing more (ADR-0008).
+	ReplyTo int64 `json:"reply_to"`
+}
+
+type reviseRequest struct {
+	ClientEntryID string `json:"client_entry_id"`
+	ContentType   string `json:"content_type"`
+	Body          string `json:"body"`
+}
+
+type retractRequest struct {
+	ClientEntryID string `json:"client_entry_id"`
+}
+
+type reactRequest struct {
+	Emoji string `json:"emoji"`
+}
+
+type reactionResponse struct {
+	Sequence  int64     `json:"sequence"`
+	AccountID string    `json:"account_id"`
+	Emoji     string    `json:"emoji"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type conversationResponse struct {
@@ -172,6 +202,11 @@ type entryResponse struct {
 	ContentType    string    `json:"content_type"`
 	Body           string    `json:"body"`
 	CreatedAt      time.Time `json:"created_at"`
+	// TargetSequence is the position this entry amends, absent for a message. A
+	// client that does not understand revisions ignores it and shows the original,
+	// which is the degradation ADR-0008 requires.
+	TargetSequence int64 `json:"target_sequence,omitempty"`
+	ReplyTo        int64 `json:"reply_to,omitempty"`
 }
 
 func newEntryResponse(entry *domain.Entry) entryResponse {
@@ -185,6 +220,8 @@ func newEntryResponse(entry *domain.Entry) entryResponse {
 		ContentType:    entry.Payload().ContentType(),
 		Body:           base64.StdEncoding.EncodeToString(entry.Payload().Body()),
 		CreatedAt:      entry.CreatedAt(),
+		TargetSequence: int64(entry.Target()),
+		ReplyTo:        int64(entry.ReplyTo()),
 	}
 }
 
@@ -345,7 +382,7 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request) {
 
 	entry, err := h.service.Send(
 		r.Context(), conversationID, domain.AccountID(accountID),
-		request.ClientEntryID, request.ContentType, body,
+		request.ClientEntryID, request.ContentType, body, domain.Sequence(request.ReplyTo),
 	)
 	if err != nil {
 		h.writeDomainError(w, r, err)
@@ -356,6 +393,148 @@ func (h *Handler) send(w http.ResponseWriter, r *http.Request) {
 	// Distinguishing them would tell a retrying client something it cannot use and
 	// invite it to treat a successful retry as a failure.
 	httpx.WriteJSON(w, h.logger, http.StatusCreated, newEntryResponse(entry))
+}
+
+// --- revisions and reactions ---
+
+// pathSequence reads a position out of the URL.
+func (h *Handler) pathSequence(r *http.Request) (domain.Sequence, bool) {
+	parsed, err := strconv.ParseInt(r.PathValue("sequence"), 10, 64)
+	if err != nil || parsed < int64(domain.FirstSequence) {
+		return 0, false
+	}
+	return domain.Sequence(parsed), true
+}
+
+func (h *Handler) revise(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+	conversationID := domain.ConversationID(r.PathValue("conversationID"))
+
+	sequence, ok := h.pathSequence(r)
+	if !ok {
+		h.fail(w, r, http.StatusBadRequest, "invalid_sequence", "the target must be a position in the log")
+		return
+	}
+
+	var request reviseRequest
+	if err := httpx.DecodeJSON(r, &request); err != nil {
+		h.fail(w, r, http.StatusBadRequest, "malformed_body", err.Error())
+		return
+	}
+	body, err := base64.StdEncoding.DecodeString(request.Body)
+	if err != nil {
+		h.fail(w, r, http.StatusBadRequest, "malformed_body", "body must be base64")
+		return
+	}
+
+	entry, err := h.service.Revise(r.Context(), conversationID, domain.AccountID(accountID),
+		sequence, request.ClientEntryID, request.ContentType, body)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	// 201, because a revision *is* a new entry with its own position — that is the
+	// whole of ADR-0008, and a 200 would suggest something was updated in place.
+	httpx.WriteJSON(w, h.logger, http.StatusCreated, newEntryResponse(entry))
+}
+
+func (h *Handler) retract(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+	conversationID := domain.ConversationID(r.PathValue("conversationID"))
+
+	sequence, ok := h.pathSequence(r)
+	if !ok {
+		h.fail(w, r, http.StatusBadRequest, "invalid_sequence", "the target must be a position in the log")
+		return
+	}
+
+	var request retractRequest
+	if err := httpx.DecodeJSON(r, &request); err != nil {
+		h.fail(w, r, http.StatusBadRequest, "malformed_body", err.Error())
+		return
+	}
+
+	entry, err := h.service.Retract(r.Context(), conversationID, domain.AccountID(accountID),
+		sequence, request.ClientEntryID)
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	httpx.WriteJSON(w, h.logger, http.StatusCreated, newEntryResponse(entry))
+}
+
+func (h *Handler) react(w http.ResponseWriter, r *http.Request) {
+	h.reaction(w, r, h.service.React)
+}
+
+func (h *Handler) unreact(w http.ResponseWriter, r *http.Request) {
+	h.reaction(w, r, h.service.Unreact)
+}
+
+func (h *Handler) reaction(
+	w http.ResponseWriter,
+	r *http.Request,
+	apply func(context.Context, domain.ConversationID, domain.AccountID, domain.Sequence, string) error,
+) {
+	accountID, _ := h.caller(r.Context())
+	conversationID := domain.ConversationID(r.PathValue("conversationID"))
+
+	sequence, ok := h.pathSequence(r)
+	if !ok {
+		h.fail(w, r, http.StatusBadRequest, "invalid_sequence", "the target must be a position in the log")
+		return
+	}
+
+	var request reactRequest
+	if err := httpx.DecodeJSON(r, &request); err != nil {
+		h.fail(w, r, http.StatusBadRequest, "malformed_body", err.Error())
+		return
+	}
+
+	if err := apply(r.Context(), conversationID, domain.AccountID(accountID), sequence, request.Emoji); err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	// 204. A reaction has no position and no identity of its own to return, which is
+	// what MS-10 means by it not being in the log.
+	httpx.WriteJSON(w, h.logger, http.StatusNoContent, nil)
+}
+
+func (h *Handler) listReactions(w http.ResponseWriter, r *http.Request) {
+	accountID, _ := h.caller(r.Context())
+	conversationID := domain.ConversationID(r.PathValue("conversationID"))
+
+	from, _ := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
+	to, _ := strconv.ParseInt(r.URL.Query().Get("to"), 10, 64)
+	if from < int64(domain.FirstSequence) {
+		from = int64(domain.FirstSequence)
+	}
+	if to < from {
+		h.fail(w, r, http.StatusBadRequest, "invalid_range", "to must not be before from")
+		return
+	}
+
+	reactions, err := h.service.Reactions(r.Context(), conversationID, domain.AccountID(accountID),
+		domain.Sequence(from), domain.Sequence(to))
+	if err != nil {
+		h.writeDomainError(w, r, err)
+		return
+	}
+
+	responses := make([]reactionResponse, 0, len(reactions))
+	for _, reaction := range reactions {
+		responses = append(responses, reactionResponse{
+			Sequence:  int64(reaction.Sequence),
+			AccountID: string(reaction.AccountID),
+			Emoji:     string(reaction.Emoji),
+			CreatedAt: reaction.CreatedAt,
+		})
+	}
+
+	httpx.WriteJSON(w, h.logger, http.StatusOK, map[string]any{"reactions": responses})
 }
 
 // --- groups, channels and membership ---
@@ -612,6 +791,18 @@ func (h *Handler) writeDomainError(w http.ResponseWriter, r *http.Request, err e
 
 	case errors.Is(err, domain.ErrCannotRemoveSelf):
 		h.fail(w, r, http.StatusUnprocessableEntity, "cannot_remove_self", "leave the conversation instead")
+
+	case errors.Is(err, domain.ErrNotTheAuthor):
+		h.fail(w, r, http.StatusForbidden, "not_the_author", "only the author may change this entry")
+
+	case errors.Is(err, domain.ErrCannotAmendAnAmendment):
+		h.fail(w, r, http.StatusUnprocessableEntity, "amend_the_original", "edit the original entry, not an edit of it")
+
+	case errors.Is(err, domain.ErrEntryRetracted):
+		h.fail(w, r, http.StatusConflict, "entry_retracted", "this entry has been deleted")
+
+	case errors.Is(err, domain.ErrEntryNotFound):
+		h.fail(w, r, http.StatusNotFound, "entry_not_found", "no such entry")
 
 	case errors.Is(err, domain.ErrInviteNotFound):
 		h.fail(w, r, http.StatusNotFound, "invite_not_found", "no such invite")
