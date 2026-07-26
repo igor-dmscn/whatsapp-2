@@ -50,8 +50,8 @@ waitFor() {
   return 1
 }
 
-echo "building api"
-go build -o bin/ ./cmd/api
+echo "building api and worker"
+go build -o bin/ ./cmd/api ./cmd/worker
 
 echo "starting two api nodes"
 API_ADDR=:8080 ./bin/api >"$logs/api-8080.log" 2>&1 &
@@ -61,6 +61,13 @@ pids+=($!)
 
 waitFor http://localhost:8080/health
 waitFor http://localhost:8081/health
+
+# From phase 3 the badge and tick assertions need the relay and the projections
+# running. One worker is enough — it is the only thing that may run more than once
+# only with care, since the relay claims rows with FOR UPDATE to preserve ordering.
+echo "starting the worker"
+./bin/worker >"$logs/worker.log" 2>&1 &
+pids+=($!)
 
 echo "starting two dev servers"
 (cd web && API_URL=http://localhost:8080 npx vite --port 5173 --strictPort >"$logs/web-5173.log" 2>&1) &

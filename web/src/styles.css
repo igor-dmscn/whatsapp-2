@@ -210,10 +210,31 @@ aside {
 }
 
 .conversations button {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
   width: 100%;
   background: none;
   color: var(--text);
   text-align: left;
+}
+
+.conversations .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  min-width: 1.35rem;
+  margin-left: auto;
+  padding: 0 0.35rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
 }
 
 .conversations button.selected {
@@ -268,6 +289,19 @@ aside {
   color: var(--muted);
   font-family: ui-monospace, monospace;
   font-size: 0.7rem;
+}
+
+/* Delivery ticks. Read is the only one that gets a colour: the difference between
+   sent and delivered is rarely acted on, while "they have seen it" is the one people
+   look for, and three colours would make all three equally loud. */
+.ticks {
+  color: var(--muted);
+  font-size: 0.75rem;
+  letter-spacing: -0.15em;
+}
+
+.ticks-read {
+  color: #7fb2ff;
 }
 
 .composer {

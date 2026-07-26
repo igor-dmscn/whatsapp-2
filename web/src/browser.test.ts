@@ -278,3 +278,166 @@ async function expectTranscript(page: Page, expected: string[], wait = timeout):
       throw new Error(`expected ${JSON.stringify(expected)}, transcript held ${JSON.stringify(found)}: ${error}`)
     })
 }
+
+// Phase 3's frontend increment, verified the same way: real browsers, real Kafka,
+// real projections. These require the worker to be running — `make e2e` starts it.
+describe.skipIf(!live)('badges and ticks', () => {
+  let browser: Browser
+  let alice: Person
+  let bob: Person
+  // A third person so bob has two conversations. With only one, bob always has it
+  // open, the badge is suppressed by design, and a test asserting the badge renders
+  // would be asserting something that cannot happen.
+  let erin: Person
+  let conversation: string
+
+  beforeAll(async () => {
+    const { chromium } = await import('playwright-core')
+    browser = await chromium.launch({ headless: true, executablePath: chromiumPath() })
+
+    alice = await join_(browser, nodeAURL, `carol${unique}`)
+    bob = await join_(browser, nodeBURL, `dave${unique}`)
+    erin = await join_(browser, nodeAURL, `erin${unique}`)
+
+    conversation = await start(alice, bob.handle)
+    await start(erin, bob.handle)
+
+    // Bob now has two. He selects erin's, leaving alice's unselected and therefore
+    // able to show a badge.
+    await bob.page.waitForFunction(
+      () => document.querySelectorAll('.conversations button').length === 2,
+      undefined,
+      { timeout },
+    )
+  }, timeout * 3)
+
+  afterAll(async () => {
+    await browser?.close()
+  })
+
+  it('shows an unread badge to the recipient and none to the author', async () => {
+    await selectOther(bob.page, conversation)
+
+    await send(alice.page, 'first unread')
+    await send(alice.page, 'second unread')
+
+    // Eventually consistent: the badge appears once the projection catches up and the
+    // client's poll picks it up. Waiting is the assertion — a badge that never arrives
+    // fails here.
+    await bob.page.waitForFunction(
+      (id: string) => {
+        const button = document.querySelector(`[data-conversation="${id}"]`)
+        return button?.querySelector('.badge')?.textContent === '2'
+      },
+      conversation,
+      { timeout },
+    )
+
+    // Alice authored both, so she has nothing unread and shows no badge at all.
+    expect(await projectedUnread(alice.page, conversation)).toBe(0)
+    expect(await alice.page.locator('.conversations .badge').count()).toBe(0)
+  }, timeout * 2)
+
+  it('clears the badge when the conversation is opened', async () => {
+    // Opening it suppresses the badge immediately, and the acknowledgement that
+    // follows makes the projection agree. Both halves matter: the first is what makes
+    // the interface right during the window, the second is what makes it right after.
+    await bob.page.click(`[data-conversation="${conversation}"]`)
+
+    await bob.page.waitForFunction(
+      (id: string) => document.querySelector(`[data-conversation="${id}"] .badge`) === null,
+      conversation,
+      { timeout },
+    )
+
+    // And the server agrees once the receipt has been projected.
+    await bob.page.waitForFunction(
+      async (id: string) => {
+        const session = JSON.parse(sessionStorage.getItem('comms.session')!)
+        const { conversations } = await fetch('/v1/conversations', {
+          headers: { Authorization: `Bearer ${session.access_token}` },
+        }).then((response) => response.json())
+        return conversations.find((each: { id: string }) => each.id === id)?.unread === 0
+      },
+      conversation,
+      { timeout },
+    )
+  }, timeout * 2)
+
+  it('progresses ticks from sent to read as the recipient catches up', async () => {
+    // Alice's own entries carry ticks. Bob has the conversation open and his tab is
+    // visible, so his client acknowledges delivery and reading on its own — that
+    // behaviour is what is under test, not something this test performs.
+    await alice.page.waitForFunction(
+      () => {
+        const ticks = [...document.querySelectorAll('.transcript li.mine .ticks')]
+        return ticks.length >= 2 && ticks.every((tick) => tick.classList.contains('ticks-read'))
+      },
+      undefined,
+      { timeout },
+    )
+
+    const states = await alice.page.evaluate(() =>
+      [...document.querySelectorAll('.transcript li.mine .ticks')].map((tick) =>
+        tick.getAttribute('aria-label'),
+      ),
+    )
+    expect(states.length).toBeGreaterThanOrEqual(2)
+    expect(states.every((state) => state === 'read')).toBe(true)
+  }, timeout * 2)
+
+  it('shows a tick on an entry the moment it is sent', async () => {
+    // NF-7 from the other side: an entry exists before any projection describes it,
+    // and "sent" is a true statement about it in the meantime. Showing nothing until
+    // a receipt lands would make every message look like it had failed.
+    await erin.page.click('.conversations button')
+    await send(erin.page, 'just sent')
+
+    const state = await erin.page
+      .locator('.transcript li.mine .ticks')
+      .last()
+      .getAttribute('aria-label')
+    expect(state).not.toBeNull()
+    expect(['sent', 'delivered', 'read']).toContain(state)
+  }, timeout * 2)
+})
+
+/** start opens a direct conversation by handle and returns its identifier.
+ *
+ *  Read off the selected button rather than from the API: starting a conversation
+ *  selects it, so the UI already knows which one it is, and asking the server means
+ *  guessing which of several is the new one. */
+async function start(person: Person, handle: string): Promise<string> {
+  await person.page.getByLabel('Handle to message').fill(handle)
+  await person.page.getByRole('button', { name: 'Start' }).click()
+  await person.page.waitForSelector('.composer input', { timeout })
+  await person.page.waitForSelector('.conversations button.selected', { timeout })
+
+  const id = await person.page
+    .locator('.conversations button.selected')
+    .getAttribute('data-conversation')
+  if (!id) throw new Error(`${person.handle}: no conversation was selected after starting one`)
+  return id
+}
+
+/** selectOther clicks whichever conversation is not the one given. */
+async function selectOther(page: Page, conversationID: string): Promise<void> {
+  const others = page.locator(`.conversations button:not([data-conversation="${conversationID}"])`)
+  await others.first().click()
+}
+
+/** projectedUnread reads the server's count, bypassing the UI's local suppression. */
+async function projectedUnread(page: Page, conversationID: string): Promise<number> {
+  return page.evaluate(async (id: string) => {
+    const session = JSON.parse(sessionStorage.getItem('comms.session')!)
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const { conversations } = await fetch('/v1/conversations', {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      }).then((response) => response.json())
+      const found = conversations.find((each: { id: string }) => each.id === id)
+      if (found && found.unread > 0) return found.unread as number
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    return 0
+  }, conversationID)
+}

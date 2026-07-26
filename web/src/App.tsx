@@ -1,16 +1,20 @@
-// Phase 2's frontend increment: log in, hold one conversation, send and receive.
+// The browser client through phase 3: log in, hold conversations, send and receive,
+// with unread badges and delivery ticks.
 //
-// State is in memory. A reload loses the messages and refetches them, which is the
-// honest behaviour for this phase — the local store arrives in phase 6, and
-// pretending to have it now would mean writing a cache this phase cannot verify.
+// Message state is in memory. A reload refetches, which is honest for now — the local
+// store arrives in phase 6.
 //
-// The conversation list, unread badges and delivery ticks are phase 3, because they
-// depend on projections that do not exist yet.
+// This is the first UI that has to tolerate eventual consistency. Badges and ticks
+// come from projections built asynchronously from the log (ADR-0002), so an entry is
+// on screen before its badge moves and the interface must be right during that window
+// rather than waiting for it to close (NF-7). Two places that shows up: the open
+// conversation's badge is suppressed locally rather than waiting for the projection to
+// clear it, and a just-sent entry renders as sent rather than as nothing at all.
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 
-import { ApiError, Client, decodeBody, login, register, SessionExpired } from './api'
-import type { Conversation, Entry, Session } from './api'
+import { ApiError, Client, decodeBody, deliveryOf, login, register, SessionExpired } from './api'
+import type { Conversation, DeliveryState, Entry, Session } from './api'
 import { Sync } from './sync'
 
 // sessionStorage, not localStorage, and the difference matters here: sessionStorage
@@ -213,6 +217,42 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
     void load()
   }, [load])
 
+  // Projections are polled, not pushed. There is no event telling a client that
+  // somebody else's read mark moved, and inventing one would mean a second delivery
+  // path with its own ordering and loss questions, for information that is
+  // decorative. Three seconds is well inside NF-7's convergence window.
+  //
+  // ponytail: fixed interval, running whether the tab is visible or not. Pushing
+  // receipts over the existing socket is phase 10's work, alongside presence.
+  useEffect(() => {
+    const timer = setInterval(() => void load(), 3000)
+    return () => clearInterval(timer)
+  }, [load])
+
+  // Acknowledge what is on screen. Delivered always — the entries are on this device
+  // either way. Read only while the tab is visible, because telling someone their
+  // message was read when it was rendered into a background tab is exactly the lie a
+  // read receipt exists not to tell.
+  const acknowledged = useRef(new Map<string, number>())
+  useEffect(() => {
+    if (!selected) return
+    const held = snapshot.conversations.get(selected) ?? []
+    const highest = held.at(-1)?.sequence ?? 0
+    if (highest === 0 || (acknowledged.current.get(selected) ?? 0) >= highest) return
+
+    acknowledged.current.set(selected, highest)
+    const readThrough = document.visibilityState === 'visible' ? highest : 0
+    client
+      .acknowledge(selected, highest, readThrough)
+      .then(() => void load())
+      .catch((failure) => {
+        // Forgotten so the next change tries again. A lost receipt is not worth
+        // failing anything over, but it is worth retrying.
+        acknowledged.current.delete(selected)
+        if (failure instanceof SessionExpired) onSignOut()
+      })
+  }, [selected, snapshot, client, load, onSignOut])
+
   // A conversation started while already connected arrives as an entry for a
   // conversation this list has never heard of — the socket carries entries, not
   // memberships. Asked once per identifier, so a list that comes back without it
@@ -280,10 +320,20 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
               <li key={conversation.id}>
                 <button
                   type="button"
+                  data-conversation={conversation.id}
                   className={conversation.id === selected ? 'selected' : ''}
                   onClick={() => setSelected(conversation.id)}
                 >
-                  {label(conversation, handles, client.accountID)}
+                  <span className="name">{label(conversation, handles, client.accountID)}</span>
+                  {/* Suppressed for the open conversation rather than waited on. The
+                      projection clears it within a second or two, and showing "3
+                      unread" against the conversation being read is the wrong answer
+                      even while it is the freshly projected one. */}
+                  {conversation.unread > 0 && conversation.id !== selected && (
+                    <span className="badge" aria-label={`${conversation.unread} unread`}>
+                      {conversation.unread}
+                    </span>
+                  )}
                 </button>
               </li>
             ))}
@@ -294,7 +344,12 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
         <section className="conversation">
           {selected ? (
             <>
-              <Transcript entries={entries} me={client.accountID} handles={handles} />
+              <Transcript
+                entries={entries}
+                me={client.accountID}
+                handles={handles}
+                conversation={conversations.find((each) => each.id === selected)}
+              />
               <Composer
                 onSend={async (text, clientEntryID) => {
                   const entry = await client.send(selected, clientEntryID, text)
@@ -350,10 +405,12 @@ function Transcript({
   entries,
   me,
   handles,
+  conversation,
 }: {
   entries: Entry[]
   me: string
   handles: Record<string, string>
+  conversation: Conversation | undefined
 }) {
   return (
     <ol className="transcript">
@@ -367,9 +424,26 @@ function Transcript({
               turns on, and seeing a hole appear and close is the fastest way to
               tell gap filling from a rendering bug. */}
           <span className="sequence">#{entry.sequence}</span>
+          {entry.author_id === me && conversation && (
+            <Ticks state={deliveryOf(entry.sequence, conversation)} />
+          )}
         </li>
       ))}
     </ol>
+  )
+}
+
+/** Ticks shows MS-13's three states.
+ *
+ *  A just-sent entry shows one tick immediately, derived from marks that have not
+ *  moved yet, rather than showing nothing until a projection lands. "Sent" is a true
+ *  statement about an entry the server has already assigned a position to — the
+ *  uncertainty is only about what happened to it afterwards. */
+function Ticks({ state }: { state: DeliveryState }) {
+  return (
+    <span className={`ticks ticks-${state}`} title={state} aria-label={state}>
+      {state === 'sent' ? '✓' : '✓✓'}
+    </span>
   )
 }
 

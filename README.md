@@ -2,7 +2,7 @@
 
 Real-time messaging, media sharing, and live audio/video calling. A Go backend with React and CLI clients, built as a reference implementation — the codebase is meant to be read, so the reasoning is committed alongside the code.
 
-**Status: phases 0–2 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, and a browser client that signs in and holds a conversation. Phase 3 is next. See [the plan](./docs/plan.md).
+**Status: phases 0–3 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, the transactional outbox with Kafka and projections, and a browser client with unread badges and delivery ticks. Phase 4 is next. See [the plan](./docs/plan.md).
 
 ## Running it
 
@@ -63,7 +63,8 @@ Contexts are packages inside `api`. Each exposes exactly one package and hides i
 These surprise people, so they are stated here rather than left to be discovered:
 
 - **Messages are not end-to-end encrypted, but the server never reads text payloads anyway.** Consequently there is no server-side search — search is local to each client. Media *is* read server-side, deliberately. ([ADR-0001](./docs/adr/0001-content-opaque-server-e2ee-deferred.md))
-- **Postgres is the system of record; Kafka is not the log.** Kafka carries consequences — projections, receipts, notifications, media work. ([ADR-0003](./docs/adr/0003-postgres-is-truth-kafka-carries-events.md))
+- **Postgres is the system of record; Kafka is not the log.** Kafka carries consequences — projections, receipts, notifications, media work. Events are written to an outbox row in the same transaction as the change they describe, because publishing to a broker from a use case cannot be made atomic. ([ADR-0003](./docs/adr/0003-postgres-is-truth-kafka-carries-events.md))
+- **The forward-only read cursor is enforced by the read model, not the aggregate.** Taking the greater of what is held and what arrives makes a stale, repeated or out-of-order advance all reach the same state — so MS-12 and idempotent redelivery are one mechanism. ([architecture](./docs/architecture.md#projections))
 - **Kafka and Redis are both present on purpose.** Redis Pub/Sub delivers to sockets and is allowed to drop messages; clients recover by detecting gaps in sequence numbers. ([ADR-0005](./docs/adr/0005-redis-pubsub-for-socket-fanout.md))
 - **Nothing in the log is ever modified.** Edits and deletes append revisions, because clients sync strictly forward and an in-place edit would be invisible to any client that had already passed it. ([ADR-0008](./docs/adr/0008-mutations-are-log-entries.md))
 - **CQRS applies to Messaging only, and without event sourcing.** Elsewhere it would be ceremony.

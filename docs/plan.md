@@ -74,7 +74,7 @@ That is what this phase's frontend increment was for. Neither bug was reachable 
 
 ---
 
-## Phase 3 — Outbox, Kafka, projections
+## Phase 3 — Outbox, Kafka, projections — **complete**
 
 **Goal:** unread counts and receipts exist, and are correct despite being eventually consistent.
 
@@ -88,6 +88,13 @@ That is what this phase's frontend increment was for. Neither bug was reachable 
 **Frontend increment:** conversation list with unread badges, and delivery ticks on sent messages. This is the first UI that must tolerate eventual consistency — an entry can be on screen before its projection lands (NF-7).
 
 **Verify:** unread counts converge within 2 seconds under load. Replay the same Kafka messages and assert badges and receipts are unchanged — this is the idempotency test and it must be explicit. Stop the relay, send ten entries, restart it: all ten events publish, none twice. Read on one device clears the badge on another.
+
+**Verified.** All four, plus the transport: measured convergence was 250 ms end to end through real Kafka against the 2-second budget. Replaying every event twice leaves every badge unchanged, and removing the `projected_sequence` guard takes an unread count from 2 to 6 — so the assertion is load-bearing rather than decorative. `make e2e` covers the badges and ticks in two real browsers.
+
+Two findings, both from running it rather than reasoning about it:
+
+- **One undecodable record wedged every projection in the system, permanently.** At-least-once plus a deterministic failure is an infinite retry, and everything behind it on the partition waits forever. The projector now distinguishes a transient failure, which must be retried, from a record that can never be applied, which is logged and skipped. The bug arrived via a test publishing transport-shaped records onto a production topic — so the tests gained their own topics too.
+- **MS-12's forward-only cursor belongs in the projection, not the aggregate.** The aggregate does not hold the cursor and cannot enforce order over it; reading the projection to validate against it would be a race dressed as a check. `GREATEST` makes a stale, duplicated or out-of-order advance all reach the same state — so the forward-only rule and idempotent redelivery are one mechanism rather than two.
 
 ---
 

@@ -26,6 +26,33 @@ export type Conversation = {
   role: string
   visible_from: number
   created_at: string
+
+  // Projected fields, and every one of them is eventually consistent (ADR-0002).
+  // An entry can be on screen before these move, and the UI has to be right during
+  // that window rather than waiting for it to close (NF-7).
+  unread: number
+  read_through: number
+  delivered_through: number
+  // The lowest marks among the other members: what everyone else has received and
+  // read. A client derives each of its own entries' delivery state by comparing the
+  // entry's sequence against these, rather than the server keeping a state per entry
+  // per recipient (MS-13).
+  others_read_through: number
+  others_delivered_through: number
+}
+
+/** DeliveryState is what a sender can observe about one of their own entries. */
+export type DeliveryState = 'sent' | 'delivered' | 'read'
+
+/** deliveryOf derives an entry's state from the conversation's marks.
+ *
+ *  The same three-way comparison the server would do, done here because the marks
+ *  answer the question for every entry at once and shipping them per entry would be
+ *  the fan-out this design exists to avoid. */
+export function deliveryOf(sequence: number, conversation: Conversation): DeliveryState {
+  if (sequence <= conversation.others_read_through) return 'read'
+  if (sequence <= conversation.others_delivered_through) return 'delivered'
+  return 'sent'
 }
 
 export type Entry = {
@@ -203,6 +230,21 @@ export class Client {
       `/v1/conversations/${conversationID}/entries?after=${after}`,
     )
     return body.entries
+  }
+
+  /**
+   * acknowledge reports how far this account has received and read a conversation.
+   *
+   * Both marks in one call because a client that has just rendered messages knows
+   * both answers at once. Neither is stored synchronously — the server answers 202
+   * and the projection catches up, so nothing here should be read back expecting to
+   * see its own effect immediately.
+   */
+  async acknowledge(conversationID: string, deliveredThrough: number, readThrough: number): Promise<void> {
+    await this.authorized<void>(`/v1/conversations/${conversationID}/receipt`, {
+      method: 'POST',
+      body: JSON.stringify({ delivered_through: deliveredThrough, read_through: readThrough }),
+    })
   }
 
   /**

@@ -34,7 +34,8 @@ graph TB
 
     API -->|"read + write"| PG
     API -->|"publish + subscribe"| REDIS
-    API -->|"outbox relay"| KAFKA
+    API -->|"outbox rows"| PG
+    WORKER -->|"outbox relay"| KAFKA
     KAFKA --> WORKER
     WORKER -->|"projections"| PG
     WORKER -->|"variants"| BLOB
@@ -125,6 +126,64 @@ This is **CQRS without event sourcing**. Entries are real rows and the log is qu
 | `messaging.entries` | conversation id | entry appended, entry revised |
 | `messaging.receipts` | conversation id | delivered, read |
 | `media.attachments` | attachment id | upload accepted, variants ready, processing failed |
-| `identity.accounts` | account id | account registered, credential added, device registered, device revoked, session started, session rotated (from phase 3 — until then these events are recorded by aggregates and written to the log) |
+| `identity.events` | device id, or account id where there is no device | account registered, credential added, device registered, device revoked, session started, session rotated |
 
 Keying entry and receipt topics by conversation gives per-conversation ordering, which is the only ordering that means anything — sequence numbers are meaningless across conversations.
+
+Identity's topic is keyed by **subject** rather than uniformly by account: the device where an event has one, the account otherwise. Session does not model an account — it belongs to a device — and adding one to the aggregate to satisfy a partitioning scheme would let the transport dictate the model. The ordering that results is per-device, which is what Messaging relies on when it disconnects a revoked device. Account-level events are not ordered against device-level ones, and nothing needs them to be.
+
+Receipts have their own topic rather than sharing `messaging.entries`. Someone scrolling a year of history produces a burst of cursor advances; behind entries on one topic, that burst would delay the projection of new messages — the badge that matters most held up by the badges being cleared.
+
+## The outbox
+
+Publishing to Kafka from a use case cannot be made correct. The state change and the publish are two commits against two systems, and whichever order they are attempted in, a crash between them either loses the event or announces something that did not happen.
+
+So an event is written to an `outbox` row **in the same transaction** as the change it describes, and a relay publishes it afterwards:
+
+```mermaid
+sequenceDiagram
+    participant U as Use case
+    participant PG as Postgres
+    participant R as Relay (worker)
+    participant K as Kafka
+    participant P as Projector (worker)
+
+    U->>PG: BEGIN
+    U->>PG: insert entry, advance head
+    U->>PG: insert outbox row
+    U->>PG: COMMIT
+    Note over U,PG: Atomic. There is no state<br/>without its event.
+
+    loop every 200ms, or straight round on a backlog
+        R->>PG: SELECT unpublished FOR UPDATE
+        R->>K: publish, wait for all in-sync replicas
+        R->>PG: mark published, COMMIT
+    end
+
+    K->>P: deliver
+    P->>PG: apply to read models, commit offsets
+```
+
+What that buys and what it costs:
+
+- **At-least-once, never at-most-once.** A crash between the publish and the mark republishes the row. Exactly-once is not available — it is the same two-systems problem one layer up — so consumers are idempotent (NF-8) rather than the pipeline being exact.
+- **Ordered per key.** The relay claims rows with `FOR UPDATE`, not `SKIP LOCKED`. Skipping locked rows would let a second relay publish row 20 while the first still holds 19, reordering two events for one conversation. One relay at a time is the price of ordering, and it is recorded as a known ceiling in the code.
+- **Kafka being down costs delay, not data.** Rows accumulate and drain on recovery (NF-6).
+- **Writing an event outside a transaction is refused**, not reviewed for. It compiles and runs and silently reintroduces exactly the split-brain the outbox exists to prevent.
+
+## Projections
+
+`conversation_member_state` holds one row per membership: read mark, delivery mark, unread count. Every write to it is idempotent by construction rather than by a deduplication table — which is what makes replaying the whole topic a safe operation rather than a dangerous one.
+
+| What moves it | How it stays idempotent |
+|---|---|
+| `entry_appended` increments unread for everyone but the author | a `projected_sequence` guard in the same statement; a redelivered entry has a sequence the row has already counted |
+| `cursor_advanced` moves the read mark | `GREATEST`, so a stale or duplicated advance changes nothing — this *is* MS-12's forward-only rule |
+| `entries_delivered` moves the delivery mark | `GREATEST`, same reason |
+| a cursor advance recomputes the unread count | recomputed from the log rather than decremented, so the answer is exact and does not accumulate error |
+
+MS-12 living in the projection rather than in the aggregate is worth stating plainly: the aggregate cannot enforce forward-only because it does not hold the cursor, and reading the projection to validate a write against it would be a race dressed up as a check. Taking the greater of the two makes ordering irrelevant — so the forward-only rule and idempotent redelivery turn out to be one mechanism, not two.
+
+Delivery state (MS-13) is derived from two integers per membership, not stored per entry per recipient. A row per entry per recipient would be the fan-out-on-write ADR-0002 rejected, wearing a different hat.
+
+A record that can never be applied — no identifiers, an undecodable payload — is logged and skipped rather than retried. At-least-once plus a deterministic failure is an infinite retry, and one bad record would otherwise stop every projection behind it on that partition, indefinitely. A transient failure, such as Postgres being unreachable, is still returned and retried. That distinction was found by running the worker, not by reasoning about it.

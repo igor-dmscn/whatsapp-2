@@ -69,3 +69,11 @@ _Avoid_: ack, tick, read state
 **Delivery State**:
 How far a message has got for one membership: *Sent* once it is durably in the log, *Delivered* once any of that account's devices acknowledged it, *Read* once the cursor passed it.
 _Avoid_: status, ticks, ack level
+
+**Mark**:
+A high-water mark: the position through which something is true. A read mark and a delivery mark per membership, each moving forward only. Two of them answer the delivery-state question for every entry in a conversation, which is why no state is stored per entry.
+_Avoid_: pointer, offset (offset is Kafka's word and means something else here)
+
+**Member State**:
+The projection holding a membership's marks and unread count. Eventually consistent by design — a read model built from the log, never written by the request that causes it (ADR-0002).
+_Avoid_: read state, membership state, counters
