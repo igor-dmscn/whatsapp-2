@@ -24,8 +24,11 @@ const (
 )
 
 // notContexts are directories under internal/ that are not bounded contexts.
-// platform is shared plumbing; arch is this test.
-var notContexts = map[string]bool{"platform": true, "arch": true}
+//
+// platform is shared plumbing; arch is this test; client is the Go client library the
+// CLI and the phase-8 harness share, which talks to the API over HTTP and therefore
+// depends on no context at all — the same position any third party would be in.
+var notContexts = map[string]bool{"platform": true, "arch": true, "client": true}
 
 // modelDirectory is where a context keeps its model, relative to the context root.
 //
