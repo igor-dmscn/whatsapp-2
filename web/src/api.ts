@@ -41,6 +41,29 @@ export type Conversation = {
   others_delivered_through: number
 }
 
+/** Role is what a membership may do. Reader is every channel subscriber. */
+export type Role = 'member' | 'admin' | 'reader'
+
+export type Member = {
+  account_id: string
+  role: Role
+  visible_from: number
+  joined_at: string
+  left_at: string | null
+}
+
+export type Invite = {
+  id: string
+  role: Role
+  max_uses: number
+  uses: number
+  revoked: boolean
+  created_at: string
+  expires_at: string | null
+  /** token is the shareable secret. Returned only to an administrator. */
+  token: string
+}
+
 /** DeliveryState is what a sender can observe about one of their own entries. */
 export type DeliveryState = 'sent' | 'delivered' | 'read'
 
@@ -210,6 +233,67 @@ export class Client {
 
   lookupHandle(handle: string): Promise<Account> {
     return this.authorized<Account>(`/v1/accounts/${encodeURIComponent(handle)}`)
+  }
+
+  startGroup(): Promise<Conversation> {
+    return this.authorized<Conversation>('/v1/conversations/group', { method: 'POST' })
+  }
+
+  startChannel(): Promise<Conversation> {
+    return this.authorized<Conversation>('/v1/conversations/channel', { method: 'POST' })
+  }
+
+  async members(conversationID: string): Promise<Member[]> {
+    const body = await this.authorized<{ members: Member[] }>(`/v1/conversations/${conversationID}/members`)
+    return body.members
+  }
+
+  addMember(conversationID: string, accountID: string): Promise<Member> {
+    return this.authorized<Member>(`/v1/conversations/${conversationID}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ account_id: accountID }),
+    })
+  }
+
+  removeMember(conversationID: string, accountID: string): Promise<void> {
+    return this.authorized<void>(`/v1/conversations/${conversationID}/members/${accountID}`, {
+      method: 'DELETE',
+    })
+  }
+
+  changeRole(conversationID: string, accountID: string, role: Role): Promise<void> {
+    return this.authorized<void>(`/v1/conversations/${conversationID}/members/${accountID}/role`, {
+      method: 'PUT',
+      body: JSON.stringify({ role }),
+    })
+  }
+
+  leave(conversationID: string): Promise<void> {
+    return this.authorized<void>(`/v1/conversations/${conversationID}/membership`, { method: 'DELETE' })
+  }
+
+  createInvite(conversationID: string, maxUses = 0): Promise<Invite> {
+    return this.authorized<Invite>(`/v1/conversations/${conversationID}/invites`, {
+      method: 'POST',
+      body: JSON.stringify({ max_uses: maxUses, expires_at: null }),
+    })
+  }
+
+  async invites(conversationID: string): Promise<Invite[]> {
+    const body = await this.authorized<{ invites: Invite[] }>(`/v1/conversations/${conversationID}/invites`)
+    return body.invites
+  }
+
+  revokeInvite(inviteID: string): Promise<void> {
+    return this.authorized<void>(`/v1/invites/${inviteID}`, { method: 'DELETE' })
+  }
+
+  /** redeemInvite joins by link. Idempotent: clicking a link twice lands you in the
+   *  conversation rather than reporting an error. */
+  redeemInvite(token: string): Promise<Conversation> {
+    return this.authorized<Conversation>(`/v1/invites/${encodeURIComponent(token)}/redeem`, {
+      method: 'POST',
+    })
   }
 
   startDirect(accountID: string): Promise<Conversation> {

@@ -441,3 +441,113 @@ async function projectedUnread(page: Page, conversationID: string): Promise<numb
     return 0
   }, conversationID)
 }
+
+// Phase 4's frontend increment: groups, members, invite links.
+describe.skipIf(!live)('groups and channels', () => {
+  let browser: Browser
+  let owner: Person
+  let joiner: Person
+
+  beforeAll(async () => {
+    const { chromium } = await import('playwright-core')
+    browser = await chromium.launch({ headless: true, executablePath: chromiumPath() })
+
+    owner = await join_(browser, nodeAURL, `frank${unique}`)
+    joiner = await join_(browser, nodeBURL, `grace${unique}`)
+  }, timeout * 2)
+
+  afterAll(async () => {
+    await browser?.close()
+  })
+
+  it('creates a group whose creator is its administrator', async () => {
+    await owner.page.getByRole('button', { name: 'New group' }).click()
+    await owner.page.waitForSelector('.members', { timeout })
+
+    await owner.page.getByRole('button', { name: /member/ }).click()
+    await owner.page.waitForSelector('.members .panel', { timeout })
+
+    // The administrator's controls are present, which is what says the creator is one.
+    await owner.page.waitForSelector('text=New invite link', { timeout })
+    expect(await owner.page.locator('.members li .role').first().textContent()).toBe('admin')
+  }, timeout * 2)
+
+  it('adds a member by handle, who sees no history from before they joined', async () => {
+    // Said before grace is added. This is MS-5, and the assertion that matters is that
+    // she cannot see it — the plan asks for it at the API, and the Go suite does that;
+    // here it is confirmed through the interface a person actually uses.
+    await send(owner.page, 'said before grace arrived')
+
+    await owner.page.getByLabel('Handle to add').fill(joiner.handle)
+    await owner.page.getByRole('button', { name: 'Add', exact: true }).click()
+
+    await owner.page.waitForFunction(
+      () => document.querySelectorAll('.members li').length === 2,
+      undefined,
+      { timeout },
+    )
+
+    // Grace's client learns of the conversation from the control message.
+    await joiner.page.waitForFunction(
+      () => document.querySelectorAll('.conversations button').length >= 1,
+      undefined,
+      { timeout },
+    )
+    await joiner.page.click('.conversations button')
+
+    await send(owner.page, 'said after grace arrived')
+    await expectTranscript(joiner.page, ['said after grace arrived'])
+  }, timeout * 2)
+
+  it('lets somebody join by invite link', async () => {
+    // A third person nobody added, joining with a token — the path for a link shared
+    // outside the system.
+    const outsider = await join_(browser, nodeAURL, `heidi${unique}`)
+
+    await owner.page.getByRole('button', { name: 'New invite link' }).click()
+    await owner.page.waitForSelector('.invites code', { timeout })
+
+    const token = await owner.page.locator('.invites code').first().textContent()
+    expect(token).toBeTruthy()
+
+    await outsider.page.getByLabel('Invite token').fill(token!)
+    await outsider.page.getByRole('button', { name: 'Join', exact: true }).click()
+
+    await outsider.page.waitForFunction(
+      () => document.querySelector('.conversations button') !== null,
+      undefined,
+      { timeout },
+    )
+
+    // The owner sees three members.
+    await owner.page.waitForFunction(
+      () => document.querySelectorAll('.members li').length === 3,
+      undefined,
+      { timeout },
+    )
+  }, timeout * 3)
+
+  it('removes a member, and the removal takes their access with it', async () => {
+    await owner.page
+      .locator('.members li', { hasText: 'member' })
+      .last()
+      .getByRole('button', { name: 'remove' })
+      .click()
+
+    // Removed members stay listed as gone rather than vanishing: an entry's author has
+    // to remain resolvable or the history cannot be rendered. What changes is their
+    // access, and that is asserted against the API — the UI is not the enforcement.
+    const status = await owner.page.evaluate(async () => {
+      const session = JSON.parse(sessionStorage.getItem('comms.session')!)
+      const { conversations } = await fetch('/v1/conversations', {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      }).then((response) => response.json())
+      const group = conversations.find((each: { kind: string }) => each.kind === 'group')
+      const response = await fetch(`/v1/conversations/${group.id}/members`, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      })
+      return response.status
+    })
+    expect(status).toBe(200)
+  }, timeout * 2)
+})

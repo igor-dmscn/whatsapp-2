@@ -98,7 +98,7 @@ Two findings, both from running it rather than reasoning about it:
 
 ---
 
-## Phase 4 — Groups and channels
+## Phase 4 — Groups and channels — **complete**
 
 **Goal:** the other two conversation kinds, with their membership rules.
 
@@ -111,6 +111,15 @@ Two findings, both from running it rather than reasoning about it:
 **Frontend increment:** create a group, view and manage members, join a channel.
 
 **Verify:** a member added to a group with existing history cannot read anything before their join point, asserted at the API, not just hidden in the UI. A new channel member reads from sequence 1. A non-writer posting to a channel is rejected. Adding a 257th group member is rejected. Fan-out write count is measured and shown to be constant regardless of member count (NF-12).
+
+**Verified.** All five. NF-12 measured at **2 rows per send** — the entry and its outbox row — with 2 members and with 64. The test states plainly what that does *not* claim: the projection is per member by design and off the request path, which is the distinction ADR-0002 actually drew.
+
+The context gained its one domain service here, as [ADR-0010](./adr/0010-ddd-conventions.md) predicted, though as a package function rather than a type. Whether an actor may change who belongs depends on the conversation's kind *and* the actor's role; Conversation and Membership are separate roots that cannot see each other, so on either one it would be the same rule written twice.
+
+Two authorisation bugs, both found by tests rather than review:
+
+- **A removed member could still read the conversation.** Three read paths asked whether a membership row existed, which stays true of somebody removed. Replaced with one guard every read routes through, so the fourth read path cannot forget.
+- **A reader posting to a channel got 422 rather than 403**, because their payload was validated before their permission was checked. Authorisation now precedes content — which also stops the server doing work on a payload it is going to reject, and matters more once phase 7 makes payloads large.
 
 ---
 

@@ -74,6 +74,14 @@ _Avoid_: status, ticks, ack level
 A high-water mark: the position through which something is true. A read mark and a delivery mark per membership, each moving forward only. Two of them answer the delivery-state question for every entry in a conversation, which is why no state is stored per entry.
 _Avoid_: pointer, offset (offset is Kafka's word and means something else here)
 
+**Invite**:
+A shareable, revocable permission to join a conversation at a fixed role. Counts its uses rather than being consumed by the first, so a link shared with many people is the ordinary case and single-use is a limit of one.
+_Avoid_: link, join code, token (the token is the secret *inside* an invite, not the invite)
+
+**Join Point**:
+The position a membership's visibility starts from — the whole of the history policy in one number. Groups join at the head, channels at the first entry.
+_Avoid_: visibility start, since, from-sequence
+
 **Member State**:
 The projection holding a membership's marks and unread count. Eventually consistent by design — a read model built from the log, never written by the request that causes it (ADR-0002).
 _Avoid_: read state, membership state, counters

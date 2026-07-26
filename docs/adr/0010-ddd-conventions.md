@@ -40,9 +40,14 @@ An entity belongs inside an aggregate when it has no meaning or lifetime apart f
 
 A domain service is for an operation that is part of the model but belongs to no single aggregate. It is not a home for logic that was awkward to place.
 
-Warranted so far: `Hasher` — producing credential material is what a password credential *is*, but it cannot be expressed without a cryptographic library, so the domain declares the operation and infrastructure supplies it.
+Warranted so far:
 
-Coming: "may this account write to this conversation" spans Conversation and Membership and belongs to neither (phase 4); bandwidth-to-layer selection is pure policy no aggregate owns (phase 9).
+- `Hasher` — producing credential material is what a password credential *is*, but it cannot be expressed without a cryptographic library, so the domain declares the operation and infrastructure supplies it.
+- `AuthoriseMembershipChange` — whether an actor may change who belongs depends on the conversation's kind *and* the actor's role. Conversation and Membership are separate roots that cannot see each other, so on either one the rule would be written twice with two chances to disagree.
+
+Coming: bandwidth-to-layer selection is pure policy no aggregate owns (phase 9).
+
+**A domain service is a function unless it needs state.** `AuthoriseMembershipChange` was expected to be a type and landed as a package-level function: Go's packages already namespace it, `domain.AuthoriseMembershipChange` reads no worse than a method, and a struct with one method and nothing to construct is ceremony. A service becomes a type when it has a dependency to inject, which is what `Hasher` has and this does not.
 
 Not warranted: anything that would be a struct wrapping one method over one aggregate. That is the aggregate's own behaviour, misplaced.
 

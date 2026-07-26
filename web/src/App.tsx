@@ -14,7 +14,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 
 import { ApiError, Client, decodeBody, deliveryOf, login, register, SessionExpired } from './api'
-import type { Conversation, DeliveryState, Entry, Session } from './api'
+import type { Conversation, DeliveryState, Entry, Invite, Member, Role, Session } from './api'
 import { Sync } from './sync'
 
 // sessionStorage, not localStorage, and the difference matters here: sessionStorage
@@ -292,6 +292,7 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
   )
 
   const entries = selected ? (snapshot.conversations.get(selected) ?? []) : []
+  const current = conversations.find((each) => each.id === selected)
 
   return (
     <div className="workspace">
@@ -315,6 +316,27 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
       <div className="panes">
         <aside>
           <StartDirect onStart={startDirect} />
+          <NewConversation
+            onGroup={async () => {
+              const conversation = await client.startGroup()
+              await load()
+              setSelected(conversation.id)
+              sync.follow(conversation.id)
+            }}
+            onChannel={async () => {
+              const conversation = await client.startChannel()
+              await load()
+              setSelected(conversation.id)
+              sync.follow(conversation.id)
+            }}
+            onJoin={async (token) => {
+              const conversation = await client.redeemInvite(token)
+              await load()
+              setSelected(conversation.id)
+              sync.follow(conversation.id)
+            }}
+            onError={setError}
+          />
           <ul className="conversations">
             {conversations.map((conversation) => (
               <li key={conversation.id}>
@@ -344,11 +366,19 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
         <section className="conversation">
           {selected ? (
             <>
+              {current && current.kind !== 'direct' && (
+                <Members
+                  client={client}
+                  conversation={current}
+                  onChanged={load}
+                  onError={setError}
+                />
+              )}
               <Transcript
                 entries={entries}
                 me={client.accountID}
                 handles={handles}
-                conversation={conversations.find((each) => each.id === selected)}
+                conversation={current}
               />
               <Composer
                 onSend={async (text, clientEntryID) => {
@@ -370,10 +400,239 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
 /** label names a conversation by the counterpart's handle when it is known, and by
  *  its identifier when it is not. Phase 3 replaces this with a real list. */
 function label(conversation: Conversation, handles: Record<string, string>, me: string): string {
+  // A group or channel has no single counterpart to name it after, so it is named by
+  // what it is. Real titles are a field somebody sets, which this system has not been
+  // asked for.
+  if (conversation.kind !== 'direct') {
+    return `${conversation.kind} ${conversation.id.slice(0, 8)}`
+  }
   for (const [accountID, handle] of Object.entries(handles)) {
     if (accountID !== me) return handle
   }
-  return `${conversation.kind} ${conversation.id.slice(0, 8)}`
+  return `direct ${conversation.id.slice(0, 8)}`
+}
+
+/** NewConversation creates groups and channels, and joins by invite link. */
+function NewConversation({
+  onGroup,
+  onChannel,
+  onJoin,
+  onError,
+}: {
+  onGroup: () => Promise<void>
+  onChannel: () => Promise<void>
+  onJoin: (token: string) => Promise<void>
+  onError: (message: string) => void
+}) {
+  const [token, setToken] = useState('')
+  const guard = (work: () => Promise<void>) => () => work().catch((failure) => onError(describe(failure)))
+
+  return (
+    <div className="new-conversation">
+      <div className="row">
+        <button type="button" onClick={guard(onGroup)}>
+          New group
+        </button>
+        <button type="button" onClick={guard(onChannel)}>
+          New channel
+        </button>
+      </div>
+      <form
+        className="start"
+        onSubmit={(event) => {
+          event.preventDefault()
+          const wanted = token.trim()
+          if (!wanted) return
+          setToken('')
+          void guard(() => onJoin(wanted))()
+        }}
+      >
+        <input
+          value={token}
+          onChange={(event) => setToken(event.target.value)}
+          placeholder="invite token"
+          aria-label="Invite token"
+        />
+        <button type="submit">Join</button>
+      </form>
+    </div>
+  )
+}
+
+/** Members shows who belongs to a group or channel, and lets an administrator
+ *  change it.
+ *
+ *  The controls are shown only to an administrator, but that is presentation: the
+ *  server refuses every one of these calls from anybody else, which is where the rule
+ *  actually lives. */
+function Members({
+  client,
+  conversation,
+  onChanged,
+  onError,
+}: {
+  client: Client
+  conversation: Conversation
+  onChanged: () => Promise<void>
+  onError: (message: string) => void
+}) {
+  const [members, setMembers] = useState<Member[]>([])
+  const [invites, setInvites] = useState<Invite[]>([])
+  const [handle, setHandle] = useState('')
+  const [open, setOpen] = useState(false)
+
+  const administrator = conversation.role === 'admin'
+
+  const refresh = useCallback(async () => {
+    try {
+      setMembers(await client.members(conversation.id))
+      if (administrator) setInvites(await client.invites(conversation.id))
+    } catch (failure) {
+      onError(describe(failure))
+    }
+  }, [client, conversation.id, administrator, onError])
+
+  useEffect(() => {
+    if (open) void refresh()
+  }, [open, refresh])
+
+  const act = (work: () => Promise<unknown>) => async () => {
+    try {
+      await work()
+      await refresh()
+      await onChanged()
+    } catch (failure) {
+      onError(describe(failure))
+    }
+  }
+
+  const active = members.filter((member) => member.left_at === null)
+
+  return (
+    <section className="members">
+      <button type="button" className="link" onClick={() => setOpen(!open)}>
+        {open ? 'Hide' : 'Show'} {active.length} member{active.length === 1 ? '' : 's'}
+      </button>
+
+      {open && (
+        <div className="panel">
+          <ul>
+            {active.map((member) => (
+              <li key={member.account_id}>
+                <span className="who">{member.account_id.slice(0, 8)}</span>
+                <span className="role">{member.role}</span>
+                {/* Their join point is on screen because it is the whole of the
+                    history policy, and the thing most likely to look like a bug when
+                    a new member sees an empty conversation (MS-5). */}
+                <span className="sequence">from #{member.visible_from}</span>
+                {administrator && member.account_id !== client.accountID && (
+                  <>
+                    <button
+                      type="button"
+                      className="link"
+                      onClick={act(() =>
+                        client.changeRole(conversation.id, member.account_id, nextRole(member.role)),
+                      )}
+                    >
+                      make {nextRole(member.role)}
+                    </button>
+                    {member.role !== 'admin' && (
+                      <button
+                        type="button"
+                        className="link"
+                        onClick={act(() => client.changeRole(conversation.id, member.account_id, 'admin'))}
+                      >
+                        make admin
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="link"
+                      onClick={act(() => client.removeMember(conversation.id, member.account_id))}
+                    >
+                      remove
+                    </button>
+                  </>
+                )}
+              </li>
+            ))}
+          </ul>
+
+          {administrator && (
+            <>
+              <form
+                className="start"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  const wanted = handle.trim()
+                  if (!wanted) return
+                  setHandle('')
+                  void act(async () => {
+                    const account = await client.lookupHandle(wanted)
+                    await client.addMember(conversation.id, account.id)
+                  })()
+                }}
+              >
+                <input
+                  value={handle}
+                  onChange={(event) => setHandle(event.target.value)}
+                  placeholder="handle to add"
+                  aria-label="Handle to add"
+                />
+                <button type="submit">Add</button>
+              </form>
+
+              <div className="row">
+                <button type="button" onClick={act(() => client.createInvite(conversation.id))}>
+                  New invite link
+                </button>
+              </div>
+
+              <ul className="invites">
+                {invites
+                  .filter((invite) => !invite.revoked)
+                  .map((invite) => (
+                    <li key={invite.id}>
+                      {/* Selectable rather than a copy button: a clipboard write needs
+                          a permission prompt in some browsers, and the token is the
+                          thing being shared. */}
+                      <code>{invite.token}</code>
+                      <span className="muted">
+                        {invite.uses} use{invite.uses === 1 ? '' : 's'}
+                        {invite.max_uses > 0 && ` of ${invite.max_uses}`}
+                      </span>
+                      <button
+                        type="button"
+                        className="link"
+                        onClick={act(() => client.revokeInvite(invite.id))}
+                      >
+                        revoke
+                      </button>
+                    </li>
+                  ))}
+              </ul>
+            </>
+          )}
+
+          <button type="button" className="link" onClick={act(() => client.leave(conversation.id))}>
+            Leave this {conversation.kind}
+          </button>
+        </div>
+      )}
+    </section>
+  )
+}
+
+/** nextRole is what the reader/member control toggles between.
+ *
+ *  Administration is deliberately not in this cycle. It is granted by its own
+ *  labelled control, because a click that hands somebody the power to remove you is
+ *  not a click anybody should make while cycling through options — and there is no
+ *  undo for it. A group does need a second administrator eventually, which is why the
+ *  control exists at all rather than being left to the API.
+ */
+function nextRole(role: Role): Role {
+  return role === 'reader' ? 'member' : 'reader'
 }
 
 function StartDirect({ onStart }: { onStart: (handle: string) => Promise<void> }) {
