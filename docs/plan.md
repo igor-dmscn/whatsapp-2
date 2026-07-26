@@ -123,7 +123,7 @@ Two authorisation bugs, both found by tests rather than review:
 
 ---
 
-## Phase 5 — Revisions and reactions
+## Phase 5 — Revisions and reactions — **complete**
 
 **Goal:** edit, delete-for-everyone and reactions, without breaking forward-only sync.
 
@@ -135,6 +135,20 @@ Two authorisation bugs, both found by tests rather than review:
 **Frontend increment:** edit and delete affordances, reaction picker, reply rendering.
 
 **Verify:** the load-bearing test of the whole phase — a client that has **already synced past** an entry receives and applies a later edit of it. A pre-phase-5 client that does not understand revisions must degrade to showing the original, not crash. Reacting a hundred times produces no sequence numbers, confirmed by asserting the conversation head is unchanged.
+
+**Verified.** All three, at both levels: in Go against a real socket, and in two browsers where the reader has the message on screen when it is edited. A hundred alternating taps leave the head where it was.
+
+Edits and retractions became two kinds rather than one kind with an empty payload. "Empty means deleted" is an encoding a client can misread in the direction that shows withdrawn content, and the permissions differ — an administrator may take something down but not replace it with different words. Moderation needs the first power; nobody needs the second.
+
+Amendments target the original, never each other, so applying the highest-sequenced amendment for a target is always correct and there is no chain to walk.
+
+Three findings:
+
+- **The broadcast omitted what an edit amends**, so a live client would have had to fetch to discover it — defeating the point of carrying the body. Found by the socket assertion, which is the only place it could have been.
+- **Payloads were rebuilt on load through the validating constructor**, which [ADR-0010](./adr/0010-ddd-conventions.md) forbids and which a retraction breaks at once, having no content type and no bytes. Loading now reconstitutes.
+- **The unmapped-event guard from phase 3 earned its keep**: a new event with no route failed the write that produced it rather than publishing on an empty key and silently losing its ordering.
+
+The client gained `web/src/transcript.ts` — a pure function turning entries into messages. It is ADR-0008's sentence "clients interpret entries rather than rendering them one-to-one" as code, and the place a mistake would be invisible, so it is unit-tested on its own.
 
 ---
 

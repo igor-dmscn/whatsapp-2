@@ -9,7 +9,8 @@
 // Deliberately free of React. The protocol is stateful and must survive re-renders,
 // StrictMode's double-mounted effects, and being tested with no DOM at all.
 
-import type { Entry } from './api'
+import type { Entry, Reaction } from './api'
+import type { ReactionsBySequence } from './transcript'
 
 export type SyncStatus = 'connecting' | 'live' | 'offline'
 
@@ -17,6 +18,10 @@ export type SyncStatus = 'connecting' | 'live' | 'offline'
 export type Snapshot = {
   status: SyncStatus
   conversations: Map<string, Entry[]>
+  /** reactions are held beside the log, not in it (ADR-0008). They carry no sequence
+   *  of their own, so there is no gap to detect and no order to preserve — a client
+   *  that misses one learns of it the next time it reads the range. */
+  reactions: Map<string, ReactionsBySequence>
 }
 
 /** Socket is the part of WebSocket this client uses, so tests can supply a fake. */
@@ -84,6 +89,11 @@ type entryFrame = {
   content_type: string
   body: string
   created_at: string
+  /** target_sequence and reply_to travel with the broadcast so an edit can be applied
+   *  without a round trip. Dropping them here would leave a live edit looking like an
+   *  entry that amends nothing, which resolve() correctly ignores — a silent failure. */
+  target_sequence?: number
+  reply_to?: number
 }
 
 type gapsFrame = {
@@ -91,10 +101,19 @@ type gapsFrame = {
   gaps: { conversation_id: string; from: number; to: number }[]
 }
 
+type reactionFrame = {
+  type: 'reaction'
+  conversation_id: string
+  sequence: number
+  account_id: string
+  emoji: string
+  removed: boolean
+}
+
 type readyFrame = { type: 'ready'; account_id: string; device_id: string }
 type errorFrame = { type: 'error'; code: string; message: string }
 
-type serverFrame = entryFrame | gapsFrame | readyFrame | errorFrame | { type: string }
+type serverFrame = entryFrame | gapsFrame | reactionFrame | readyFrame | errorFrame | { type: string }
 
 /** openAtCurrentOrigin is the browser default: same origin as the page, so the
  *  server's same-origin check passes with no configuration to keep in step. */
@@ -114,6 +133,8 @@ function toEntry(frame: entryFrame): Entry {
     content_type: frame.content_type,
     body: frame.body,
     created_at: frame.created_at,
+    target_sequence: frame.target_sequence,
+    reply_to: frame.reply_to,
   }
 }
 
@@ -124,7 +145,8 @@ export class Sync {
 
   private socket: Socket | null = null
   private status: SyncStatus = 'offline'
-  private snapshot: Snapshot = { status: 'offline', conversations: new Map() }
+  private readonly reactions = new Map<string, ReactionsBySequence>()
+  private snapshot: Snapshot = { status: 'offline', conversations: new Map(), reactions: new Map() }
 
   private attempt = 0
   private retryTimer: ReturnType<typeof setTimeout> | null = null
@@ -151,6 +173,48 @@ export class Sync {
    *  is not a second message. */
   accept(entry: Entry): void {
     if (this.store(entry.conversation_id, entry)) this.publish()
+  }
+
+  /** acceptReactions merges what a fetch returned.
+   *
+   *  Merged rather than replaced: a live reaction can arrive while the fetch is in
+   *  flight, and replacing would discard it with nothing to bring it back — there is
+   *  no gap to notice for something that has no sequence. */
+  acceptReactions(conversationID: string, reactions: Reaction[]): void {
+    for (const reaction of reactions) {
+      this.setReaction(conversationID, reaction.sequence, reaction.emoji, reaction.account_id, false)
+    }
+    this.publish()
+  }
+
+  private onReaction(frame: reactionFrame): void {
+    this.setReaction(frame.conversation_id, frame.sequence, frame.emoji, frame.account_id, frame.removed)
+    this.publish()
+  }
+
+  private setReaction(
+    conversationID: string,
+    sequence: number,
+    emoji: string,
+    accountID: string,
+    removed: boolean,
+  ): void {
+    let bySequence = this.reactions.get(conversationID)
+    if (!bySequence) {
+      bySequence = new Map()
+      this.reactions.set(conversationID, bySequence)
+    }
+
+    let byEmoji = bySequence.get(sequence)
+    if (!byEmoji) {
+      byEmoji = new Map()
+      bySequence.set(sequence, byEmoji)
+    }
+
+    const accounts = byEmoji.get(emoji) ?? new Set<string>()
+    if (removed) accounts.delete(accountID)
+    else accounts.add(accountID)
+    byEmoji.set(emoji, accounts)
   }
 
   /** follow makes a conversation known before any entry arrives, so opening one
@@ -292,6 +356,10 @@ export class Sync {
 
       case 'entry':
         this.onEntry(frame as entryFrame)
+        break
+
+      case 'reaction':
+        this.onReaction(frame as reactionFrame)
         break
 
       case 'error':
@@ -445,7 +513,9 @@ export class Sync {
         [...log.entries.values()].sort((left, right) => left.sequence - right.sequence),
       )
     }
-    this.snapshot = { status: this.status, conversations }
+    // The reaction maps are mutated in place; what changes on every publish is the
+    // snapshot's own identity, which is what useSyncExternalStore compares.
+    this.snapshot = { status: this.status, conversations, reactions: new Map(this.reactions) }
     for (const listener of this.listeners) listener()
   }
 }

@@ -378,3 +378,105 @@ aside {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* --- revisions, replies and reactions (phase 5) --- */
+
+.transcript li {
+  flex-wrap: wrap;
+}
+
+.quoted {
+  flex-basis: 100%;
+  padding-left: 0.5rem;
+  border-left: 2px solid var(--muted);
+  color: var(--muted);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.retracted {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.edited {
+  font-size: 0.75rem;
+}
+
+/* Actions stay hidden until the message is hovered or something in it is focused.
+   Keyboard users get them via :focus-within, so they are not mouse-only. */
+.actions {
+  display: flex;
+  gap: 0.4rem;
+  visibility: hidden;
+  font-size: 0.75rem;
+}
+
+.transcript li:hover .actions,
+.transcript li:focus-within .actions {
+  visibility: visible;
+}
+
+.reactions {
+  display: flex;
+  flex-basis: 100%;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.reaction {
+  padding: 0 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.75rem;
+}
+
+.reaction.mine {
+  border-color: var(--accent);
+}
+
+/* The add button only appears on hover, so a conversation with no reactions is not a
+   column of plus signs. */
+.reaction.add {
+  visibility: hidden;
+}
+
+.transcript li:hover .reaction.add,
+.transcript li:focus-within .reaction.add {
+  visibility: visible;
+}
+
+.picker {
+  display: flex;
+  gap: 0.2rem;
+  padding: 0.15rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--raised);
+}
+
+.edit {
+  display: flex;
+  flex: 1;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.edit input {
+  margin-top: 0;
+}
+
+.composer {
+  flex-wrap: wrap;
+}
+
+.replying {
+  display: flex;
+  flex-basis: 100%;
+  gap: 0.5rem;
+  align-items: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+}

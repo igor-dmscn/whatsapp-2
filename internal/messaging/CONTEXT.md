@@ -74,6 +74,18 @@ _Avoid_: status, ticks, ack level
 A high-water mark: the position through which something is true. A read mark and a delivery mark per membership, each moving forward only. Two of them answer the delivery-state question for every entry in a conversation, which is why no state is stored per entry.
 _Avoid_: pointer, offset (offset is Kafka's word and means something else here)
 
+**Revision**:
+The umbrella term for an entry that amends an earlier one. Two concrete kinds: a *revision* replaces the target's content, a *retraction* withdraws it. Both take their own position in the log and reference the original, never each other.
+_Avoid_: edit, update, tombstone, soft delete
+
+**Retraction**:
+Delete for everyone. Carries no payload at all, so no client can render withdrawn content by misreading a kind. Terminal — the target cannot be edited afterwards.
+_Avoid_: delete, remove, redaction
+
+**Reaction**:
+Somebody's symbol on an entry, held beside the log rather than in it. Has no sequence number, so it moves no cursor, fills no gap and wakes no client with work to do.
+_Avoid_: like, emoji (the emoji is the symbol; the reaction is the fact somebody applied it)
+
 **Invite**:
 A shareable, revocable permission to join a conversation at a fixed role. Counts its uses rather than being consumed by the first, so a link shared with many people is the ordinary case and single-use is a limit of one.
 _Avoid_: link, join code, token (the token is the secret *inside* an invite, not the invite)

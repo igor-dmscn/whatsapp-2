@@ -2,7 +2,7 @@
 
 Real-time messaging, media sharing, and live audio/video calling. A Go backend with React and CLI clients, built as a reference implementation — the codebase is meant to be read, so the reasoning is committed alongside the code.
 
-**Status: phases 0–4 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, the transactional outbox with Kafka and projections, groups and channels with invite links, and a browser client that covers all of it. Phase 5 is next. See [the plan](./docs/plan.md).
+**Status: phases 0–5 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, the transactional outbox with Kafka and projections, groups and channels with invite links, edits, deletes, replies and reactions, and a browser client that covers all of it. Phase 6 is next. See [the plan](./docs/plan.md).
 
 ## Running it
 

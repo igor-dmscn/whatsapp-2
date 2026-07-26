@@ -551,3 +551,114 @@ describe.skipIf(!live)('groups and channels', () => {
     expect(status).toBe(200)
   }, timeout * 2)
 })
+
+// Phase 5's frontend increment: edits, deletes, reactions, replies.
+describe.skipIf(!live)('edits, deletes and reactions', () => {
+  let browser: Browser
+  let author: Person
+  let reader: Person
+
+  beforeAll(async () => {
+    const { chromium } = await import('playwright-core')
+    browser = await chromium.launch({ headless: true, executablePath: chromiumPath() })
+
+    author = await join_(browser, nodeAURL, `ivan${unique}`)
+    reader = await join_(browser, nodeBURL, `judy${unique}`)
+
+    await start(author, reader.handle)
+    await reader.page.waitForFunction(
+      () => document.querySelector('.conversations button') !== null,
+      undefined,
+      { timeout },
+    )
+    await reader.page.click('.conversations button')
+  }, timeout * 3)
+
+  afterAll(async () => {
+    await browser?.close()
+  })
+
+  it('shows an edit to a reader already past the message', async () => {
+    // The load-bearing behaviour of the phase, from the client's side. The reader has
+    // this message on screen — it has synced past it — and the edit must still land.
+    await send(author.page, 'the original wording')
+    await expectTranscript(reader.page, ['the original wording'])
+
+    await author.page.locator('.transcript li').last().hover()
+    await author.page.getByRole('button', { name: 'edit' }).last().click()
+    await author.page.getByLabel('Edit message').fill('the corrected wording')
+    await author.page.getByRole('button', { name: 'Save' }).click()
+
+    // One message, not two: the revision took its own position in the log and changed
+    // what the original says rather than appearing beside it.
+    await expectTranscript(reader.page, ['the corrected wording (edited)'])
+    await expectTranscript(author.page, ['the corrected wording (edited)'])
+  }, timeout * 2)
+
+  it('marks a message deleted for everyone without removing it', async () => {
+    await author.page.locator('.transcript li').last().hover()
+    await author.page.getByRole('button', { name: 'delete' }).last().click()
+
+    await reader.page.waitForFunction(
+      () => document.querySelector('.transcript li .retracted')?.textContent === 'deleted',
+      undefined,
+      { timeout },
+    )
+
+    // The message stays in place. Its position is real and every client syncs through
+    // it; what changed is that it carries nothing.
+    expect(await reader.page.locator('.transcript li').count()).toBe(1)
+  }, timeout * 2)
+
+  it('shows a reaction to both sides and takes no position in the log', async () => {
+    await send(author.page, 'react to this')
+    await expectTranscript(reader.page, ['deleted', 'react to this'])
+
+    const headBefore = await headOf(reader.page)
+
+    await reader.page.locator('.transcript li').last().hover()
+    await reader.page.locator('.transcript li').last().locator('.reaction.add').click()
+    await reader.page.locator('.picker .reaction').first().click()
+
+    // The author sees it, which means it crossed nodes on the ephemeral path.
+    await author.page.waitForFunction(
+      () => {
+        const reactions = [...document.querySelectorAll('.transcript li:last-child .reaction')]
+        return reactions.some((button) => (button.textContent ?? '').includes('1'))
+      },
+      undefined,
+      { timeout },
+    )
+
+    // And the log did not grow. This is MS-10 through the interface: the head is what
+    // a reaction must never move.
+    expect(await headOf(reader.page)).toBe(headBefore)
+  }, timeout * 2)
+
+  it('sends a reply carrying the position it answers', async () => {
+    await reader.page.locator('.transcript li').last().hover()
+    await reader.page.getByRole('button', { name: 'reply' }).last().click()
+    await reader.page.waitForSelector('.replying', { timeout })
+
+    await send(reader.page, 'an answer')
+
+    // The quoted text is what the reply names, resolved locally from the log.
+    await reader.page.waitForFunction(
+      () => document.querySelector('.transcript li:last-child .quoted')?.textContent === 'react to this',
+      undefined,
+      { timeout },
+    )
+  }, timeout * 2)
+})
+
+/** headOf reads the conversation's head from the API, which is where MS-10's assertion
+ *  actually lives — the UI never shows it. */
+async function headOf(page: Page): Promise<number> {
+  return page.evaluate(async () => {
+    const session = JSON.parse(sessionStorage.getItem('comms.session')!)
+    const { conversations } = await fetch('/v1/conversations', {
+      headers: { Authorization: `Bearer ${session.access_token}` },
+    }).then((response) => response.json())
+    return conversations[0].head as number
+  })
+}

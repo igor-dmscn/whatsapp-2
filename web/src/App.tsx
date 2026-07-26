@@ -13,9 +13,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 
-import { ApiError, Client, decodeBody, deliveryOf, login, register, SessionExpired } from './api'
-import type { Conversation, DeliveryState, Entry, Invite, Member, Role, Session } from './api'
+import { ApiError, Client, deliveryOf, login, register, SessionExpired } from './api'
+import type { Conversation, DeliveryState, Invite, Member, Role, Session } from './api'
 import { Sync } from './sync'
+import { resolve, summarise, type Message, type ReactionsBySequence } from './transcript'
 
 // sessionStorage, not localStorage, and the difference matters here: sessionStorage
 // is per-tab, so two tabs are two independent logins. Sharing one session across
@@ -165,6 +166,8 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
   // reverse, so a conversation loaded from the list is labelled by its identifier
   // until someone is looked up. Proper titles come with phase 3's conversation list.
   const [handles, setHandles] = useState<Record<string, string>>({})
+  // The position the composer is replying to, zero for none.
+  const [replyTo, setReplyTo] = useState(0)
 
   const client = useMemo(
     () =>
@@ -294,6 +297,24 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
   const entries = selected ? (snapshot.conversations.get(selected) ?? []) : []
   const current = conversations.find((each) => each.id === selected)
 
+  // Entries become messages here, not in the components. An edit occupies its own
+  // position in the log but changes what an earlier message says (ADR-0008), so what
+  // is on screen is derived from the log rather than being it.
+  const messages = useMemo(() => resolve(entries), [entries])
+  const reactions = (selected && snapshot.reactions.get(selected)) || new Map()
+
+  // Reactions are read for the range on screen — no cursor, no history. They are not in
+  // the log, so there is no gap to notice when one is missed; reading the range again
+  // is the whole recovery mechanism (ADR-0008).
+  const highest = entries.at(-1)?.sequence ?? 0
+  useEffect(() => {
+    if (!selected || highest === 0) return
+    client
+      .reactions(selected, 1, highest)
+      .then((found) => sync.acceptReactions(selected, found))
+      .catch((failure) => fatal.current(failure))
+  }, [selected, highest, client, sync])
+
   return (
     <div className="workspace">
       <header>
@@ -375,15 +396,39 @@ function Workspace({ session, onSignOut }: { session: Session; onSignOut: () => 
                 />
               )}
               <Transcript
-                entries={entries}
+                messages={messages}
+                reactions={reactions}
                 me={client.accountID}
                 handles={handles}
                 conversation={current}
+                onEdit={async (sequence, text) => {
+                  const entry = await client.revise(selected, sequence, crypto.randomUUID(), text)
+                  sync.accept(entry)
+                }}
+                onDelete={async (sequence) => {
+                  const entry = await client.retract(selected, sequence, crypto.randomUUID())
+                  sync.accept(entry)
+                }}
+                onReact={async (sequence, emoji, mine) => {
+                  if (mine) await client.unreact(selected, sequence, emoji)
+                  else await client.react(selected, sequence, emoji)
+                  // Applied locally at once rather than waiting for the echo: the
+                  // server has accepted it, and a tap that does nothing for a round
+                  // trip gets tapped again.
+                  sync.acceptReactions(selected, [])
+                  const found = await client.reactions(selected, 1, highest)
+                  sync.acceptReactions(selected, found)
+                }}
+                onReply={setReplyTo}
+                onError={setError}
               />
               <Composer
+                replyTo={replyTo}
+                onCancelReply={() => setReplyTo(0)}
                 onSend={async (text, clientEntryID) => {
-                  const entry = await client.send(selected, clientEntryID, text)
+                  const entry = await client.send(selected, clientEntryID, text, replyTo)
                   sync.accept(entry)
+                  setReplyTo(0)
                 }}
                 onError={setError}
               />
@@ -661,34 +706,197 @@ function StartDirect({ onStart }: { onStart: (handle: string) => Promise<void> }
 }
 
 function Transcript({
-  entries,
+  messages,
+  reactions,
   me,
   handles,
   conversation,
+  onEdit,
+  onDelete,
+  onReact,
+  onReply,
+  onError,
 }: {
-  entries: Entry[]
+  messages: Message[]
+  reactions: ReactionsBySequence
   me: string
   handles: Record<string, string>
   conversation: Conversation | undefined
+  onEdit: (sequence: number, text: string) => Promise<void>
+  onDelete: (sequence: number) => Promise<void>
+  onReact: (sequence: number, emoji: string, mine: boolean) => Promise<void>
+  onReply: (sequence: number) => void
+  onError: (message: string) => void
 }) {
+  const [editing, setEditing] = useState(0)
+  const byPosition = new Map(messages.map((message) => [message.sequence, message]))
+  const guard = (work: () => Promise<void>) => work().catch((failure) => onError(describe(failure)))
+  const administrator = conversation?.role === 'admin'
+
   return (
     <ol className="transcript">
-      {entries.map((entry) => (
-        <li key={entry.sequence} className={entry.author_id === me ? 'mine' : 'theirs'}>
+      {messages.map((message) => (
+        <li key={message.sequence} className={message.authorID === me ? 'mine' : 'theirs'}>
+          {message.replyTo > 0 && (
+            <span className="quoted">
+              {/* The quoted text, or a note that it is not held. A reply is a bare
+                  reference (ADR-0008), so the message it names may be before this
+                  member's join point or simply not fetched yet. */}
+              {byPosition.get(message.replyTo)?.text ?? `#${message.replyTo}`}
+            </span>
+          )}
+
           <span className="who">
-            {entry.author_id === me ? 'you' : (handles[entry.author_id] ?? entry.author_id.slice(0, 8))}
+            {message.authorID === me ? 'you' : (handles[message.authorID] ?? message.authorID.slice(0, 8))}
           </span>
-          <span className="body">{decodeBody(entry.body)}</span>
+
+          {message.retracted ? (
+            <span className="body retracted">deleted</span>
+          ) : editing === message.sequence ? (
+            <EditBox
+              initial={message.text}
+              onCancel={() => setEditing(0)}
+              onSave={async (text) => {
+                await guard(() => onEdit(message.sequence, text))
+                setEditing(0)
+              }}
+            />
+          ) : (
+            <span className="body">
+              {message.text}
+              {message.edited && <span className="muted edited"> (edited)</span>}
+            </span>
+          )}
+
           {/* The sequence is on screen deliberately. It is what the sync protocol
               turns on, and seeing a hole appear and close is the fastest way to
               tell gap filling from a rendering bug. */}
-          <span className="sequence">#{entry.sequence}</span>
-          {entry.author_id === me && conversation && (
-            <Ticks state={deliveryOf(entry.sequence, conversation)} />
+          <span className="sequence">#{message.sequence}</span>
+
+          {message.authorID === me && conversation && (
+            <Ticks state={deliveryOf(message.sequence, conversation)} />
           )}
+
+          {!message.retracted && (
+            <span className="actions">
+              <button type="button" className="link" onClick={() => onReply(message.sequence)}>
+                reply
+              </button>
+              {message.authorID === me && (
+                <button type="button" className="link" onClick={() => setEditing(message.sequence)}>
+                  edit
+                </button>
+              )}
+              {/* Deleting somebody else's message is an administrator's power and only
+                  theirs. Editing it is nobody's — see MS-9. */}
+              {(message.authorID === me || administrator) && (
+                <button
+                  type="button"
+                  className="link"
+                  onClick={() => void guard(() => onDelete(message.sequence))}
+                >
+                  delete
+                </button>
+              )}
+            </span>
+          )}
+
+          <Reactions
+            summary={summarise(reactions, message.sequence, me)}
+            onReact={(emoji, mine) => void guard(() => onReact(message.sequence, emoji, mine))}
+          />
         </li>
       ))}
     </ol>
+  )
+}
+
+function EditBox({
+  initial,
+  onSave,
+  onCancel,
+}: {
+  initial: string
+  onSave: (text: string) => Promise<void>
+  onCancel: () => void
+}) {
+  const [text, setText] = useState(initial)
+
+  return (
+    <form
+      className="edit"
+      onSubmit={(event) => {
+        event.preventDefault()
+        const wanted = text.trim()
+        if (!wanted) return
+        void onSave(wanted)
+      }}
+    >
+      <input value={text} onChange={(event) => setText(event.target.value)} aria-label="Edit message" autoFocus />
+      <button type="submit">Save</button>
+      <button type="button" className="link" onClick={onCancel}>
+        cancel
+      </button>
+    </form>
+  )
+}
+
+/** offered is the reaction picker's fixed set.
+ *
+ *  A fixed few rather than a full emoji keyboard. The server validates that a reaction
+ *  is a symbol and not text, so an arbitrary picker would be safe — but six choices
+ *  make the counts mean something, where an open set turns every message into a long
+ *  tail of ones. */
+const offered = ['👍', '❤️', '😂', '🎉', '😮', '😢']
+
+function Reactions({
+  summary,
+  onReact,
+}: {
+  summary: { emoji: string; count: number; mine: boolean }[]
+  onReact: (emoji: string, mine: boolean) => void
+}) {
+  const [picking, setPicking] = useState(false)
+
+  return (
+    <span className="reactions">
+      {summary.map(({ emoji, count, mine }) => (
+        <button
+          key={emoji}
+          type="button"
+          className={mine ? 'reaction mine' : 'reaction'}
+          title={mine ? 'remove your reaction' : 'react'}
+          onClick={() => onReact(emoji, mine)}
+        >
+          {emoji} {count}
+        </button>
+      ))}
+
+      <button type="button" className="reaction add" title="react" onClick={() => setPicking(!picking)}>
+        +
+      </button>
+
+      {picking && (
+        <span className="picker">
+          {offered.map((emoji) => (
+            <button
+              key={emoji}
+              type="button"
+              className="reaction"
+              onClick={() => {
+                setPicking(false)
+                // Always an add from the picker: the summary's own buttons are how a
+                // reaction is removed, and a picker that toggled would make the same
+                // tap mean different things depending on invisible state.
+                onReact(emoji, false)
+              }}
+            >
+              {emoji}
+            </button>
+          ))}
+        </span>
+      )}
+    </span>
   )
 }
 
@@ -707,16 +915,20 @@ function Ticks({ state }: { state: DeliveryState }) {
 }
 
 function Composer({
+  replyTo,
+  onCancelReply,
   onSend,
   onError,
 }: {
+  replyTo: number
+  onCancelReply: () => void
   onSend: (text: string, clientEntryID: string) => Promise<void>
   onError: (message: string) => void
 }) {
   const [draft, setDraft] = useState('')
-  // The identifier belongs to the draft, not to the attempt. A send that fails and
-  // is tried again reuses it, so the server recognises the retry and returns the
-  // entry the first attempt created rather than writing a second one (MS-2).
+  // The identifier belongs to the draft, not to the attempt. A send that fails and is
+  // tried again reuses it, so the server recognises the retry and returns the entry the
+  // first attempt created rather than writing a second one (MS-2).
   const [clientEntryID, setClientEntryID] = useState(() => crypto.randomUUID())
   const [sending, setSending] = useState(false)
 
@@ -731,8 +943,8 @@ function Composer({
       setDraft('')
       setClientEntryID(crypto.randomUUID())
     } catch (failure) {
-      // The draft and its identifier are kept, so pressing send again is a retry
-      // of the same entry rather than a new one.
+      // The draft and its identifier are kept, so pressing send again is a retry of
+      // the same entry rather than a new one.
       onError(describe(failure))
     } finally {
       setSending(false)
@@ -741,6 +953,14 @@ function Composer({
 
   return (
     <form className="composer" onSubmit={submit}>
+      {replyTo > 0 && (
+        <span className="replying">
+          replying to #{replyTo}
+          <button type="button" className="link" onClick={onCancelReply}>
+            cancel
+          </button>
+        </span>
+      )}
       <input
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
@@ -754,3 +974,4 @@ function Composer({
     </form>
   )
 }
+

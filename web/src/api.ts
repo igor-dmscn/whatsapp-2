@@ -84,9 +84,23 @@ export type Entry = {
   sequence: number
   author_id: string
   client_entry_id: string
+  /** kind is 'message', 'revision' or 'retraction' — and may be something this client
+   *  has never heard of. Anything unrecognised must be ignored, not rendered and not
+   *  fatal (ADR-0008). */
   kind: string
   content_type: string
   body: string
+  created_at: string
+  /** target_sequence is the position this entry amends, absent on a message. */
+  target_sequence?: number
+  /** reply_to is the position this entry replies to, absent for none. */
+  reply_to?: number
+}
+
+export type Reaction = {
+  sequence: number
+  account_id: string
+  emoji: string
   created_at: string
 }
 
@@ -235,6 +249,45 @@ export class Client {
     return this.authorized<Account>(`/v1/accounts/${encodeURIComponent(handle)}`)
   }
 
+  revise(conversationID: string, target: number, clientEntryID: string, text: string): Promise<Entry> {
+    return this.authorized<Entry>(`/v1/conversations/${conversationID}/entries/${target}/revision`, {
+      method: 'POST',
+      body: JSON.stringify({
+        client_entry_id: clientEntryID,
+        content_type: textContentType,
+        body: encodeBody(text),
+      }),
+    })
+  }
+
+  retract(conversationID: string, target: number, clientEntryID: string): Promise<Entry> {
+    return this.authorized<Entry>(`/v1/conversations/${conversationID}/entries/${target}/retraction`, {
+      method: 'POST',
+      body: JSON.stringify({ client_entry_id: clientEntryID }),
+    })
+  }
+
+  react(conversationID: string, sequence: number, emoji: string): Promise<void> {
+    return this.authorized<void>(`/v1/conversations/${conversationID}/entries/${sequence}/reactions`, {
+      method: 'PUT',
+      body: JSON.stringify({ emoji }),
+    })
+  }
+
+  unreact(conversationID: string, sequence: number, emoji: string): Promise<void> {
+    return this.authorized<void>(`/v1/conversations/${conversationID}/entries/${sequence}/reactions`, {
+      method: 'DELETE',
+      body: JSON.stringify({ emoji }),
+    })
+  }
+
+  async reactions(conversationID: string, from: number, to: number): Promise<Reaction[]> {
+    const body = await this.authorized<{ reactions: Reaction[] }>(
+      `/v1/conversations/${conversationID}/reactions?from=${from}&to=${to}`,
+    )
+    return body.reactions
+  }
+
   startGroup(): Promise<Conversation> {
     return this.authorized<Conversation>('/v1/conversations/group', { method: 'POST' })
   }
@@ -338,13 +391,14 @@ export class Client {
    * with the sequence it already has — which is what makes retrying a send safe
    * when the response was lost rather than the request.
    */
-  send(conversationID: string, clientEntryID: string, text: string): Promise<Entry> {
+  send(conversationID: string, clientEntryID: string, text: string, replyTo = 0): Promise<Entry> {
     return this.authorized<Entry>(`/v1/conversations/${conversationID}/entries`, {
       method: 'POST',
       body: JSON.stringify({
         client_entry_id: clientEntryID,
         content_type: textContentType,
         body: encodeBody(text),
+        reply_to: replyTo,
       }),
     })
   }
