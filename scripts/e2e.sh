@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 #
-# Runs the browser suite against two api nodes and two dev servers.
+# Runs the browser suite against two api nodes, one media node and two dev servers.
 #
-# Two of each, deliberately. One node would leave cross-node delivery untested,
-# and cross-node delivery is the part of the ephemeral path most likely to be
-# quietly broken — every assertion still passes on a single process.
+# Two api nodes, deliberately. One would leave cross-node delivery untested, and
+# cross-node delivery is the part of the ephemeral path most likely to be quietly
+# broken — every assertion still passes on a single process.
+#
+# One media node, also deliberately. Both api nodes forward through it, which is
+# what makes a call belong to neither of them; running forwarding inside api
+# instead is supported and is what a development machine does, but it is the
+# configuration in which a cross-node call cannot work.
 #
 # Assumes `make up` and `make migrate` have already run.
 
@@ -50,12 +55,21 @@ waitFor() {
   return 1
 }
 
-echo "building api, worker and cli"
+echo "building api, sfu, worker and cli"
 # The cli is built because the browser suite runs it: one of phase 6's verifications is
 # that both clients answer the same search identically, which needs both to exist.
-go build -o bin/ ./cmd/api ./cmd/worker ./cmd/cli
+go build -o bin/ ./cmd/api ./cmd/sfu ./cmd/worker ./cmd/cli
+
+# The media node first, so that neither api node spends its first second retrying a
+# subscription. The suite would still pass — an offer with nowhere to go is retried —
+# but a test that depends on the retry is a test of the retry.
+echo "starting the media node"
+SFU_ADDR=:8090 ./bin/sfu >"$logs/sfu-8090.log" 2>&1 &
+pids+=($!)
+waitFor http://localhost:8090/health
 
 echo "starting two api nodes"
+export SFU_URL=http://localhost:8090
 API_ADDR=:8080 ./bin/api >"$logs/api-8080.log" 2>&1 &
 pids+=($!)
 API_ADDR=:8081 ./bin/api >"$logs/api-8081.log" 2>&1 &
@@ -63,6 +77,21 @@ pids+=($!)
 
 waitFor http://localhost:8080/health
 waitFor http://localhost:8081/health
+
+# Both api nodes subscribed to the node's offers, which is the one part of the split
+# that nothing else would report. Without it calls still start and still carry media
+# one way, so waiting here is what keeps a broken reverse channel from presenting as a
+# flaky media assertion twenty seconds later.
+echo "waiting for both api nodes to subscribe to offers"
+for _ in $(seq 1 40); do
+  subscribers=$(curl -fsS http://localhost:8090/health | sed -n 's/.*"offer_subscribers":\([0-9]*\).*/\1/p')
+  [[ ${subscribers:-0} -ge 2 ]] && break
+  sleep 0.25
+done
+if [[ ${subscribers:-0} -lt 2 ]]; then
+  echo "only ${subscribers:-0} api nodes subscribed to the media node's offers" >&2
+  exit 1
+fi
 
 # From phase 3 the badge and tick assertions need the relay and the projections
 # running. One worker is enough — it is the only thing that may run more than once

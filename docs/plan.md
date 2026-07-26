@@ -251,7 +251,7 @@ Three findings, all from running it:
 
 ---
 
-## Phase 9 — SFU — **partly done: the model and the media plane**
+## Phase 9 — SFU — **steps 1 and 2 done; simulcast and the measurements remain**
 
 **Goal:** live audio and video calls. The largest and riskiest phase ([ADR-0006](./adr/0006-custom-pion-sfu-with-simulcast.md)).
 
@@ -271,24 +271,35 @@ Step 2 is a shippable product on its own. If schedule pressure arrives, stop aft
 
 - **Signalling over the existing WebSocket** (ADR-0004), with 6 integration tests against real Postgres and the real media plane. Messaging delegates frame families it does not own, so it carries call traffic without learning what a call is. There is no *start* operation: a call exists because somebody joined a conversation that had none, so CL-2 falls out — no code path could create a second, and a partial unique index catches two people pressing call at once. CL-1 is one question asked of Messaging. CL-3 fires on the last departure, whether that was a leave frame or a socket that closed.
 - **Persistence**: migration 00009, one row per presence rather than per device, so a rejoin does not erase the record of who was in a call.
-- **The call UI**, with **media flowing between two real browsers, both directions**. Start, ring, join, mute, hang up, participant tiles. Four states, because "a call you are in" and "a call in progress you have not joined" are the difference between a button that says leave and one that says join. 6 browser tests: the ring arrives without being asked for, both sides show a playing remote tile, mute is local, hanging up ends the call with `/health` reporting zero calls.
+- **The call UI**, with **media flowing between two real browsers, both directions**. Start, ring, join, mute, hang up, participant tiles. Four states, because "a call you are in" and "a call in progress you have not joined" are the difference between a button that says leave and one that says join. 6 browser tests: the ring arrives without being asked for, both sides show a playing remote tile, mute is local, hanging up ends the call with the media node reporting zero calls.
+- **`cmd/sfu`, and with it calls that cross api nodes.** Media forwarding is its own process now, both api nodes signal to it, and **a browser on node A and a browser on node B hold one call with media both ways**. The entry that used to be under *not done* said the fix was one shared media process plus an HTTP implementation of `MediaNodes`, and that nothing above the port would change. Both were right: the domain, the use cases and the signalling are untouched, and the whole of it is one package — a client, the surface it talks to, and the wire they agree on, in one directory so the two ends cannot drift.
+
+  Two api nodes, one media node, one call, media both ways, in **0.32 s** in the integration test.
+
+  The hard part was the one named in advance: an offer the node produces has to reach whichever api node holds that participant's socket, and the node holds no sockets to look one up with. **It broadcasts** ([ADR-0013](./adr/0013-media-node-broadcasts-its-offers.md)) — every api node subscribes to a stream of offers, delivers the ones it has a socket for, and drops the rest. A registry mapping devices to nodes would target the delivery, and is a second source of truth about where a client is: wrong for exactly as long as a reconnection takes to notice, which is when an offer is most likely to be in flight.
+
+  Three things that only exist once the two halves are in different processes:
+
+  - **An offer can be delivered to nobody, and silence is the wrong answer.** No api node is subscribed while the media node starts and while a stream reconnects. So `Renegotiator` returns an error and an undelivered offer is retried — without that, a one-second window costs a participant every joiner for the rest of the call, with nothing reporting it.
+  - **`offer_subscribers` is a health signal, not a statistic.** Zero with calls above zero is a node forwarding media that cannot tell anybody about a new publisher. Every other number looks healthy and the symptom is one-way media — which is the misdiagnosis this phase has already made once, so it is in `/health`, in the browser suite's failure message, and `scripts/e2e.sh` refuses to start the suite until both api nodes have subscribed.
+  - **An unanswered offer used to wedge a participant permanently.** The flag that permits one exchange at a time was only ever cleared by an answer, so an offer lost for any reason meant that participant never received another track for the life of the call. Pre-existing, and found by asking how the new path fails rather than by a test.
+
+  One test-only race came out of it too, and it is worth the line because of how it was hidden. The phase-8 stub's offer channel was closed on leave under a `sync.Once`, whose comment claimed to guard a renegotiation in flight and did not: `Once` stops a second close, not a send racing the first. Race-clean for a whole phase, and `-race` found it within minutes of the server gaining a retry.
 
 **The bug that hid all of this, and how it presented.** Media between browsers appeared to fail in one direction, with the failing direction varying between runs — which reads exactly like a renegotiation race, and the first fix attempted was one. It was not that. Two api nodes both defaulted their media address to the literal `"local"`, so the check meant to enforce CL-4 — is this call mine? — passed on both. A call started on node A was quietly continued on node B's own in-process SFU: two participants, two media planes, no shared media, no error anywhere. Both people saw what looked like a working call.
 
 `/health` reporting `calls: 1, 1` is what settled it, and it took adding that to the failure message. The lesson is the ordinary one: the symptom pointed at the layer I had most recently written, and the cause was in wiring I had written earlier and reasoned about rather than measured.
 
-Two things came out of it. The node address now defaults per process, so the mismatch is loud instead of silent. And a browser pair on *one* node proves the whole media path, while a pair across *two* nodes asserts the refusal — the boundary of an in-process media plane, tested rather than described.
+Two things came out of it. The node address now defaults per process, so the mismatch is loud instead of silent. And a browser pair on *one* node proves the whole media path, while a pair across *two* nodes proves the shared one — that second test asserted a refusal when it was written, because an in-process media plane could not do better, and `cmd/sfu` is what turned the assertion around.
 
 **Not done.**
 
-- **`cmd/sfu`, and with it calls that cross api nodes.** Media forwarding runs inside `cmd/api`, so a call belongs to the node it started on and a client whose socket landed elsewhere is refused. That refusal is asserted, not hoped for. The seam is `MediaNodes`, which names a node by address on every call — one shared media process plus an HTTP implementation of that port is the fix, and the hard part of it is the reverse channel: an offer the node produces has to reach whichever api node holds that participant's socket.
-- The trade being accepted meanwhile is the one ADR-0007 split these processes to avoid: CPU-bound forwarding and I/O-bound sockets scale together.
 - **Simulcast (CL-5)** — step 3, which the plan itself says to stop before under pressure.
 - **The measurements** NF-3 (join to first media), NF-4 (audio latency) and NF-14 (three concurrent 4-way calls), all of which want media between real clients first.
 
 **Two decisions, both forced by running it.**
 
-- **Renegotiation cannot be avoided.** A two-party call is asymmetric: the second to join receives the first's tracks in the answer to their own offer, and the first learns of the second's only if something offers the other way. The alternative — clients pre-declaring a receive slot per possible participant — removes renegotiation at the cost of a participant limit baked into every client and a demuxing scheme that varies by browser. So the server re-offers, and `Renegotiator` is the callback the signalling layer will fill in.
+- **Renegotiation cannot be avoided.** A two-party call is asymmetric: the second to join receives the first's tracks in the answer to their own offer, and the first learns of the second's only if something offers the other way. The alternative — clients pre-declaring a receive slot per possible participant — removes renegotiation at the cost of a participant limit baked into every client and a demuxing scheme that varies by browser. So the server re-offers, through a `Renegotiator` the signalling layer installs — one implementation calls the socket handler directly, the other publishes to every api node, and the media plane cannot tell which it has.
 - **A NACK is answered here, not relayed.** The packet is in this server's send buffer, and the publisher's sequence numbers mean something different. CL-6's retransmission therefore works because the server buffers, not because the publisher does. A PLI *is* relayed, because only a publisher can make a keyframe.
 
 Three findings:
@@ -300,6 +311,8 @@ Three findings:
 **Frontend increment:** call UI — start, ring, accept, decline, mute, participant tiles, hang up.
 
 **Verify:** two browsers plus the harness hold a group call. Drop 5% of packets and confirm video recovers rather than freezing beyond 2 seconds (CL-6). Throttle one participant with the phase-8 harness and assert the SFU switches that receiver's layer down and back up. Call join to first media under 2 seconds (NF-3). One-way audio latency under 200 ms (NF-4). Three concurrent 4-way calls on 4 vCPUs (NF-14).
+
+Of those: two browsers hold a call on one node and across two nodes, and a three-party call forwards in every direction under the harness. Keyframe recovery is measured at 21 ms against CL-6's two seconds, but *packet loss* is not — the harness can throttle and cannot yet drop. Layer switching needs simulcast. NF-3, NF-4 and NF-14 are unmeasured.
 
 ---
 
@@ -313,6 +326,19 @@ Three findings:
 - Rate limiting on send, handle search, and connect.
 - OpenTelemetry traces spanning HTTP, WebSocket and Kafka on one correlation identifier (NF-16).
 - Backpressure: what happens to a slow socket consumer, and what happens when Redis or Kafka is unavailable.
+- A service worker, so the browser client's offline cold start is genuinely offline. Noted in phase 6 and still owed: the database survives a restart, the page it is loaded by does not.
+- A dead-letter topic for records a consumer skips as permanently unprocessable. They are logged today, which is a record nobody reads.
+- **A flake in the media tests, bounded but not found.** Somewhere around one run in five, a three-party call ends with one participant receiving nothing.
+
+  What is known, and each of these cost a run to establish:
+
+  - **It is not the node work.** `go test -count=10 ./internal/calling/internal/sfu/` fails on the commit before any of it, and on the commit before phase 9's browser fix.
+  - **It is not one test.** Four different tests have been the victim across seven reproductions, which is what says it is not a test's own logic.
+  - **It presented as a hang, and that part is fixed.** Every reproduction before the fix sat at `<-gathered` in `Join` until Go's ten-minute panic. The server now waits ten seconds and answers with what it has, so the same flake costs 85 seconds and prints which participant received nothing, instead of 450 seconds and a goroutine dump. That is worth having on its own terms — an unbounded wait there is a client's join never returning — and it is the reason the rest of this list could be established at all.
+  - **It is not slow gathering.** With the wait bounded and logged, ten runs produced no timeout and no slow-gather warning, and still failed. So gathering completing is not the missing piece; something after it is.
+  - **One candidate, unproven.** The phase-8 stub drops an offer when its four-deep channel is full and reports success, so a lost offer leaves the server believing an exchange is in flight. The server's grace period now recovers that after fifteen seconds, which is longer than a test's patience. Worth testing before anything more elaborate.
+
+  Not chased further, because it is pre-existing, it is now loud instead of silent, and the cost of guessing at it is another hour like the one phase 9 already spent guessing at a symptom.
 
 **Verify:** a load test at target concurrency meets NF-1 and NF-2. Kill Redis: sends still succeed, delivery falls back to gap sync on reconnect. Kill Kafka: sends still succeed, the outbox drains on recovery, nothing is lost (NF-6). A deliberately slow client is disconnected rather than being allowed to consume unbounded memory.
 

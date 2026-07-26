@@ -31,6 +31,7 @@ graph TB
     HARNESS -->|"WebRTC media"| SFU
     WEB -.->|"signalling over WS"| API
     API -.->|"call control"| SFU
+    SFU -.->|"offers, to every api node"| API
 
     API -->|"read + write"| PG
     API -->|"publish + subscribe"| REDIS
@@ -66,6 +67,8 @@ Every write follows both, and confusing them is the mistake this design most wan
 **Ephemeral path** — Redis Pub/Sub, per account, subscribed only by the node holding that account's sockets. At-most-once and best-effort. Getting a message onto a screen *now* goes here.
 
 The ephemeral path is allowed to fail. When it does, the client notices a gap in sequence numbers and refetches from Postgres. That reconciliation is required for offline sync anyway, so it is one mechanism doing two jobs rather than a fallback bolted on ([ADR-0003](./adr/0003-postgres-is-truth-kafka-carries-events.md)).
+
+Call signalling is on neither. It is request and response between a client and the node holding its socket, plus one hop to `sfu` — and the offers coming back the other way, which are the one thing in the system that needs to reach a *particular* socket from a process that holds none ([ADR-0013](./adr/0013-media-node-broadcasts-its-offers.md)).
 
 ## Data ownership
 

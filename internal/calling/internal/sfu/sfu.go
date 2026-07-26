@@ -127,7 +127,13 @@ func New(options Options) (*Server, error) {
 // The alternative — having clients pre-declare a receive slot per possible participant and
 // filling them in place — removes renegotiation at the cost of a fixed participant limit
 // baked into every client and a demuxing scheme that depends on the browser. Not worth it.
-type Renegotiator func(ctx context.Context, callID, participantID, offer string)
+//
+// It returns an error because delivery can fail in a way that is worth retrying. When
+// signalling is in this process, failure means the participant has no socket and is about to
+// be cleaned up. When it is not, failure means no api node was listening — a media node that
+// has just started, or one whose subscribers are reconnecting — and the participant would
+// otherwise never learn of a joiner for the rest of the call.
+type Renegotiator func(ctx context.Context, callID, participantID, offer string) error
 
 // SetRenegotiator installs the callback used to re-offer to participants.
 //
@@ -166,6 +172,9 @@ type participant struct {
 	negotiating bool
 	// pending records that something changed while a renegotiation was in flight.
 	pending bool
+	// exchange numbers the offers sent to this participant, so that the timer which
+	// abandons an unanswered one cannot abandon its successor instead.
+	exchange int
 }
 
 // published is one forwarded track and what is needed to send feedback to its publisher.
@@ -254,10 +263,60 @@ func (s *Server) Join(callID, participantID, offer string) (string, error) {
 	if err := connection.SetLocalDescription(answer); err != nil {
 		return "", fmt.Errorf("set local description: %w", err)
 	}
-	<-gathered
+	s.waitForGathering(gathered, participantID)
 
 	return connection.LocalDescription().SDP, nil
 }
+
+// waitForGathering waits for ICE gathering, but not forever.
+//
+// Bounded because an unbounded wait here is a request that never returns, and the request is
+// a client's join arriving on the socket its whole session is on. Whatever the cause of a
+// gatherer that does not finish, holding the connection open until the client gives up is the
+// worst available answer.
+//
+// The cap is generous, and deliberately not NF-3's two seconds. Gathering binds a socket per
+// address on the host, and a machine with a docker bridge per project has ten of them — so a
+// tight cap does not enforce a latency budget, it silently truncates the candidate list and
+// trades a call that would have worked for one that fails fast. Being slow is recoverable and
+// gets logged; being short of the candidate that would have connected is not.
+//
+// There is a live case of a gatherer that never finishes: the media tests hit it roughly one
+// run in three, on a fresh connection, on a commit that predates any of the node work. That is
+// recorded in docs/plan.md phase 10 as a defect to find. This is not its fix — it is the
+// reason a defect like it costs a test run rather than a production node.
+func (s *Server) waitForGathering(gathered <-chan struct{}, participantID string) {
+	timer := time.NewTimer(gatheringTimeout)
+	defer timer.Stop()
+
+	started := time.Now()
+	select {
+	case <-gathered:
+		// Logged when it is slow enough to matter, because gathering time is otherwise
+		// invisible and it is the first thing to look at when a join is slow.
+		if slow := time.Since(started); slow > slowGathering {
+			s.logger.Warn("ice gathering was slow",
+				slog.String("participant", participantID), slog.Duration("took", slow))
+		}
+	case <-timer.C:
+		s.logger.Error("ice gathering did not complete; answering with what was gathered",
+			slog.String("participant", participantID), slog.Duration("waited", gatheringTimeout))
+	}
+}
+
+const (
+	// gatheringTimeout bounds the wait above.
+	//
+	// It has to stay comfortably below whatever deadline an api node puts on a join, or a
+	// gather that is slow but would have finished becomes a *failed* join rather than a slow
+	// one — the node gives up while this is still waiting, and the client is told no media
+	// node is available. See signallingTimeout in the nodes package, which is the other half
+	// of that pair. Five seconds against fifteen, and ten times any gathering measured here.
+	gatheringTimeout = 5 * time.Second
+	// slowGathering is when to say so. Above NF-3's two seconds for join to first media,
+	// which is the point at which gathering alone has spent the whole budget.
+	slowGathering = 2 * time.Second
+)
 
 // Answer applies a participant's answer to an offer this server sent.
 func (s *Server) Answer(callID, participantID, answer string) error {
@@ -434,6 +493,16 @@ func (s *Server) requestKeyframe(connection *webrtc.PeerConnection, ssrc uint32)
 
 // renegotiateWith offers a participant the tracks it has gained.
 func (s *Server) renegotiateWith(callID string, to *participant) {
+	s.offerTo(callID, to, 1)
+}
+
+// offerTo makes and delivers one offer, retrying a delivery that found nobody.
+//
+// The retry is bounded and short, and it is aimed at one thing: the window in which a media
+// node has an offer to send and no api node subscribed to send it through. That window exists
+// at startup and after a stream reconnects, and without a retry it costs a participant every
+// joiner for the rest of the call — silently, which is the part that makes it worth code.
+func (s *Server) offerTo(callID string, to *participant, attempt int) {
 	s.mutex.RLock()
 	renegotiate := s.renegotiate
 	s.mutex.RUnlock()
@@ -454,6 +523,8 @@ func (s *Server) renegotiateWith(callID string, to *participant) {
 		return
 	}
 	to.negotiating = true
+	to.exchange++
+	exchange := to.exchange
 	to.mutex.Unlock()
 
 	offer, err := to.connection.CreateOffer(nil)
@@ -467,16 +538,70 @@ func (s *Server) renegotiateWith(callID string, to *participant) {
 		s.failedNegotiation(to, "set local description", err)
 		return
 	}
-	<-gathered
+	s.waitForGathering(gathered, to.id)
+
+	// An offer that is never answered must not wedge the participant forever. It can be
+	// lost: the socket it was addressed to may have closed between the track arriving and
+	// the offer being made. Without this the flag stays set for the life of the call and the
+	// participant silently never receives another joiner.
+	time.AfterFunc(answerGrace, func() { s.abandon(callID, to, exchange) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), negotiationTimeout)
 	defer cancel()
-	renegotiate(ctx, callID, to.id, to.connection.LocalDescription().SDP)
+
+	if err := renegotiate(ctx, callID, to.id, to.connection.LocalDescription().SDP); err != nil {
+		s.failedNegotiation(to, "deliver offer", err)
+		if attempt >= deliveryAttempts {
+			s.logger.Error("an offer could not be delivered; a participant will not see a joiner",
+				slog.String("call", callID), slog.String("participant", to.id))
+			return
+		}
+		// A fresh offer rather than the same one again, because the connection's state was
+		// rolled back with the flag and the tracks may have changed since.
+		time.AfterFunc(deliveryRetryDelay, func() { s.offerTo(callID, to, attempt+1) })
+	}
 }
+
+// deliveryAttempts and deliveryRetryDelay bound the retry above: long enough to outlast an
+// offer stream reconnecting, short enough that a participant who really has gone is not
+// re-offered to for the rest of the call.
+const (
+	deliveryAttempts   = 5
+	deliveryRetryDelay = time.Second
+)
 
 // negotiationTimeout bounds how long delivering an offer may take. Short: the offer
 // travels over a socket the client is already holding, or it does not travel at all.
 const negotiationTimeout = 10 * time.Second
+
+// answerGrace is how long an offer may go unanswered before the next one is allowed.
+//
+// Generous, because the cost of being wrong differs by direction: too short and two
+// exchanges overlap, which is the wedge this whole mechanism exists to prevent, while too
+// long only delays a recovery that nothing was waiting on.
+const answerGrace = 15 * time.Second
+
+// abandon lets the next renegotiation proceed after an offer went unanswered.
+func (s *Server) abandon(callID string, to *participant, exchange int) {
+	to.mutex.Lock()
+	// Only this exchange. An answer has already cleared the flag, and a later offer owns
+	// it now — clearing it here would permit exactly the overlap being guarded against.
+	if !to.negotiating || to.exchange != exchange {
+		to.mutex.Unlock()
+		return
+	}
+	to.negotiating = false
+	again := to.pending
+	to.pending = false
+	to.mutex.Unlock()
+
+	s.logger.Warn("an offer went unanswered",
+		slog.String("call", callID), slog.String("participant", to.id))
+
+	if again {
+		s.renegotiateWith(callID, to)
+	}
+}
 
 func (s *Server) failedNegotiation(to *participant, what string, err error) {
 	to.mutex.Lock()

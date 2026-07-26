@@ -244,24 +244,34 @@ func (h *Handler) SocketClosed(ctx context.Context, session Session) {
 
 // Offer delivers a media node's offer to the participant it is for.
 //
-// Called by the SFU when a call gains a publisher: everyone already in it negotiated before
-// that track existed, and this is how they are told. A participant whose socket has gone is
-// dropped silently — they are about to be cleaned up anyway.
-func (h *Handler) Offer(_ context.Context, callID, participantID, offer string) {
+// Called when a call gains a publisher: everyone already in it negotiated before that track
+// existed, and this is how they are told. It is also called for participants on other api
+// nodes, because a media node in its own process broadcasts its offers rather than knowing
+// which socket is where — so "this is not mine" is the ordinary case and not a problem.
+func (h *Handler) Offer(_ context.Context, callID, participantID, offer string) error {
 	h.mutex.RLock()
 	session := h.sessions[participantID]
 	h.mutex.RUnlock()
 
 	if session == nil {
-		h.logger.Debug("no socket for a renegotiation",
+		h.logger.Debug("no socket here for a renegotiation",
 			slog.String("call", callID), slog.String("participant", participantID))
-		return
+		return ErrNoSocket
 	}
 
 	if err := session.Send(offerView{Type: "call.offer", CallID: callID, SDP: offer}); err != nil {
 		h.logger.Warn("send offer", slog.Any("error", err))
+		return fmt.Errorf("send offer: %w", err)
 	}
+	return nil
 }
+
+// ErrNoSocket means this process holds no connection for that participant.
+//
+// Reported rather than swallowed so the media plane can tell an undelivered offer from a
+// delivered one. What it means depends on where forwarding happens: in process, that the
+// client has gone; out of process, that this was somebody else's participant.
+var ErrNoSocket = errors.New("calling: no socket for that participant")
 
 func (h *Handler) remember(session Session) {
 	h.mutex.Lock()

@@ -19,3 +19,11 @@ _Avoid_: pending, dialing, alerting
 **Layer**:
 One of several quality renditions a participant publishes, so that each receiver can be sent the best one its connection will carry.
 _Avoid_: stream, quality, track, simulcast level
+
+**Media node**:
+The process forwarding one call's media. Named by address on every call, so a call says where its media is rather than assuming.
+_Avoid_: SFU node, server, relay, worker
+
+**Offer**:
+A description of what one side of a connection will send and receive. Either side may make one — the media node offers whenever a call gains a publisher, because whoever was already there negotiated before that track existed.
+_Avoid_: invite, request, renegotiation

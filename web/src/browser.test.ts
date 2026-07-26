@@ -26,6 +26,11 @@ const nodeBURL = process.env.COMMS_WEB_B ?? 'http://localhost:5174'
 const apiAURL = process.env.COMMS_API_A ?? 'http://localhost:8080'
 const apiBURL = process.env.COMMS_API_B ?? 'http://localhost:8081'
 
+// The media node, which both api nodes forward through. It holds the calls, so it is the
+// only place a count of them means anything — an api node reports zero because forwarding is
+// not what it does.
+const sfuURL = process.env.COMMS_SFU ?? 'http://localhost:8090'
+
 const passphrase = 'correct horse battery staple'
 const timeout = 30_000
 
@@ -1140,10 +1145,14 @@ function adler32(bytes: Buffer): number {
 // Phase 9: calls.
 //
 // Two pairs, deliberately. A pair on *one* node exercises the whole path — signalling over
-// the socket, forwarding, renegotiation, media on screen. A pair across *two* nodes shows
-// where that stops: media forwarding is in the api process, so a call belongs to the node it
-// started on and the other node refuses it rather than quietly starting a second one. That
-// refusal is the phase's honest boundary and it is asserted rather than described.
+// the socket, forwarding, renegotiation, media on screen. A pair across *two* nodes exercises
+// the thing that made media a separate process: both api nodes signal to one forwarding node,
+// so a call no longer belongs to whichever of them happened to start it.
+//
+// The second pair used to assert a refusal, because forwarding was in the api process and the
+// other node had no way to reach the call. That was the honest boundary at the time and it is
+// gone now; what remains of it is the diagnostic below, which reports the media node's own
+// numbers, because "each node holds a call of its own" is what the failure looked like.
 describe.skipIf(!live)('calls', () => {
   let browser: Browser
   let caller: Person
@@ -1220,14 +1229,14 @@ describe.skipIf(!live)('calls', () => {
         .catch(async () => {
           const banners = await person.page.locator('.error').allTextContents()
           const tiles = await person.page.locator('.tiles video').count()
-          // Two nodes each holding one call is the signature of the two browsers being in
-          // separate calls on separate media planes rather than in one call together.
-          const nodes = await Promise.all(
-            [apiAURL, apiBURL].map((url) => fetch(`${url}/health`).then((response) => response.json())),
-          )
+          // The media node's own numbers, because they name the two ways this fails. More
+          // than one call is two browsers in separate calls rather than one together — the
+          // shape of phase 9's worst bug. No offer subscribers is a forwarding node that
+          // cannot tell anyone about a new publisher, which presents as one-way media.
+          const media = await fetch(`${sfuURL}/health`).then((response) => response.json())
           throw new Error(
             `${name} has ${tiles} tiles and no remote video. errors: ${JSON.stringify(banners)}; ` +
-              `calls per node: ${nodes.map((node) => node.calls).join(', ')}`,
+              `media node: ${media.calls} calls, ${media.offer_subscribers} offer subscribers`,
           )
         })
     }
@@ -1250,23 +1259,30 @@ describe.skipIf(!live)('calls', () => {
     await caller.page.locator('.hang-up').click()
     await caller.page.waitForSelector('.call.idle', { timeout })
 
-    // CL-3 from outside: the last departure ended it, so the node holds nothing.
+    // CL-3 from outside: the last departure ended it, so nothing is being forwarded.
     //
-    // Asked of the api directly rather than through the page: only /v1 is proxied by the
-    // dev server, so a fetch for /health from inside the page returns the app's own HTML.
-    const held = await fetch(`${apiAURL}/health`).then((response) => response.json())
-    expect(held.calls).toBe(0)
+    // Asked of the media node, which is where a call now lives. Asking an api node would
+    // pass whatever happened, because an api node forwards nothing and says so.
+    //
+    // Fetched from the test process rather than the page: only /v1 is proxied by the dev
+    // server, so a fetch for /health from inside the page returns the app's own HTML.
+    const media = await fetch(`${sfuURL}/health`).then((response) => response.json())
+    expect(media.calls).toBe(0)
+
+    // Both api nodes are still subscribed to the offers it produces. A call that ended must
+    // not have taken the reverse channel with it — the next call needs it.
+    expect(media.offer_subscribers).toBeGreaterThanOrEqual(2)
   }, timeout * 2)
 
-  it('refuses to join a call held by another node, rather than starting a second one', async () => {
-    // The boundary of the in-process media plane, asserted. Media forwarding lives in the
-    // api process, so a call belongs to the node it started on — and a client whose socket
-    // landed elsewhere must be told, not quietly joined to a different call with the same
-    // identifier. That silent split is what this test exists to prevent: it looked like a
-    // working call to both people, with no media and no error.
+  it('carries media between browsers whose sockets are on different api nodes', async () => {
+    // What cmd/sfu is for, and the assertion that would have failed before it existed.
     //
-    // The fix that makes this pass properly is one shared media process, which is the
-    // cmd/sfu work phase 9 has not done. See docs/plan.md.
+    // These two people are on different api processes. Neither holds a media plane: they
+    // both signal to the forwarding node, so the call belongs to it and not to whichever of
+    // them the caller happened to reach. The hard half is the offer the *caller* needs when
+    // the joiner starts publishing — it is produced inside a process that holds no sockets
+    // at all, and reaches the caller's browser only because every api node subscribes to
+    // that node's offers and delivers the ones it has a socket for.
     await start(caller, elsewhere.handle)
     await caller.page.waitForSelector('.call.idle', { timeout })
     await caller.page.getByRole('button', { name: 'Start a call' }).click()
@@ -1276,21 +1292,37 @@ describe.skipIf(!live)('calls', () => {
     await elsewhere.page.click('.conversations button')
     await elsewhere.page.waitForSelector('.call.ringing', { timeout })
     await elsewhere.page.locator('.call.ringing button').click()
+    await elsewhere.page.waitForSelector('.call.joined', { timeout })
 
-    // Refused, and said so. The client is left able to try again rather than sitting in a
-    // call that carries nothing.
-    await elsewhere.page.waitForFunction(
-      () => document.querySelector('.error')?.textContent?.includes('media node') ?? false,
-      undefined,
-      { timeout },
-    )
+    for (const [name, person] of [
+      ['caller on node A', caller],
+      ['joiner on node B', elsewhere],
+    ] as const) {
+      await person.page
+        .waitForFunction(
+          () => {
+            const tiles = [...document.querySelectorAll<HTMLVideoElement>('.tiles video')]
+            return tiles.length >= 2 && tiles.some((video, index) => index > 0 && video.videoWidth > 0)
+          },
+          undefined,
+          { timeout: 20_000 },
+        )
+        .catch(async () => {
+          const banners = await person.page.locator('.error').allTextContents()
+          const media = await fetch(`${sfuURL}/health`).then((response) => response.json())
+          throw new Error(
+            `${name} has no remote video across nodes. errors: ${JSON.stringify(banners)}; ` +
+              `media node: ${media.calls} calls, ${media.offer_subscribers} offer subscribers`,
+          )
+        })
+    }
 
-    // And exactly one node is holding the call — the one that started it.
-    const nodes = await Promise.all(
-      [apiAURL, apiBURL].map((url) => fetch(`${url}/health`).then((response) => response.json())),
-    )
-    expect(nodes.map((node) => node.calls)).toEqual([1, 0])
+    // One call, on one media node, with both of them in it. Two calls here would be the
+    // silent split back again, wearing a different disguise.
+    const media = await fetch(`${sfuURL}/health`).then((response) => response.json())
+    expect(media.calls).toBe(1)
 
     await caller.page.locator('.hang-up').click()
+    await elsewhere.page.locator('.hang-up').click()
   }, timeout * 4)
 })

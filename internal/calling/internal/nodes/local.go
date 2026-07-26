@@ -1,14 +1,18 @@
 // Package nodes carries signalling to the SFU holding a call.
 //
-// One implementation so far, and it is in-process. That is a deployment decision rather
-// than a design one, and the seam is the point: MediaNodes is a port that names a node by
-// address on every call, so moving media out to its own binary (ADR-0007) is a second
-// implementation of this interface and nothing else. Nothing above here knows whether the
-// node is a goroutine or a machine.
+// Two implementations, and the choice between them is a deployment decision rather than a
+// design one. Local forwards in this process, which is what a development machine and every
+// test wants. Remote reaches a media node over HTTP (ADR-0007), which is what a deployment
+// wants, because forwarding is CPU-bound and holding sockets is not — they scale differently,
+// and one process means scaling both together.
 //
-// The trade being accepted meanwhile: media forwarding is CPU-bound and holding sockets is
-// not, so they scale differently and sharing a process means scaling both together. See
-// docs/plan.md phase 9.
+// Nothing above here knows which it has. MediaNodes names a node by address on every call, so
+// the second implementation was a package rather than a change, and the domain, the use cases
+// and the signalling are untouched by it.
+//
+// Media is the other side of Remote: the surface a forwarding process serves. It lives here,
+// beside its client, because the two must agree on a wire and the way a protocol goes wrong
+// when its ends are written apart is silence rather than an error.
 package nodes
 
 import (

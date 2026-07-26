@@ -7,6 +7,7 @@ package sfu_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"sync"
@@ -39,10 +40,15 @@ type direct struct {
 	callID        string
 	participantID string
 
+	// offers, and the lock that makes closing it safe.
+	//
+	// A sync.Once was here first, and it was not enough: it stops a second close but not a
+	// send racing the first one, which is the actual hazard — a participant leaves while a
+	// renegotiation is already in flight for them. The race detector found it once the
+	// server gained a retry, having tolerated it for a phase.
+	mutex  sync.Mutex
+	closed bool
 	offers chan string
-	// closeOnce guards the offers channel: a participant that left must not have an
-	// offer written to a closed channel by a renegotiation already in flight.
-	closeOnce sync.Once
 }
 
 func newDirect(server *sfu.Server, callID, participantID string) *direct {
@@ -62,7 +68,13 @@ func (d *direct) Join(_ context.Context, offer webrtc.SessionDescription) (webrt
 
 func (d *direct) Leave(context.Context) error {
 	d.server.Leave(d.callID, d.participantID)
-	d.closeOnce.Do(func() { close(d.offers) })
+
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	if !d.closed {
+		d.closed = true
+		close(d.offers)
+	}
 	return nil
 }
 
@@ -74,6 +86,12 @@ func (d *direct) Answer(_ context.Context, answer string) error {
 
 // offer is how the server's renegotiator reaches this signaller.
 func (d *direct) offer(sdp string) {
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	if d.closed {
+		return
+	}
+
 	select {
 	case d.offers <- sdp:
 	default:
@@ -99,13 +117,15 @@ func newRoom(t *testing.T) *room {
 	}
 
 	held := &room{server: server, signallers: make(map[string]*direct)}
-	server.SetRenegotiator(func(_ context.Context, _, participantID, offer string) {
+	server.SetRenegotiator(func(_ context.Context, _, participantID, offer string) error {
 		held.mutex.Lock()
 		signaller := held.signallers[participantID]
 		held.mutex.Unlock()
-		if signaller != nil {
-			signaller.offer(offer)
+		if signaller == nil {
+			return errors.New("nobody is signalling for that participant")
 		}
+		signaller.offer(offer)
+		return nil
 	})
 
 	t.Cleanup(server.Close)

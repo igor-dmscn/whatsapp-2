@@ -8,9 +8,13 @@ package calling_test
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -137,20 +141,34 @@ type harnessed struct {
 func newHarnessed(t *testing.T, permission permissive) *harnessed {
 	t.Helper()
 
-	db := testdb.Open(t)
-	notifier := &recordingNotifier{}
-
-	module, err := calling.New(db, permission, notifier, calling.Options{
+	// A real identifier, because the column is uuid.
+	return wire(t, testdb.Open(t), permission, id.New(), calling.Options{
 		Address: "test-node",
 		Logger:  slog.New(slog.DiscardHandler),
 	})
+}
+
+// wire builds one api node over a database, for one conversation.
+//
+// Separate from newHarnessed so that a test can build two of them over the same database,
+// which is what an api node being one of several means.
+func wire(
+	t *testing.T,
+	db *sql.DB,
+	permission permissive,
+	conversation string,
+	options calling.Options,
+) *harnessed {
+	t.Helper()
+
+	notifier := &recordingNotifier{}
+	module, err := calling.New(db, permission, notifier, options)
 	if err != nil {
 		t.Fatalf("wire calling: %v", err)
 	}
 	t.Cleanup(module.Close)
 
-	// A real identifier, because the column is uuid.
-	return &harnessed{module: module, notifier: notifier, conversation: id.New()}
+	return &harnessed{module: module, notifier: notifier, conversation: conversation}
 }
 
 // signaller carries a peer's negotiation over the frame handler, which is what a browser's
@@ -418,6 +436,162 @@ func TestTheLastToLeaveEndsTheCallAndReleasesTheNode(t *testing.T) {
 
 	if held.module.Calls() != 0 {
 		t.Fatalf("the node still holds %d calls", held.module.Calls())
+	}
+}
+
+// cluster is two api nodes and the one media node they share.
+type cluster struct {
+	first  *harnessed
+	second *harnessed
+	node   *calling.MediaNode
+}
+
+// newCluster wires two api nodes, one media node and one database.
+//
+// The shape a deployment has, and the shape that was impossible until media moved out of
+// process: two processes holding sockets, one process forwarding, and a call that belongs to
+// neither of the first two.
+func newCluster(t *testing.T) *cluster {
+	t.Helper()
+
+	db := testdb.Open(t)
+	quiet := slog.New(slog.DiscardHandler)
+
+	node, err := calling.NewMediaNode(calling.Options{Logger: quiet})
+	if err != nil {
+		t.Fatalf("wire media node: %v", err)
+	}
+	t.Cleanup(node.Close)
+
+	mux := http.NewServeMux()
+	node.Routes(mux)
+	served := httptest.NewServer(mux)
+	t.Cleanup(served.Close)
+
+	conversation := id.New()
+	options := calling.Options{MediaNodeURL: served.URL, Logger: quiet}
+
+	held := &cluster{
+		first:  wire(t, db, permissive{}, conversation, options),
+		second: wire(t, db, permissive{}, conversation, options),
+		node:   node,
+	}
+
+	// Both nodes subscribe to the offers the media node produces, exactly as cmd/api does.
+	// Waited for rather than assumed: an offer produced before anyone is subscribed is
+	// retried, so skipping this would test the retry instead of the delivery.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go held.first.module.Run(ctx)
+	go held.second.module.Run(ctx)
+	held.awaitSubscribers(t, 2)
+
+	return held
+}
+
+// awaitSubscribers waits until the media node reports that many api nodes are listening.
+func (c *cluster) awaitSubscribers(t *testing.T, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := c.node.OfferSubscribers()
+		if got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d api nodes subscribed to offers, want %d", got, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestACallCrossesTwoApiNodes is what cmd/sfu exists for.
+//
+// Before media moved out of process a call belonged to the api node that started it, and the
+// second participant — whose socket landed on the other node — was refused. Nothing about the
+// domain, the use cases or the signalling changed to fix that: a node was always named by
+// address on every call, and this is the second implementation of the port that names it.
+//
+// Both directions, because that is where the interesting half is. The joiner is answered by
+// the node it asked, but the participant who was already there has to be *offered* the new
+// track — and that offer is produced inside a process that has no sockets at all, so it
+// reaches the other api node's client only if the reverse channel works.
+func TestACallCrossesTwoApiNodes(t *testing.T) {
+	t.Parallel()
+	held := newCluster(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	alice := held.first.join(t, ctx, "alice")
+	bob := held.second.join(t, ctx, "bob")
+
+	// One call. The two api nodes agree because the database is where a call lives, and the
+	// media node is named in it rather than assumed.
+	if alice.callID != bob.callID {
+		t.Fatalf("two calls in one conversation: %s and %s", alice.callID, bob.callID)
+	}
+
+	if err := bob.peer.WaitForMedia(ctx, "video", "audio"); err != nil {
+		t.Fatalf("bob, on the second api node, received nothing: %v", err)
+	}
+	if err := alice.peer.WaitForMedia(ctx, "video", "audio"); err != nil {
+		t.Fatalf("alice received nothing — an offer from the media node did not reach the "+
+			"api node holding her socket: %v", err)
+	}
+
+	// The forwarding is where it should be: one call on the media node, and no transports on
+	// either api node. This is the assertion that would have caught phase 9's silent
+	// two-media-plane bug, stated positively.
+	if calls := held.node.Calls(); calls != 1 {
+		t.Fatalf("the media node holds %d calls, want 1", calls)
+	}
+	if participants := held.node.Participants(alice.callID); participants != 2 {
+		t.Fatalf("the call holds %d transports on the media node, want 2", participants)
+	}
+	if first, second := held.first.module.Calls(), held.second.module.Calls(); first+second != 0 {
+		t.Fatalf("the api nodes are forwarding %d and %d calls, want none of it", first, second)
+	}
+}
+
+// TestAnApiNodeThatCannotReachTheMediaNodeRefusesTheJoin.
+//
+// The failure that matters about splitting the processes: one of them can be missing. A join
+// that cannot reach a forwarding node must say so, because the alternative is a client that
+// believes it is in a call and receives nothing — which is exactly how phase 9's worst bug
+// presented, and it took an hour to find because nothing reported it.
+func TestAnApiNodeThatCannotReachTheMediaNodeRefusesTheJoin(t *testing.T) {
+	t.Parallel()
+
+	db := testdb.Open(t)
+	// A port nothing is listening on. Refused immediately rather than timing out, which is
+	// what a media node that has stopped looks like from here.
+	held := wire(t, db, permissive{}, id.New(), calling.Options{
+		MediaNodeURL: "http://127.0.0.1:1",
+		Logger:       slog.New(slog.DiscardHandler),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	client := newSocket(id.New(), id.New())
+	frame, err := json.Marshal(map[string]string{
+		"type": "call.join", "conversation_id": held.conversation, "sdp": "v=0\r\n",
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	err = held.module.HandleFrame(ctx, client, "call.join", frame)
+	if err == nil {
+		t.Fatal("a join succeeded with no media node to forward it")
+	}
+	if !strings.Contains(err.Error(), "media node") {
+		t.Fatalf("the error does not mention the media node: %v", err)
+	}
+	if held.module.Calls() != 0 {
+		t.Fatalf("the api node is forwarding %d calls", held.module.Calls())
 	}
 }
 

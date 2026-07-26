@@ -49,8 +49,17 @@ type Session interface {
 
 // Options are the choices a deployment makes about calling.
 type Options struct {
+	// MediaNodeURL is the forwarding process this node allocates calls to, as a base URL.
+	//
+	// Empty means forward in this process, which is what a development machine and every
+	// test wants. Set means media is out of process (ADR-0007), the forwarding node is
+	// shared, and a call therefore no longer belongs to whichever api node happened to
+	// start it — which is the whole point.
+	MediaNodeURL string
+
 	// Address is what this node is called in the calls it holds. Recorded on every call
 	// (CL-4), so it must be something another process could resolve once media moves out.
+	// Ignored when MediaNodeURL is set, because then the node has an address of its own.
 	Address string
 	// UDPPortMin and UDPPortMax bound the range media arrives on. A deployment needs a
 	// range somebody can open in a firewall; zero means let the operating system choose,
@@ -65,16 +74,20 @@ type Options struct {
 // Module is a wired Calling context.
 type Module struct {
 	handler *api.Handler
-	server  *sfu.Server
+	// server is the in-process media plane, and is nil when forwarding is out of process.
+	server *sfu.Server
+	// remote is the media node this process signals to, and is nil when forwarding is here.
+	// One of the two is always set; which one is the deployment's choice.
+	remote *nodes.Remote
 }
 
 // New wires the context.
 //
-// The media plane is in this process. That is a deployment decision and the seam is
-// deliberate: MediaNodes names a node by address on every call, so moving forwarding to its
-// own binary (ADR-0007) is one more implementation of that port and nothing else. The trade
-// being accepted meanwhile is that CPU-bound forwarding and I/O-bound sockets scale
-// together — see docs/plan.md phase 9.
+// Where media is forwarded is the one deployment choice this makes, and it is a choice
+// between two implementations of one port. In process, a call belongs to the api node that
+// started it and a client whose socket landed elsewhere cannot join it. Out of process, the
+// forwarding node is shared and that restriction goes away — at the cost of a second thing
+// to deploy and a reverse channel for the offers it produces.
 func New(
 	db *sql.DB,
 	conversations Conversations,
@@ -86,25 +99,35 @@ func New(
 		logger = slog.New(slog.DiscardHandler)
 	}
 
-	server, err := sfu.New(sfu.Options{
-		UDPPortMin: options.UDPPortMin,
-		UDPPortMax: options.UDPPortMax,
-		PublicIP:   options.PublicIP,
-		Logger:     logger,
-	})
-	if err != nil {
-		return nil, err //nolint:wrapcheck // already named where it happened.
-	}
+	module := &Module{}
 
-	address := options.Address
-	if address == "" {
-		address = "local"
+	var media domain.MediaNodes
+	if options.MediaNodeURL != "" {
+		module.remote = nodes.NewRemote(options.MediaNodeURL, logger)
+		media = module.remote
+	} else {
+		server, err := sfu.New(sfu.Options{
+			UDPPortMin: options.UDPPortMin,
+			UDPPortMax: options.UDPPortMax,
+			PublicIP:   options.PublicIP,
+			Logger:     logger,
+		})
+		if err != nil {
+			return nil, err //nolint:wrapcheck // already named where it happened.
+		}
+		module.server = server
+
+		address := options.Address
+		if address == "" {
+			address = "local"
+		}
+		media = nodes.NewLocal(address, server)
 	}
 
 	service := app.NewService(
 		postgres.NewCallRepository(db),
 		conversations,
-		nodes.NewLocal(address, server),
+		media,
 		notifier,
 		postgres.NewOutboxPublisher(db),
 		database.NewConn(db),
@@ -113,17 +136,40 @@ func New(
 		logger,
 	)
 
-	handler := api.NewHandler(service, logger)
+	module.handler = api.NewHandler(service, logger)
 
 	// The loop closed: the media plane produces offers when a call gains a publisher, and
 	// signalling delivers them to the participant they are for. Without this a call never
 	// gets past the joiner's own view — everyone already in it negotiated before the new
 	// track existed.
-	server.SetRenegotiator(func(ctx context.Context, callID, participantID, offer string) {
-		handler.Offer(ctx, callID, participantID, offer)
-	})
+	//
+	// Only for the in-process plane. A remote one publishes its offers to every api node
+	// instead, and Run is what receives them.
+	if module.server != nil {
+		module.server.SetRenegotiator(func(ctx context.Context, callID, participantID, offer string) error {
+			return module.handler.Offer(ctx, callID, participantID, offer)
+		})
+	}
 
-	return &Module{handler: handler, server: server}, nil
+	return module, nil
+}
+
+// Run receives offers from a remote media node, until ctx is done.
+//
+// Returns immediately when forwarding is in this process, where the media plane can call the
+// handler directly. Started as a goroutine by cmd/api, alongside the one Messaging runs for
+// the same reason: one subscription per process serves every socket it holds.
+func (m *Module) Run(ctx context.Context) {
+	if m.remote == nil {
+		return
+	}
+	m.remote.Offers(ctx, func(callID, participantID, offer string) {
+		// Every api node receives every offer, because the media plane knows a participant
+		// by device and not by which socket holds it. Most of them belong to somebody else's
+		// socket, and the error saying so is the ordinary case — there is nothing to report
+		// it to, and reporting it would be reporting that this node is not the one.
+		_ = m.handler.Offer(ctx, callID, participantID, offer)
+	})
 }
 
 // Frames is the socket frame family this context answers, for registration by cmd/api.
@@ -139,11 +185,23 @@ func (m *Module) SocketClosed(ctx context.Context, session Session) {
 	m.handler.SocketClosed(ctx, session)
 }
 
-// Calls reports how many calls this node is forwarding, for health reporting.
-func (m *Module) Calls() int { return m.server.Calls() }
+// Calls reports how many calls this process is forwarding, for health reporting.
+//
+// Zero when media is out of process, which is the truth rather than a gap: this process
+// holds sockets and no transports, and the count that matters is the media node's own.
+func (m *Module) Calls() int {
+	if m.server == nil {
+		return 0
+	}
+	return m.server.Calls()
+}
 
-// Close releases every transport this node holds.
-func (m *Module) Close() { m.server.Close() }
+// Close releases every transport this process holds.
+func (m *Module) Close() {
+	if m.server != nil {
+		m.server.Close()
+	}
+}
 
 // ids generates calling identifiers.
 type ids struct{}

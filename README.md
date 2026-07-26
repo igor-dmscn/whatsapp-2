@@ -2,7 +2,7 @@
 
 Real-time messaging, media sharing, and live audio/video calling. A Go backend with React and CLI clients, built as a reference implementation — the codebase is meant to be read, so the reasoning is committed alongside the code.
 
-**Status: phases 0–8 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, the transactional outbox with Kafka and projections, groups and channels with invite links, edits, deletes, replies and reactions, a terminal client, both clients persisting locally with offline search, photos and video uploaded straight to an object store and processed into thumbnails off the request path, and a media test harness that simulates twenty participants against a forwarding server. **Phase 9 is partly done** — the call lifecycle and a working selective-forwarding media plane, verified with the harness; call signalling, persistence, the call UI and simulcast are not. See [the plan](./docs/plan.md) for exactly what exists.
+**Status: phases 0–8 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, the transactional outbox with Kafka and projections, groups and channels with invite links, edits, deletes, replies and reactions, a terminal client, both clients persisting locally with offline search, photos and video uploaded straight to an object store and processed into thumbnails off the request path, and a media test harness that simulates twenty participants against a forwarding server. **Phase 9 is done except simulcast** — live calls between real browsers, both directions, signalled over the socket they already hold, with media forwarded by its own process so a call is joinable from any api node. Simulcast and the latency measurements are not done. See [the plan](./docs/plan.md) for exactly what exists.
 
 ## Running it
 
@@ -19,9 +19,13 @@ go run ./cmd/api   # then, in another terminal:
 make web           # browser client on http://localhost:5173
 ```
 
+`go run ./cmd/api` forwards call media itself, which is all one machine needs. Set
+`SFU_URL` and it signals to `go run ./cmd/sfu` instead — the configuration in which
+two api nodes can share a call.
+
 `make help` lists every target. `make e2e` runs the browser suite against two api
-nodes — see [web/README.md](./web/README.md) for what that proves and why it takes
-two.
+nodes and one media node — see [web/README.md](./web/README.md) for what that proves
+and why it takes more than one of each.
 
 ## Reading order
 

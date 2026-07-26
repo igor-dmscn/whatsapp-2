@@ -158,49 +158,59 @@ The notification carries no state. Variant URLs are signed and expire within the
 
 **What the bytes never touch.** The api process signs URLs and serves metadata. It reads no attachment on the way in and proxies none on the way out — the only process that ever holds attachment bytes is the worker, deriving variants off the request path.
 
-## 4. Starting a group call
+## 4. Joining a call
 
 Signalling is domain code and rides the existing WebSocket. Media never touches `api`.
+
+Two `api` nodes here, because that is the case worth drawing: the two people are on different processes and the call belongs to neither of them.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C1 as Caller
-    participant A as api
+    participant A1 as api (node A)
     participant PG as Postgres
     participant SFU as sfu
+    participant A2 as api (node B)
     participant C2 as Callee
 
-    C1->>A: start call { conversation }
-    A->>PG: may I join? (membership check)
-    A->>PG: INSERT call (ringing) — reject if one is active
-    A->>SFU: allocate call, expect participant
-    SFU-->>A: node address + ice credentials
-    A-->>C1: joined { call id, sfu address }
-    A-->>C2: incoming call (ringing)
+    C1->>A1: call.join { conversation, offer }
+    A1->>PG: may I join? (membership check)
+    A1->>PG: INSERT call (ringing) — refused if one is live
+    A1->>SFU: join { call, participant, offer }
+    SFU-->>A1: answer
+    A1-->>C1: call.joined { call, answer, participants }
+    A1-->>C2: call changed (via Redis, to whichever node holds them)
 
-    C1->>SFU: ICE + DTLS-SRTP
-    C1->>SFU: publish audio + video layers
+    C1->>SFU: ICE + DTLS-SRTP, then publish
     Note over C1,SFU: media bypasses api entirely
 
-    C2->>A: accept
-    A->>PG: participant joined, call active
-    A-->>C1: participant joined
-    C2->>SFU: ICE + DTLS-SRTP
-    SFU->>C2: forward caller's layers
-    SFU->>C1: forward callee's layers
+    C2->>A2: call.active { conversation }
+    A2-->>C2: call.current { ringing }
+    C2->>A2: call.join { conversation, offer }
+    A2->>PG: participant joined, call active
+    A2->>SFU: join { call, participant, offer }
+    SFU-->>A2: answer, carrying the caller's tracks
+    A2-->>C2: call.joined
 
-    loop while call is active
-        SFU->>SFU: estimate per-receiver bandwidth
-        SFU->>C2: switch layer, request keyframe on switch
-    end
+    Note over SFU: the callee starts publishing; the caller<br/>negotiated before that track existed
+    SFU-->>A1: offer for the caller (broadcast to every node)
+    SFU-->>A2: same offer (node B has no socket for it, drops it)
+    A1-->>C1: call.offer
+    C1->>A1: call.answer
+    A1->>SFU: answer
+    SFU->>C1: forward the callee's media
 
-    C2->>A: leave
-    A->>PG: participant left
-    Note over A,PG: last participant leaving ends the call
-    A->>SFU: release call
+    C2->>A2: call.leave
+    A2->>SFU: release the participant
+    A2->>PG: participant left
+    Note over A2,PG: the last participant leaving ends the call
 ```
+
+There is no separate *start*. A call exists because somebody joined a conversation that had none, so at most one call per conversation is not a rule that has to be enforced — no code path can create a second, and a partial unique index catches two people pressing call in the same instant.
 
 Because entitlement derives entirely from conversation membership, Calling holds no access rules of its own — the check at step 2 is the only authorisation in the flow. An SFU on a public address is its own relay, so there is no separate TURN server here ([ADR-0006](./adr/0006-custom-pion-sfu-with-simulcast.md)).
 
-The loop is the expensive part of the project. Layer selection needs receiver bandwidth estimation and a keyframe on every switch — without the keyframe the receiver shows corruption until the next natural one arrives.
+Steps 17 and 18 are the asymmetry that makes a two-person call work at all, and they are why the media node broadcasts ([ADR-0013](./adr/0013-media-node-broadcasts-its-offers.md)): the offer is produced by a process holding no sockets, for a client whose socket is on a node it cannot name.
+
+**Not built yet:** simulcast. Per-receiver bandwidth estimation, layer selection, and a keyframe on every switch — without the keyframe the receiver shows corruption until the next natural one arrives. It is the expensive part of the project and the plan says to stop before it under schedule pressure.

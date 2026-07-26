@@ -152,14 +152,19 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	mediaModule := media.New(db, attachments, messagingModule, nil, identityModule.Caller, logger)
 
 	// Calling asks Messaging one question — may this account join — and reaches clients
-	// through it. Media forwarding is in this process for now; the seam that lets it move
-	// out is Calling's MediaNodes port, not anything here.
+	// through it. Where media is forwarded is the one other choice, and it is made here.
 	callingModule, err := calling.New(db, messagingModule, messagingModule, calling.Options{
-		// This node's media address, and it must be distinct per process. Defaulting it
-		// to a shared literal is what made CL-4 fail silently: two api nodes both called
-		// themselves the same thing, so the check that a call belongs to *this* node
-		// passed on both, and a call started on one was quietly continued on the other's
-		// media plane. Two participants, two SFUs, no shared media, no error.
+		// The forwarding node, shared by every api node when it is set. Unset means media
+		// is forwarded in this process, which is what a single-process development machine
+		// wants — and which means a call belongs to the node that started it.
+		MediaNodeURL: config.EnvOr("SFU_URL", ""),
+
+		// This process's media address, used only when forwarding is in it, and it must be
+		// distinct per process. Defaulting it to a shared literal is what made CL-4 fail
+		// silently: two api nodes both called themselves the same thing, so the check that
+		// a call belongs to *this* node passed on both, and a call started on one was
+		// quietly continued on the other's media plane. Two participants, two SFUs, no
+		// shared media, no error.
 		Address:    config.EnvOr("SFU_ADDRESS", "local"+config.EnvOr("API_ADDR", ":8080")),
 		UDPPortMin: uint16(config.EnvIntOr("SFU_UDP_PORT_MIN", 0)),
 		UDPPortMax: uint16(config.EnvIntOr("SFU_UDP_PORT_MAX", 0)),
@@ -170,6 +175,10 @@ func run(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 	defer callingModule.Close()
+
+	// One subscription per process for the offers a remote media node produces, exactly as
+	// Messaging runs one for broadcasts. Returns immediately when forwarding is in process.
+	go callingModule.Run(ctx)
 
 	// Call signalling rides the socket the client already has (ADR-0004). Registered here
 	// because this is the only file allowed to know both contexts exist.

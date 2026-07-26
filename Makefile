@@ -32,6 +32,10 @@ lint: ## Vet, check architectural boundaries, and run golangci-lint if present
 		&& golangci-lint run \
 		|| echo "golangci-lint not installed, skipping (see .golangci.yml)"
 
+# Known flake, in the media tests rather than in this target: roughly one run in
+# five, a three-party call ends with one participant receiving nothing. Pre-existing,
+# reproduces on internal/calling/internal/sfu alone under -count=10, and names a
+# different test each time. Diagnosed as far as it has been in docs/plan.md phase 10.
 test: ## Run all tests
 	go test ./...
 
