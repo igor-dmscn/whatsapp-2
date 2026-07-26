@@ -215,7 +215,7 @@ Three findings:
 
 ---
 
-## Phase 8 — SFU test harness
+## Phase 8 — SFU test harness — **complete**
 
 **Goal:** the ability to test a media server, built before the media server.
 
@@ -228,6 +228,26 @@ This phase exists because browser tabs cannot load-test an SFU, and because writ
 - Bandwidth throttling, so layer switching can be provoked deliberately in phase 9.
 
 **Verify:** the harness joins a stub SFU, publishes, and asserts on what comes back. Twenty simulated peers run without the harness itself becoming the bottleneck — measured, because a harness that is slower than the thing it tests proves nothing.
+
+**Verified.** Seven tests against a stub that forwards RTP and does nothing else.
+
+- **Media crosses the server:** 159 video and 127 audio packets in 2.5 s, one keyframe detected, **zero gaps and zero duplicates**, first packet **103 ms** after joining.
+- **Twenty peers on twelve cores:** all twenty joined in **743 ms**, slowest first packet **163 ms**, 3877 packets across nineteen receivers, worst gap count **0**. Every receiver is checked individually, because a fan-out that thins out as it goes averages to something that looks fine.
+- **Keyframe on demand:** a receiver asks, and one arrives **21 ms** later. This is the mechanism CL-6's recovery and phase 9's layer switch both rest on.
+- **Throttling is observable downstream:** 180 packets in a window at 1.2 Mbit/s, 47 in the next at 150 kbit/s.
+- **A publisher does not receive its own media** — the failure that looks correct from one browser and doubles everyone's bandwidth.
+
+**Three decisions worth recording.**
+
+- **Signalling is one exchange, not trickle ICE.** A peer gathers, offers, and gets a complete answer, which a server on a known address with a known port range can always give. `Signaller` is a two-method interface with no transport in it: the stub uses HTTP, phase 9 uses the WebSocket that already exists (ADR-0004). Browsers will trickle because browsers do; what this fixes is that trickling stays optional.
+- **The media is synthetic, not a captured file.** An SFU never decodes what it forwards — it reads the VP8 payload descriptor for frame boundaries and keyframes and copies the rest — so the properties that matter are a valid frame tag, honest keyframe marking, and a steady rate. That buys a bitrate and framerate that are parameters rather than properties of a file, a keyframe on demand at an exact moment, and no binary fixture in the repository that nobody can inspect.
+- **Congestion is reported, not shaped.** `ReportBandwidth` sends REMB and `ReportLost` sends NACK, directly. Genuine throttling means a traffic shaper — privileged, platform-specific and flaky to require of a test — and what a server reacts to is the message. This exercises the server's *reaction*; measuring its *estimator* needs a real constrained path, which belongs with phase 10's load testing.
+
+Three findings, all from running it:
+
+- **A sender's RTCP must be read for its packets to exist.** The stub added forwarding tracks and never read the senders, so a receiver's keyframe request filled a queue nobody drained and the publisher never heard. It presents as "the harness cannot get a keyframe", nothing about feedback. The stub now relays PLI to the publisher's connection and SSRC — the mapping an SFU has to keep, because feedback travels the opposite way to media.
+- **Adding a track before setting the remote description negotiates cleanly and delivers nothing.** Pion creates a transceiver of its own, so the answer carries more media sections than the offer asked about. Offer first, then tracks, so each one claims a receive-only section the joiner already declared. Both peers reported `connected` throughout.
+- **A mutex added to fix a race deadlocked the suite.** `Next` held the lock and called `Interval`, which takes it — Go's mutex is not reentrant, and it presents as every test hanging rather than as anything to do with a lock. The race was real (`-race` found the source being read by the send loop while a PLI wrote it); the fix needed an unlocked private form rather than a lock that pretends to be reentrant.
 
 ---
 
