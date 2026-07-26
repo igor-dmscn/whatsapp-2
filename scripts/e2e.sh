@@ -81,4 +81,4 @@ waitFor http://localhost:5173/
 waitFor http://localhost:5174/
 
 echo "running browser suite"
-cd web && COMMS_E2E=1 npx vitest run src/browser.test.ts
+cd web && COMMS_E2E=1 npx vitest run src/browser.test.ts ${VITEST_ARGS:-}

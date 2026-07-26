@@ -11,6 +11,7 @@
 
 import { decodeBody, encodeBody } from './api'
 import type { Conversation, Entry, Reaction } from './api'
+import type { CallFrame } from './call'
 import type { LocalStore } from './store'
 import type { ReactionsBySequence } from './transcript'
 
@@ -54,6 +55,11 @@ export type SyncOptions = {
    *  Carries only the identifier, because the state and the URLs have to be fetched to
    *  be trusted — a frame is not a source of truth about something signed and expiring. */
   onAttachmentChanged?: (attachmentID: string) => void
+  /** onCallFrame receives call signalling, forwarded without being understood. */
+  onCallFrame?: (frame: CallFrame) => void
+  /** onCallChanged fires when a conversation's call changed and this client should ask
+   *  what it now is. */
+  onCallChanged?: (conversationID: string) => void
   /** open connects. Defaults to a real WebSocket at the current origin.
    *
    *  It takes no URL: the default computes one from location, and a caller that
@@ -511,6 +517,25 @@ export class Sync {
         this.onReaction(frame as reactionFrame)
         break
 
+      case 'call':
+        // The broadcast, which carries no state — only "a call in this conversation
+        // changed". Distinct from the signalling frames below: those are addressed to this
+        // client, this one went to everybody in the conversation. What a client does with it
+        // is ask, which is what makes a ring arrive without the frame having to be trusted.
+        this.options.onCallChanged?.((frame as unknown as { conversation_id: string }).conversation_id)
+        break
+
+      case 'call.joined':
+      case 'call.current':
+      case 'call.none':
+      case 'call.offer':
+      case 'call.left':
+        // Forwarded whole. Call signalling rides this socket because a client should hold
+        // one (ADR-0004), and this file deliberately does not learn what an SDP is — the
+        // protocol lives in call.ts, which can be driven without a socket at all.
+        this.options.onCallFrame?.(frame as unknown as CallFrame)
+        break
+
       case 'attachment':
         // Forwarded rather than stored. Nothing about the log changed, so no sequence
         // moves and no gap opens — the only thing to do is tell whoever is rendering
@@ -522,6 +547,20 @@ export class Sync {
         this.options.onFatal?.(new Error((frame as errorFrame).message))
         break
     }
+  }
+
+  /**
+   * sendFrame puts a frame on this connection, reporting whether there was one.
+   *
+   * For protocols that ride this socket without being part of it. The boolean matters to a
+   * caller: an offer that was never sent is not an offer waiting to be answered, and call
+   * signalling has to know the difference between "asked and waiting" and "not asked".
+   */
+  sendFrame(frame: unknown): boolean {
+    if (!this.socket || this.status !== 'live') return false
+
+    this.socket.send(JSON.stringify(frame))
+    return true
   }
 
   private resume(): void {

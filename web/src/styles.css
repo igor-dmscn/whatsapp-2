@@ -589,3 +589,72 @@ aside {
   max-width: 9rem;
   font-size: 0.75rem;
 }
+
+/* --- calls (phase 9) --- */
+
+.call {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.call.idle button,
+.call.ringing button {
+  align-self: flex-start;
+}
+
+.call.ringing {
+  gap: 0.3rem;
+}
+
+/* Auto-fit rather than a fixed column count: a call of two should not render as two
+   narrow strips beside two empty cells. */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 0.4rem;
+}
+
+.tile {
+  position: relative;
+  overflow: hidden;
+  background: #111827;
+  border-radius: 6px;
+  aspect-ratio: 4 / 3;
+}
+
+.tile video {
+  width: 100%;
+  height: 100%;
+  /* Cover, because a webcam's aspect ratio is not the tile's and letterboxing a call
+     wastes the space that matters most. */
+  object-fit: cover;
+}
+
+.tile .label {
+  position: absolute;
+  bottom: 0.2rem;
+  left: 0.3rem;
+  padding: 0 0.2rem;
+  font-size: 0.7rem;
+  color: #f9fafb;
+  background: rgb(0 0 0 / 45%);
+  border-radius: 3px;
+}
+
+.controls {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.controls .muted {
+  margin-right: auto;
+  font-size: 0.8rem;
+}
+
+.hang-up {
+  background: #b91c1c;
+}

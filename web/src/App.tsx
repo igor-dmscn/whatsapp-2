@@ -18,6 +18,7 @@ import type { Attachment, Conversation, DeliveryState, Invite, Member, Role, Ses
 import { Sync } from './sync'
 import { LocalStore, type Hit } from './store'
 import { resolve, summarise, type Message, type ReactionsBySequence } from './transcript'
+import { Call, type CallFrame, type CallState } from './call'
 
 // sessionStorage, not localStorage, and the difference matters here: sessionStorage
 // is per-tab, so two tabs are two independent logins. Sharing one session across
@@ -245,10 +246,38 @@ function Workspace({
           client.send(conversationID, clientEntryID, text, replyTo),
         onFatal: (failure) => fatal.current(failure),
         onAttachmentChanged: (attachmentID) => bump.current(attachmentID),
+        onCallFrame: (frame) => callFrame.current(frame),
+        onCallChanged: (conversationID) => callChanged.current(conversationID),
         store: store ?? undefined,
       }),
     [client, store],
   )
+
+  // The call, and the same ref trick for the same reason: the socket must not be rebuilt
+  // because a callback identity changed, and dropping it mid-call would look like the
+  // server losing everyone.
+  const [live, setLive] = useState<CallState | null>(null)
+  const callFrame = useRef<(frame: CallFrame) => void>(() => {})
+  const callChanged = useRef<(conversationID: string) => void>(() => {})
+  const call = useMemo(
+    () =>
+      new Call({
+        send: (frame) => {
+          if (!sync.sendFrame(frame)) setError('not connected — cannot reach the call')
+        },
+        onChange: setLive,
+        onError: (failure) => setError(describe(failure)),
+      }),
+    [sync],
+  )
+  callFrame.current = (frame) => call.apply(frame)
+  // The broadcast says only that something changed, so the client asks. That indirection is
+  // what makes a ring correct rather than merely fast: what is rendered came from a query
+  // this client made, not from a frame it was handed.
+  callChanged.current = (conversationID) => call.ask(conversationID)
+
+  // Leaving on unmount is what turns the camera light off when somebody closes the tab.
+  useEffect(() => () => void call.leave(), [call])
 
   useEffect(() => {
     // Hydrate first, connect second. NF-5 is exactly this ordering: what a previous
@@ -259,6 +288,15 @@ function Workspace({
   }, [sync])
 
   const snapshot = useSyncExternalStore(sync.subscribe, sync.getSnapshot)
+
+  // Asked on every conversation change, and only once connected, because the notification
+  // that a call started is ephemeral (ADR-0005): this is the durable answer to the same
+  // question, and it is what makes a ring survive a client that was reloading when it
+  // happened.
+  useEffect(() => {
+    if (!selected || snapshot.status !== 'live') return
+    call.ask(selected)
+  }, [call, selected, snapshot.status])
 
   const load = useCallback(async () => {
     try {
@@ -479,6 +517,14 @@ function Workspace({
                   onError={setError}
                 />
               )}
+              <CallPanel
+                call={live}
+                me={session.account.id}
+                handles={handles}
+                onStart={() => void call.join(selected).catch((failure) => setError(describe(failure)))}
+                onLeave={() => void call.leave()}
+                onMute={(muted) => call.mute(muted)}
+              />
               <Transcript
                 messages={messages}
                 reactions={reactions}
@@ -1075,6 +1121,105 @@ function Ticks({ state }: { state: DeliveryState }) {
     <span className={`ticks ticks-${state}`} title={state} aria-label={state}>
       {state === 'sent' ? '✓' : '✓✓'}
     </span>
+  )
+}
+
+/**
+ * CallPanel is the call, in whatever state it is.
+ *
+ * Four states and they are genuinely different things to a person: no call, a call ringing
+ * that you could answer, a call you are in, and a call in progress you have not joined. The
+ * temptation is to collapse the last two into "there is a call"; they are the difference
+ * between a button that says join and one that says leave.
+ */
+function CallPanel({
+  call,
+  me,
+  handles,
+  onStart,
+  onLeave,
+  onMute,
+}: {
+  call: CallState | null
+  me: string
+  handles: Record<string, string>
+  onStart: () => void
+  onLeave: () => void
+  onMute: (muted: boolean) => void
+}) {
+  if (!call) {
+    return (
+      <div className="call idle">
+        <button type="button" onClick={onStart}>
+          Start a call
+        </button>
+      </div>
+    )
+  }
+
+  if (!call.joined) {
+    // Somebody else's call, in progress. Who is in it is shown, because "join a call" and
+    // "join a call with these three people" are different decisions.
+    return (
+      <div className="call ringing">
+        <span className="who">
+          {call.participants
+            .map((participant) => handles[participant.account_id] ?? participant.account_id.slice(0, 8))
+            .join(', ')}{' '}
+          {call.state === 'ringing' ? 'is calling' : 'are in a call'}
+        </span>
+        <button type="button" onClick={onStart}>
+          Join
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="call joined" aria-label="Call in progress">
+      <div className="tiles">
+        {/* Muted and playsInline on the local tile, always: a browser that plays your own
+            microphone back to you produces feedback, and a mobile browser that does not get
+            playsInline takes the video fullscreen. */}
+        <Tile stream={call.local} label={handles[me] ?? 'you'} muted />
+        {[...call.remote.entries()].map(([id, stream]) => (
+          <Tile key={id} stream={stream} label="" muted={false} />
+        ))}
+      </div>
+      <div className="controls">
+        <span className="muted">
+          {call.state === 'ringing' ? 'ringing…' : `${call.participants.length} in the call`}
+        </span>
+        <button type="button" onClick={() => onMute(!call.muted)}>
+          {call.muted ? 'Unmute' : 'Mute'}
+        </button>
+        <button type="button" className="hang-up" onClick={onLeave}>
+          Hang up
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** Tile is one participant's video.
+ *
+ *  A ref rather than a src, because a MediaStream is attached to an element rather than
+ *  addressed by URL — and attaching it in an effect is what keeps React from being asked to
+ *  render an object it cannot serialise. */
+function Tile({ stream, label, muted }: { stream: MediaStream | null; label: string; muted: boolean }) {
+  const element = useRef<HTMLVideoElement>(null)
+
+  useEffect(() => {
+    if (element.current && element.current.srcObject !== stream) {
+      element.current.srcObject = stream
+    }
+  }, [stream])
+
+  return (
+    <div className="tile">
+      <video ref={element} autoPlay playsInline muted={muted} />
+      {label && <span className="label">{label}</span>}
+    </div>
   )
 }
 

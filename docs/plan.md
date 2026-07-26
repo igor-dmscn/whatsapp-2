@@ -269,14 +269,16 @@ Step 2 is a shippable product on its own. If schedule pressure arrives, stop aft
 - **The call lifecycle**, as an aggregate with 11 tests. CL-2 and CL-3 are rules of the model: a second presence makes a call active, and the last departure ends it terminally. A participant is per device, because one person on a laptop and a phone is two transports and one tile. Joining twice from a device is idempotent.
 - **The media plane** — `internal/calling/internal/sfu` — with 6 tests driven by the phase-8 harness. A three-party call forwards in every direction in **0.44 s**. A keyframe request reaches the publisher in **21 ms**, against CL-6's two seconds. Two calls on one node cannot hear each other. A departing participant's transport is released and an empty call is forgotten. Race-clean under `-race`.
 
-**Not done.** Named precisely, because "phase 9" is not one thing:
+- **Signalling over the existing WebSocket** (ADR-0004), with 6 integration tests against real Postgres and the real media plane. Messaging delegates frame families it does not own, so it carries call traffic without learning what a call is. There is no *start* operation: a call exists because somebody joined a conversation that had none, so CL-2 falls out — no code path could create a second, and a partial unique index catches two people pressing call at once. CL-1 is one question asked of Messaging. CL-3 fires on the last departure, whether that was a leave frame or a socket that closed.
+- **Persistence**: migration 00009, one row per presence rather than per device, so a rejoin does not erase the record of who was in a call.
+- **The call UI**: start, ring, join, mute, hang up, participant tiles. Four states, because "a call you are in" and "a call in progress you have not joined" are the difference between a button that says leave and one that says join. 4 browser tests across two browsers on two nodes: the ring crosses nodes, joining works, mute is local, and hanging up ends the call — asserted against `/health` reporting zero calls on the node.
 
-- Signalling over the existing WebSocket, and the `call.*` frames it would carry. The SFU's interface exists and is exercised in-process; nothing carries it to a browser yet.
-- Persistence for calls — there is no migration and no repository, so the aggregate is not yet loadable.
-- The `MediaNodes` and `Conversations` ports are declared and unimplemented, so entitlement from membership (CL-1) is designed and not wired.
-- `cmd/sfu`, and the api-to-node hop.
-- The frontend call UI.
-- Simulcast (CL-5) — step 3, which the plan itself says to stop before under pressure.
+**Not done.**
+
+- **Media between two browsers.** One cause, not two: whichever side needs the server to re-offer does not get media, and which side that is varies between runs depending on whether the caller's tracks reached the node before the callee joined. The server re-offers correctly — `internal/calling`'s two-way test and the SFU's three-party test both assert media arriving at whoever joined first, through the same frame handler the UI talks to. So the fault is a browser failing to answer a server-initiated offer, and it is not diagnosed. Recorded as an `it.fails` browser test rather than skipped, so the day it works the suite goes red.
+- **`cmd/sfu`.** Media forwarding runs inside `cmd/api`. That is a deployment decision and the seam is deliberate: `MediaNodes` names a node by address on every call, so moving it out is one more implementation of that port. The trade being accepted meanwhile is that CPU-bound forwarding and I/O-bound sockets scale together, which ADR-0007 split them to avoid.
+- **Simulcast (CL-5)** — step 3, which the plan itself says to stop before under pressure.
+- **The measurements** NF-3 (join to first media), NF-4 (audio latency) and NF-14 (three concurrent 4-way calls), all of which want media between real clients first.
 
 **Two decisions, both forced by running it.**
 
