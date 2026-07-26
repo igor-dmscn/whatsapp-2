@@ -168,7 +168,7 @@ The client gained `web/src/transcript.ts` — a pure function turning entries in
 
 **Verified.** Cold start rendered the conversation list in **255 ms** against NF-5's 500. Search works with the api unreachable. A send that fails is flushed on the next connection with its original identifier, arriving exactly once, in both clients. And the cross-client check runs the CLI's `-sync` and `-search` against the same account the browser is signed in as, comparing four queries.
 
-**One scope limit, stated rather than hidden.** The browser test cuts `/v1`, not the whole network. A browser needs the network to fetch the document and its scripts, so a *fully* offline cold start requires the app shell to be cached by a service worker — which does not exist yet and is production-build work. What is verified is this phase's part: with the api answering nothing, the screen is drawn from local storage. The service worker belongs in phase 10.
+**One scope limit, stated rather than hidden — and since closed.** This phase's browser test cuts `/v1`, not the whole network, because a browser needs the network to fetch the document and its scripts; a *fully* offline cold start needs the app shell cached by a service worker. What this phase verified is its own part: with the api answering nothing, the screen is drawn from local storage. Phase 10 added the service worker and the test that cuts everything, which renders in 125 ms.
 
 Four findings:
 
@@ -401,7 +401,13 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
   **Redis unreachable: sends still succeed.** Verified against a client pointed at a closed port, which exercises every Redis-dependent path at once — the broadcast, presence, and the rate limiter, which is designed to fail open and would otherwise refuse everything the moment the cache went away. Delivery falls back to gap sync, which is what ADR-0005 and NF-9 already say it must.
 
   **Kafka unreachable** was already covered by phase 3: an entry and its outbox row commit together, a failed publish leaves rows to retry, and stopping the relay delays events rather than losing them (NF-6).
-- A service worker, so the browser client's offline cold start is genuinely offline. Noted in phase 6 and still owed: the database survives a restart, the page it is loaded by does not.
+- ~~A service worker, so the browser client's offline cold start is genuinely offline.~~ **Done.** Phase 6 made the *data* survive being offline and said plainly that the page did not: its test cut `/v1` and left the document and scripts loading from the network, because a browser needs the network to fetch them. A **fully offline cold start now renders in 125 ms** — faster than the `/v1`-only case at 289 ms, because the shell comes from cache rather than from a dev server.
+
+  Runtime caching, not a precache manifest, and not a plugin. A manifest means a build step, a generated list of hashed filenames, and a worker that behaves differently in development from production — which is the kind of difference discovered on the day it matters. Network-first, so being online always means being current and a deploy is picked up on the next load.
+
+  Registered in development too, against the usual advice, for a reason: the browser suite runs against a dev server, so registering only in production would make the one thing this exists for untestable. A capability nobody can test is a capability nobody should claim.
+
+  **`/v1` is never cached**, and that is the most important line in the worker. The client's correctness rests on knowing whether the server answered: a cached API response would make it believe it had synced when it had not, and a stale conversation list served as fresh is worse than no answer at all.
 
 - **A flake in the media tests. Found, and it was the same bug NF-14 exposed** — worth recording because of how it was found, which was not by looking for it.
 

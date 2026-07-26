@@ -725,12 +725,10 @@ describe.skipIf(!live)('local persistence and search', () => {
   it('renders from local storage on a cold start with the api unreachable', async () => {
     // NF-5, and the ordering that makes it possible: hydrate, then connect.
     //
-    // Only /v1 is cut, not the whole network. A browser needs the network to fetch the
-    // document and its scripts, so a *fully* offline cold start requires the app shell to
-    // be cached by a service worker — which this does not have yet, and which is
-    // production-build work (noted in the plan). What is under test here is the part that
-    // is this phase's: with the api answering nothing, the conversation list and the
-    // messages come from storage.
+    // Only /v1 is cut here, which isolates one claim: with the api answering nothing, the
+    // conversation list and the messages come from storage. The document and its scripts
+    // still load from the network, so this says nothing about the app shell — that is the
+    // next test's job, and until phase 10 added a service worker it was not possible at all.
     // The snapshot is debounced, so the reload has to come after it has landed.
     // Production has a pagehide flush for this; a test that reloaded inside the debounce
     // window would be asserting against a store the app had not finished writing.
@@ -769,6 +767,57 @@ describe.skipIf(!live)('local persistence and search', () => {
       // failing, the screen is drawn from storage.
     } finally {
       await person.context.unroute('**/v1/**')
+    }
+  }, timeout * 3)
+
+  it('starts cold with the whole network down, not just the api', async () => {
+    // The claim phase 6 could not make and phase 10's service worker exists for. The test
+    // above cuts /v1 and leaves the document and scripts loading normally; this cuts
+    // *everything*, which is what a person with no connection actually has.
+    //
+    // The worker has to have been installed and to have seen the shell go past, so the
+    // first load must have happened online — which it did, several tests ago. Waited for
+    // rather than assumed, because registration is asynchronous and a reload that races it
+    // would fail for a reason that has nothing to do with being offline.
+    await person.page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined))
+
+    // A second online load, so the shell and its assets are in the cache under the URLs the
+    // reload will ask for. Network-first means the first visit populates nothing until it
+    // completes, and the visit that installed the worker was not served by it.
+    await person.page.reload()
+    await person.page.waitForSelector('.conversations button', { timeout })
+    await person.page.waitForTimeout(500)
+
+    await person.context.setOffline(true)
+    try {
+      const started = Date.now()
+      await person.page.reload()
+
+      // The document came from the cache, the scripts came from the cache, and the data
+      // came from SQLite. Nothing on this path touched the network.
+      await person.page.waitForFunction(
+        () => document.querySelectorAll('.conversations button').length > 0,
+        undefined,
+        { timeout },
+      )
+      const elapsed = Date.now() - started
+
+      await person.page.click('.conversations button')
+      await person.page.waitForFunction(
+        () => document.querySelectorAll('.transcript li').length === 2,
+        undefined,
+        { timeout },
+      )
+
+      // eslint-disable-next-line no-console
+      console.log(`fully offline cold start rendered in ${elapsed}ms`)
+
+      // And the client knows it is offline rather than pretending otherwise, which matters:
+      // a client that rendered from cache and claimed to be live would be lying about
+      // whether what is on screen is current.
+      await person.page.waitForSelector('.status-offline', { timeout })
+    } finally {
+      await person.context.setOffline(false)
     }
   }, timeout * 3)
 
