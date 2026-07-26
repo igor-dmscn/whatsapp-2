@@ -110,13 +110,21 @@ func (s *Service) StartDirect(ctx context.Context, initiator, other domain.Accou
 		s.publish(ctx, membership.TakeEvents())
 	}
 
-	// Tell the other account's node to start listening, or nothing this
-	// conversation produces will arrive live until they reconnect.
-	if err := s.broadcaster.NotifyConversationStarted(ctx, other, conversation.ID()); err != nil {
-		logging.With(ctx, s.logger).Warn("notify conversation started",
-			slog.String("conversation_id", string(conversation.ID())),
-			slog.Any("error", err),
-		)
+	// Tell both accounts' nodes to start listening, or nothing this conversation
+	// produces will arrive live until they reconnect.
+	//
+	// Both, including the initiator: a socket authenticated before this call has no
+	// membership to resume from and so was never subscribed. Notifying only the
+	// recipient leaves the person who started the conversation the one who cannot
+	// see replies to it — and every other device they have open in the same state.
+	for _, accountID := range []domain.AccountID{initiator, other} {
+		if err := s.broadcaster.NotifyConversationStarted(ctx, accountID, conversation.ID()); err != nil {
+			logging.With(ctx, s.logger).Warn("notify conversation started",
+				slog.String("conversation_id", string(conversation.ID())),
+				slog.String("account_id", string(accountID)),
+				slog.Any("error", err),
+			)
+		}
 	}
 
 	return conversation, nil

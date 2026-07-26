@@ -804,6 +804,37 @@ func TestAConversationStartedWhileConnectedDeliversLive(t *testing.T) {
 	}
 }
 
+func TestTheInitiatorOfAConversationAlsoReceivesLive(t *testing.T) {
+	// The mirror of the test above, and the case that was wrong: notifying only the
+	// recipient left the person who *started* a conversation unable to see replies
+	// to it. Their socket authenticated before the conversation existed, so resume
+	// found no membership and subscribed to nothing — and nothing afterwards told
+	// it otherwise. Found by two browsers in web/src/browser.test.ts, which is what
+	// that suite is for.
+	tokens := newFakeAuthenticator()
+	initiator := newNode(t, tokens)
+	other := newNode(t, tokens)
+
+	ana, bruno := newAccountID(), newAccountID()
+	anaToken, brunoToken := tokens.issue(ana), tokens.issue(bruno)
+
+	client := initiator.dial(t)
+	client.authenticate(anaToken)
+	if gaps := client.resume(nil); len(gaps) != 0 {
+		t.Fatalf("a new account has gaps: %v", gaps)
+	}
+
+	// Ana starts the conversation on her own already-connected socket, then Bruno
+	// replies from the other node.
+	conversation := initiator.startDirect(anaToken, bruno)
+	other.send(brunoToken, conversation.ID, "replying to you")
+
+	frame := client.readOfType("entry")
+	if frame["conversation_id"] != conversation.ID {
+		t.Errorf("conversation = %v, want %s", frame["conversation_id"], conversation.ID)
+	}
+}
+
 func TestNoDeliveryToAccountsOutsideTheConversation(t *testing.T) {
 	tokens := newFakeAuthenticator()
 	node := newNode(t, tokens)
