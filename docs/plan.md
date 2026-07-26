@@ -46,7 +46,7 @@ Requirement IDs (`MS-3`, `NF-7`, …) refer to [requirements.md](./requirements.
 
 ---
 
-## Phase 2 — The log, the socket, and sync
+## Phase 2 — The log, the socket, and sync — **complete**
 
 **Goal:** two people exchange messages in real time, and nothing is lost when the connection drops. This is the heart of the system.
 
@@ -62,6 +62,15 @@ Scope is deliberately narrowed to **direct conversations only**. Groups and chan
 **Frontend increment:** login screen, one conversation, send and receive. In-memory state only — persistence is phase 6. Ugly is fine; wired correctly is not optional.
 
 **Verify:** two browser sessions exchange messages live. Kill the socket mid-conversation, send from the other side, reconnect — the gap fills and no entry is missing or duplicated. Send the same client identifier twice and assert one entry with one sequence number. Run two `api` nodes and confirm delivery across them.
+
+**Verified by** `make e2e` — two real browsers on two api nodes, all four claims asserted rather than observed. The client's own rules are covered separately and hermetically in `web/src/sync.test.ts`, and the contract both clients implement is written down in [client-sync.md](./client-sync.md).
+
+Two bugs came out of it, neither visible to the Go suite as it stood:
+
+- The server told only the *recipient* of a new conversation to start listening, so whoever started one could not see replies until they reconnected. Fixed, and now covered by `TestTheInitiatorOfAConversationAlsoReceivesLive`.
+- A callback with an unstable identity rebuilt the client's socket on ordinary re-renders, dropping the connection and every entry held in it — indistinguishable, from the outside, from the server losing messages.
+
+That is what this phase's frontend increment was for. Neither bug was reachable by writing more backend tests.
 
 ---
 

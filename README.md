@@ -2,7 +2,7 @@
 
 Real-time messaging, media sharing, and live audio/video calling. A Go backend with React and CLI clients, built as a reference implementation — the codebase is meant to be read, so the reasoning is committed alongside the code.
 
-**Status: phases 0–2 complete** — accounts, conversations, the entry log, WebSocket sync and cross-node delivery. Phase 2's React increment is next. See [the plan](./docs/plan.md).
+**Status: phases 0–2 complete** — accounts, conversations, the entry log, WebSocket sync, cross-node delivery, and a browser client that signs in and holds a conversation. Phase 3 is next. See [the plan](./docs/plan.md).
 
 ## Running it
 
@@ -12,12 +12,16 @@ Requires Go 1.26 and Docker.
 cp .env.example .env
 make up        # Postgres, Redis, Kafka, MinIO — returns when all are healthy
 make migrate   # apply schema
-make check     # lint + tests
+make check     # lint + tests, backend and frontend
 make build     # binaries into bin/
+
+go run ./cmd/api   # then, in another terminal:
+make web           # browser client on http://localhost:5173
 ```
 
-`make help` lists every target. The three binaries currently start, log and shut
-down on SIGTERM; they gain behaviour from phase 1 onward.
+`make help` lists every target. `make e2e` runs the browser suite against two api
+nodes — see [web/README.md](./web/README.md) for what that proves and why it takes
+two.
 
 ## Reading order
 
@@ -26,9 +30,10 @@ If you are new to this repository, in this order:
 1. **[Context map](./CONTEXT-MAP.md)** — the four bounded contexts and how they relate. Start here; the rest of the docs use its vocabulary precisely.
 2. **[Architecture](./docs/architecture.md)** — containers, the durable and ephemeral paths, data ownership, layering.
 3. **[Flows](./docs/flows.md)** — sequence diagrams for sending, reconnect sync, media processing and call setup.
-4. **[Requirements](./docs/requirements.md)** — functional and non-functional, written to be testable.
-5. **[Plan](./docs/plan.md)** — eleven phases with verification criteria.
-6. **[ADRs](./docs/adr/)** — why each hard-to-reverse decision was made, including what was rejected.
+4. **[Client sync contract](./docs/client-sync.md)** — what every client must do to not lose messages. Read before touching either client.
+5. **[Requirements](./docs/requirements.md)** — functional and non-functional, written to be testable.
+6. **[Plan](./docs/plan.md)** — eleven phases with verification criteria.
+7. **[ADRs](./docs/adr/)** — why each hard-to-reverse decision was made, including what was rejected.
 
 ## Glossary
 
@@ -62,4 +67,5 @@ These surprise people, so they are stated here rather than left to be discovered
 - **Kafka and Redis are both present on purpose.** Redis Pub/Sub delivers to sockets and is allowed to drop messages; clients recover by detecting gaps in sequence numbers. ([ADR-0005](./docs/adr/0005-redis-pubsub-for-socket-fanout.md))
 - **Nothing in the log is ever modified.** Edits and deletes append revisions, because clients sync strictly forward and an in-place edit would be invisible to any client that had already passed it. ([ADR-0008](./docs/adr/0008-mutations-are-log-entries.md))
 - **CQRS applies to Messaging only, and without event sourcing.** Elsewhere it would be ceremony.
+- **The clients are trusted to detect their own missing messages.** The server does not track what each device holds; a client resumes from the highest sequence it has with no hole below it, and the server answers with what is missing. ([client sync contract](./docs/client-sync.md))
 - **The SFU is ours, built on Pion.** The expensive choice, made because the media path is the part of this system most worth learning from. ([ADR-0006](./docs/adr/0006-custom-pion-sfu-with-simulcast.md))
