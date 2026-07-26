@@ -104,6 +104,18 @@ type AttachmentMessage struct {
 	AttachmentID   string `json:"attachment_id"`
 }
 
+// CallMessage tells clients a conversation's call changed, and carries no state.
+//
+// The same shape and the same reasoning as an attachment change: what a client needs is to
+// ask again, and a frame carrying participants would be stale the moment somebody joined.
+// This is what makes a phone ring — and it is allowed to fail, because the durable answer to
+// "is there a call" is a query the client can make itself (ADR-0005).
+type CallMessage struct {
+	Type           string `json:"type"`
+	ConversationID string `json:"conversation_id"`
+	CallID         string `json:"call_id"`
+}
+
 // ControlMessage tells a node something about an account rather than a
 // conversation.
 type ControlMessage struct {
@@ -175,6 +187,26 @@ func (b *RedisBroadcaster) AttachmentChanged(ctx context.Context, conversationID
 
 	if err := b.client.Publish(ctx, entriesChannel(domain.ConversationID(conversationID)), encoded).Err(); err != nil {
 		return fmt.Errorf("publish attachment change: %w", err)
+	}
+	return nil
+}
+
+// CallChanged is how Calling reaches connected clients.
+//
+// On the conversation's channel, so a call announces itself to exactly the people entitled to
+// join it, at the cost of one publish however many that is.
+func (b *RedisBroadcaster) CallChanged(ctx context.Context, conversationID, callID string) error {
+	encoded, err := json.Marshal(CallMessage{
+		Type:           "call",
+		ConversationID: conversationID,
+		CallID:         callID,
+	})
+	if err != nil {
+		return fmt.Errorf("encode call broadcast: %w", err)
+	}
+
+	if err := b.client.Publish(ctx, entriesChannel(domain.ConversationID(conversationID)), encoded).Err(); err != nil {
+		return fmt.Errorf("publish call change: %w", err)
 	}
 	return nil
 }

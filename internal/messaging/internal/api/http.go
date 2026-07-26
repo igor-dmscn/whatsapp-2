@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"comms/internal/messaging/internal/app"
@@ -26,6 +27,34 @@ import (
 // does not depend on Identity, so cmd/api supplies this.
 type CallerResolver func(ctx context.Context) (accountID string, deviceID string)
 
+// FrameHandler takes socket frames Messaging does not own.
+//
+// The mechanism behind ADR-0004's one socket per client: a second context can carry its own
+// protocol over the connection a client already has, without Messaging learning what that
+// protocol means. Registered per family — everything before the first dot.
+type FrameHandler interface {
+	// HandleFrame is given the raw frame, so the handler decodes its own shapes. Returning
+	// an error sends the client an error frame and leaves the connection open: a call that
+	// cannot be joined must not cost somebody their messages.
+	HandleFrame(ctx context.Context, session Session, frameType string, raw []byte) error
+
+	// SocketClosed lets a handler clean up after a client that vanished. A crashed tab is
+	// a participant who is gone whether or not it said so.
+	SocketClosed(ctx context.Context, session Session)
+}
+
+// Session is what a delegated handler may do with the connection it was given.
+//
+// Deliberately narrow: who is on it, and how to reply. A handler with the whole Connection
+// could change what the client is subscribed to, which is Messaging's business alone.
+type Session interface {
+	AccountID() string
+	DeviceID() string
+	// Send writes a frame to this connection. Non-blocking; a socket too far behind is
+	// closed rather than allowed to grow memory on the server.
+	Send(frame any) error
+}
+
 // Handler serves the messaging endpoints.
 type Handler struct {
 	service        *app.Service
@@ -34,6 +63,20 @@ type Handler struct {
 	caller         CallerResolver
 	logger         *slog.Logger
 	allowedOrigins []string
+
+	// frameHandlers is what other contexts registered, by family.
+	frameMutex    sync.RWMutex
+	frameHandlers map[string]FrameHandler
+}
+
+// RegisterFrames routes a family of socket frames to a handler.
+//
+// Called at wiring time in cmd/api, which is the only place allowed to know that two
+// contexts exist.
+func (h *Handler) RegisterFrames(family string, handler FrameHandler) {
+	h.frameMutex.Lock()
+	defer h.frameMutex.Unlock()
+	h.frameHandlers[family] = handler
 }
 
 // NewHandler returns a handler.
@@ -52,6 +95,7 @@ func NewHandler(
 		caller:         caller,
 		logger:         logger,
 		allowedOrigins: allowedOrigins,
+		frameHandlers:  make(map[string]FrameHandler),
 	}
 }
 

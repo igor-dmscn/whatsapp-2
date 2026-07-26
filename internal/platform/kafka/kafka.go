@@ -40,6 +40,12 @@ const (
 	// TopicIdentityEvents carries account, device and session facts. Messaging
 	// consumes device revocation from here.
 	TopicIdentityEvents = "identity.events"
+	// TopicCallingEvents carries what happened to a call, keyed by call.
+	//
+	// Nothing consumes it yet. It exists because a call log is the obvious next thing
+	// somebody will want and these events are the only record that a call happened —
+	// unlike a projection, which can be rebuilt, a fact not published is gone.
+	TopicCallingEvents = "calling.events"
 	// TopicMediaAttachments carries uploads awaiting processing.
 	//
 	// This one is a work queue rather than a stream of facts other contexts observe,
@@ -51,7 +57,8 @@ const (
 
 // AllTopics is what EnsureTopics creates.
 var AllTopics = []string{
-	TopicMessagingEntries, TopicMessagingReceipts, TopicIdentityEvents, TopicMediaAttachments,
+	TopicMessagingEntries, TopicMessagingReceipts, TopicIdentityEvents,
+	TopicMediaAttachments, TopicCallingEvents,
 }
 
 // Brokers splits a comma-separated broker list.

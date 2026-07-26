@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -112,10 +114,22 @@ func (h *Handler) Socket(w http.ResponseWriter, r *http.Request) {
 	h.hub.Register(ctx, connection)
 	defer h.hub.Unregister(ctx, connection)
 	defer connection.Close("closed")
+	// Registered handlers are told the socket has gone, on a context of their own: this
+	// one is cancelled the moment the request returns, and cleaning up after a departed
+	// participant is a database write that has to be allowed to finish.
+	defer func() {
+		cleanup, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), socketCleanupGrace)
+		defer cancelCleanup()
+		h.closed(cleanup, connection)
+	}()
 
 	go connection.Write(ctx)
 	h.read(ctx, connection, logger)
 }
+
+// socketCleanupGrace bounds what a handler may do after a socket closes. Long enough for a
+// call departure to commit, short enough that a shutdown is not held up by one.
+const socketCleanupGrace = 10 * time.Second
 
 // handshake authenticates the socket and resumes it.
 //
@@ -195,11 +209,96 @@ func (h *Handler) read(ctx context.Context, connection *Connection, logger *slog
 			_ = connection.WriteFrame(ctx, clientFrame{Type: "pong"})
 
 		default:
-			// Unknown frames are ignored rather than fatal, so a newer client
-			// talking to an older server degrades instead of disconnecting.
+			// Frames Messaging does not own are offered to whoever registered for
+			// them — call signalling, so far (ADR-0004: one socket per client, for
+			// everything). Delegation rather than a switch that grows: Messaging must
+			// not learn what a call is to carry one.
+			if h.delegate(ctx, connection, envelope.Type, raw) {
+				continue
+			}
+			// Still unknown. Ignored rather than fatal, so a newer client talking to
+			// an older server degrades instead of disconnecting.
 			logger.Debug("ignoring unknown frame", slog.String("type", envelope.Type))
 		}
 	}
+}
+
+// session is the narrow view of a connection a delegated handler is given.
+//
+// A wrapper rather than the Connection itself, and not only because AccountID returns a
+// domain type here and a string there. A handler holding the whole Connection could change
+// what the client is subscribed to, and what a client sees of a conversation is Messaging's
+// business alone.
+type session struct {
+	connection *Connection
+}
+
+var _ Session = session{}
+
+func (s session) AccountID() string { return string(s.connection.AccountID()) }
+func (s session) DeviceID() string  { return s.connection.DeviceID() }
+
+// Send marshals a frame and queues it.
+//
+// Marshalled here rather than by the handler, so a delegated protocol writes Go structs
+// and never has to know that this connection carries JSON.
+func (s session) Send(frame any) error {
+	encoded, err := json.Marshal(frame)
+	if err != nil {
+		return fmt.Errorf("encode frame: %w", err)
+	}
+	s.connection.Send(encoded)
+	return nil
+}
+
+// closed tells every registered handler that a connection has gone.
+//
+// A client that crashed said nothing, and something has to notice: without this a call
+// keeps a participant nobody can see forever, and CL-3 never fires.
+func (h *Handler) closed(ctx context.Context, connection *Connection) {
+	h.frameMutex.RLock()
+	handlers := make([]FrameHandler, 0, len(h.frameHandlers))
+	for _, handler := range h.frameHandlers {
+		handlers = append(handlers, handler)
+	}
+	h.frameMutex.RUnlock()
+
+	for _, handler := range handlers {
+		handler.SocketClosed(ctx, session{connection})
+	}
+}
+
+// delegate offers a frame to a registered handler, reporting whether one took it.
+//
+// Matched on the part before the first dot, so a context registers a family — "call" —
+// rather than every frame it will ever add. That keeps the socket's routing table the size
+// of the number of contexts rather than the number of messages.
+func (h *Handler) delegate(
+	ctx context.Context,
+	connection *Connection,
+	frameType string,
+	raw []byte,
+) bool {
+	family, _, found := strings.Cut(frameType, ".")
+	if !found {
+		return false
+	}
+
+	h.frameMutex.RLock()
+	handler := h.frameHandlers[family]
+	h.frameMutex.RUnlock()
+	if handler == nil {
+		return false
+	}
+
+	if err := handler.HandleFrame(ctx, session{connection}, frameType, raw); err != nil {
+		// Reported to the client rather than closing the socket. A call that cannot be
+		// joined is not a reason to lose the messages on the same connection.
+		logging.With(ctx, h.logger).Warn("delegated frame",
+			slog.String("type", frameType), slog.Any("error", err))
+		_ = connection.WriteFrame(ctx, errorFrame{"error", "frame_failed", err.Error()})
+	}
+	return true
 }
 
 // handleResume answers a client's declaration of what it holds with what it is

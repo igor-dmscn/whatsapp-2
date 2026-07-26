@@ -18,6 +18,12 @@ var (
 	// relayed rather than a rule of Calling's own.
 	ErrNotPermitted = errors.New("not permitted to join this call")
 
+	// ErrCallInProgress means a live call already exists in this conversation (CL-2).
+	//
+	// Not a failure the caller reports: two people pressing call simultaneously is
+	// normal, and the answer is to join the one that won rather than to refuse.
+	ErrCallInProgress = errors.New("a call is already in progress in this conversation")
+
 	// ErrNoMediaNode means no SFU is available to hold the call. A start refused for
 	// this reason is a capacity problem, not the caller's fault, and must not be
 	// reported as one.

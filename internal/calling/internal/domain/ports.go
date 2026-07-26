@@ -17,6 +17,13 @@ type CallRepository interface {
 	// This is CL-2 expressed as a query the write path uses under a lock: a conversation
 	// has at most one active call, and starting a second returns the existing one.
 	ActiveIn(ctx context.Context, conversationID ConversationID) (*Call, error)
+
+	// LiveFor returns every unended call a device is present in.
+	//
+	// For cleaning up after a socket that closed. A device is normally in at most one call,
+	// so this returns a slice rather than one because "normally" is not a guarantee and a
+	// leaked participant is the failure it exists to prevent.
+	LiveFor(ctx context.Context, device DeviceID) ([]*Call, error)
 }
 
 // EventPublisher carries recorded events out of the context.
@@ -52,6 +59,13 @@ type MediaNodes interface {
 	// answer. The node is told which call and which participant, because forwarding is
 	// per call and a participant must not receive its own media.
 	Join(ctx context.Context, node string, call CallID, participant DeviceID, offer string) (string, error)
+
+	// Answer carries a participant's answer to an offer the node sent.
+	//
+	// The direction the phase-8 harness did not anticipate. A call of two is asymmetric:
+	// the second to join is answered, and the first has to be *offered* the second's
+	// media — so signalling is bidirectional and this is the return leg.
+	Answer(ctx context.Context, node string, call CallID, participant DeviceID, answer string) error
 
 	// Leave tells the node a participant has gone, so it can release the transport
 	// rather than waiting for ICE to time out.

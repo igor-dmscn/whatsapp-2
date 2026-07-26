@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"comms/internal/calling"
 	"comms/internal/identity"
 	"comms/internal/media"
 	"comms/internal/messaging"
@@ -56,6 +57,29 @@ func storeConfig() media.Config {
 		AccessKey: config.MustEnv("S3_ACCESS_KEY"),
 		SecretKey: config.MustEnv("S3_SECRET_KEY"),
 	}
+}
+
+// callFrames joins Messaging's socket to Calling's signalling.
+//
+// Eight lines of adapter because the two contexts declare the same Session shape under
+// different names, and Go compares method signatures by name rather than by structure. That
+// is the price of neither context importing the other, and this file is where such joins
+// belong.
+type callFrames struct {
+	calling *calling.Module
+}
+
+func (c callFrames) HandleFrame(
+	ctx context.Context,
+	session messaging.Session,
+	frameType string,
+	raw []byte,
+) error {
+	return c.calling.HandleFrame(ctx, session, frameType, raw)
+}
+
+func (c callFrames) SocketClosed(ctx context.Context, session messaging.Session) {
+	c.calling.SocketClosed(ctx, session)
 }
 
 func main() {
@@ -127,11 +151,31 @@ func run(ctx context.Context, logger *slog.Logger) error {
 	// and has no readiness to announce.
 	mediaModule := media.New(db, attachments, messagingModule, nil, identityModule.Caller, logger)
 
+	// Calling asks Messaging one question — may this account join — and reaches clients
+	// through it. Media forwarding is in this process for now; the seam that lets it move
+	// out is Calling's MediaNodes port, not anything here.
+	callingModule, err := calling.New(db, messagingModule, messagingModule, calling.Options{
+		Address:    config.EnvOr("SFU_ADDRESS", "local"),
+		UDPPortMin: uint16(config.EnvIntOr("SFU_UDP_PORT_MIN", 0)),
+		UDPPortMax: uint16(config.EnvIntOr("SFU_UDP_PORT_MAX", 0)),
+		PublicIP:   config.EnvOr("SFU_PUBLIC_IP", ""),
+		Logger:     logger,
+	})
+	if err != nil {
+		return err
+	}
+	defer callingModule.Close()
+
+	// Call signalling rides the socket the client already has (ADR-0004). Registered here
+	// because this is the only file allowed to know both contexts exist.
+	messagingModule.RegisterFrames(callingModule.Frames(), callFrames{callingModule})
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, logger, http.StatusOK, map[string]any{
 			"status":      "ok",
 			"connections": messagingModule.ConnectionCount(),
+			"calls":       callingModule.Calls(),
 		})
 	})
 	identityModule.Routes(mux)

@@ -82,6 +82,20 @@ func (h *Hub) dispatch(ctx context.Context, message *redis.Message) {
 			return
 		}
 
+		if envelope.Type == "call" {
+			var changed broadcast.CallMessage
+			if err := json.Unmarshal([]byte(message.Payload), &changed); err != nil {
+				h.logger.Warn("decode call change", slog.Any("error", err))
+				return
+			}
+			// Every connection following the conversation, with no visibility check: a
+			// call belongs to the conversation rather than to a position in its log, so
+			// there is no sequence to compare against a join point. What a late joiner
+			// learns is that a call exists, which they are entitled to join anyway.
+			h.deliverToFollowers(domain.ConversationID(changed.ConversationID), changed)
+			return
+		}
+
 		if envelope.Type == "attachment" {
 			var attachment broadcast.AttachmentMessage
 			if err := json.Unmarshal([]byte(message.Payload), &attachment); err != nil {
@@ -182,6 +196,37 @@ func (h *Hub) deliverReaction(message broadcast.ReactionMessage) {
 	encoded, err := json.Marshal(message)
 	if err != nil {
 		h.logger.Error("encode reaction frame", slog.Any("error", err))
+		return
+	}
+	for _, connection := range targets {
+		connection.Send(encoded)
+	}
+}
+
+// deliverToFollowers sends a frame to every local connection following a conversation.
+//
+// No visibility check, which is right for facts about a conversation rather than about a
+// position in its log — a call, an attachment becoming ready. Anything that names a sequence
+// must go through deliverEntry instead, where the join point is applied.
+func (h *Hub) deliverToFollowers(conversationID domain.ConversationID, frame any) {
+	h.mutex.RLock()
+	targets := make([]*Connection, 0, 8)
+	for _, connections := range h.connections {
+		for connection := range connections {
+			if connection.alreadySees(conversationID) {
+				targets = append(targets, connection)
+			}
+		}
+	}
+	h.mutex.RUnlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	encoded, err := json.Marshal(frame)
+	if err != nil {
+		h.logger.Error("encode frame", slog.Any("error", err))
 		return
 	}
 	for _, connection := range targets {

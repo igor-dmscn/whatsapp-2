@@ -153,6 +153,64 @@ func (m *Module) AttachmentChanged(ctx context.Context, conversationID, attachme
 	return m.notifier.AttachmentChanged(ctx, conversationID, attachmentID) //nolint:wrapcheck // already named where it happened.
 }
 
+// MayJoin reports whether an account may join a conversation's call.
+//
+// Calling's port (CL-1). The same question as "may this account send here": joining a call
+// means publishing media into the conversation, so a reader in a channel is refused and a
+// removed member is refused. One rule, asked two ways.
+func (m *Module) MayJoin(ctx context.Context, conversationID, accountID string) (bool, error) {
+	return m.service.MayAttach(ctx, conversationID, accountID) //nolint:wrapcheck // already named where it happened.
+}
+
+// CallChanged tells clients following a conversation to look at its call again.
+func (m *Module) CallChanged(ctx context.Context, conversationID, callID string) error {
+	return m.notifier.CallChanged(ctx, conversationID, callID) //nolint:wrapcheck // already named where it happened.
+}
+
+// Session is one client's socket, as much of it as a delegated protocol needs.
+type Session interface {
+	AccountID() string
+	DeviceID() string
+	Send(frame any) error
+}
+
+// FrameHandler takes socket frames Messaging does not own.
+//
+// This is ADR-0004's one socket per client made possible: another context carries its own
+// protocol over the connection a client already holds, and Messaging never learns what that
+// protocol means. Registered per family — everything before the first dot of a frame type.
+type FrameHandler interface {
+	HandleFrame(ctx context.Context, session Session, frameType string, raw []byte) error
+	SocketClosed(ctx context.Context, session Session)
+}
+
+// RegisterFrames routes a family of socket frames to a handler.
+//
+// Called from cmd/api, the only place allowed to know that two contexts exist.
+func (m *Module) RegisterFrames(family string, handler FrameHandler) {
+	m.handler.RegisterFrames(family, frames{handler})
+}
+
+// frames adapts a public handler to the internal one.
+//
+// Two interfaces with identical method sets and different names, which Go treats as
+// unrelated for method signatures — but an api.Session value satisfies Session, so the
+// adaptation is a pass-through. The alternative is exporting the internal type, which would
+// make the fence decorative.
+type frames struct {
+	handler FrameHandler
+}
+
+var _ api.FrameHandler = frames{}
+
+func (f frames) HandleFrame(ctx context.Context, session api.Session, frameType string, raw []byte) error {
+	return f.handler.HandleFrame(ctx, session, frameType, raw) //nolint:wrapcheck // the handler's error reaches the client.
+}
+
+func (f frames) SocketClosed(ctx context.Context, session api.Session) {
+	f.handler.SocketClosed(ctx, session)
+}
+
 // Notifier reaches connected clients without a database or an HTTP surface.
 //
 // For cmd/worker, which derives attachment variants and has to announce them but holds
