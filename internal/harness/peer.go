@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -322,8 +323,10 @@ func (p *Peer) sendAudio() {
 		case <-p.stop:
 			return
 		case <-ticker.C:
+			// Stamped as late as possible — here, not on the tick — so the measurement is
+			// of the path and not of this loop's own scheduling.
 			if err := p.audio.WriteSample(media.Sample{
-				Data: audioFrame(bytesPerPacket), Duration: audioInterval,
+				Data: audioFrame(bytesPerPacket, time.Now()), Duration: audioInterval,
 			}); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				p.logger.Debug("write audio", slog.Any("error", err))
 				return
@@ -414,13 +417,21 @@ func (p *Peer) Received(kind string) Report {
 		total.Gaps += report.Gaps
 		total.Reordered += report.Reordered
 		total.Duplicates += report.Duplicates
+		// Samples pooled, not percentiles averaged. A p95 of two p95s is not a p95 of
+		// anything, and this total is what NF-4 is read from.
+		total.Latencies = append(total.Latencies, report.Latencies...)
 		if report.Duration > total.Duration {
 			total.Duration = report.Duration
 		}
 		if total.TimeToFirst == 0 || (report.TimeToFirst > 0 && report.TimeToFirst < total.TimeToFirst) {
 			total.TimeToFirst = report.TimeToFirst
 		}
+		if total.TimeToFirstKeyframe == 0 ||
+			(report.TimeToFirstKeyframe > 0 && report.TimeToFirstKeyframe < total.TimeToFirstKeyframe) {
+			total.TimeToFirstKeyframe = report.TimeToFirstKeyframe
+		}
 	}
+	slices.Sort(total.Latencies)
 	return total
 }
 
@@ -512,11 +523,34 @@ func (p *Peer) Connected() bool {
 	return state == webrtc.ICEConnectionStateConnected || state == webrtc.ICEConnectionStateCompleted
 }
 
+// WaitForWatchableVideo blocks until a keyframe has arrived.
+//
+// The stronger of the two waits, and the one NF-3 needs. A packet arriving proves the
+// transport; a keyframe arriving is the first moment a person would see anything, because a
+// decoder that joined mid-stream has no reference frame and shows nothing until then.
+//
+// Written after the measurement built on WaitForMedia turned out to be flattering: it
+// returned two packets in, well before any keyframe, so the number it produced was the time
+// to first *packet* wearing NF-3's name.
+func (p *Peer) WaitForWatchableVideo(ctx context.Context) error {
+	for {
+		if p.Received("video").TimeToFirstKeyframe > 0 {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for a keyframe on %s: %w", p.name, ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
 // WaitForMedia blocks until a track of each named kind has delivered a packet.
 //
-// The measurement NF-3 asks for — join to first media — needs a moment to wait for, and
-// "the connection reported connected" is not it: a connected transport carrying nothing
-// is precisely the failure this is meant to catch.
+// Enough for "is this forwarding at all", which is what most assertions want. Not enough for
+// NF-3 — see WaitForWatchableVideo. "The connection reported connected" is not enough for
+// either: a connected transport carrying nothing is precisely the failure this catches.
 func (p *Peer) WaitForMedia(ctx context.Context, kinds ...string) error {
 	for {
 		missing := ""

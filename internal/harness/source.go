@@ -218,16 +218,51 @@ func IsKeyframe(frame []byte) bool {
 	return len(frame) > 0 && frame[0]&0x01 == 0
 }
 
-// audioFrame is one 20 ms Opus packet's worth of bytes.
+// audioFrame is one 20 ms Opus packet's worth of bytes, stamped with the time it was made.
 //
 // Opus has no payload descriptor and nothing forwards it conditionally, so the contents
 // are arbitrary. The TOC byte is set to something plausible anyway: a capture that says
 // "SILK, 20 ms, mono" is easier to read than one that says nothing.
-func audioFrame(size int) []byte {
+//
+// The stamp is how NF-4 — one-way audio latency through the SFU — is measured, and it is in
+// the *payload* rather than in the header on purpose. A forwarder rewrites SSRC and may
+// rewrite sequence numbers and timestamps; the payload is the one part it is contractually
+// forbidden to touch, because touching it would mean decoding. So a stamp there measures the
+// real path and cannot be confused by anything the server legitimately does to the header.
+//
+// It only means anything when publisher and receiver share a clock, which for a harness run
+// they do — one process. Across machines this would be measuring clock skew.
+func audioFrame(size int, stampedAt time.Time) []byte {
 	frame := make([]byte, size)
 	frame[0] = 0x08 // config 1: SILK narrowband, 20 ms, mono
+
 	for index := 1; index < len(frame); index++ {
 		frame[index] = byte(index)
 	}
+	if size >= audioStampEnd {
+		binary.BigEndian.PutUint64(frame[audioStampStart:audioStampEnd], uint64(stampedAt.UnixNano()))
+	}
 	return frame
+}
+
+// Where the send time sits in an audio payload: eight bytes straight after the TOC byte.
+const (
+	audioStampStart = 1
+	audioStampEnd   = audioStampStart + 8
+)
+
+// audioSentAt reads the stamp back, reporting whether there was one.
+//
+// The bounds check is not ceremony. This reads a packet that arrived over a network, and a
+// short payload — a truncated packet, or audio from something that is not this harness — must
+// be a missing measurement rather than a panic in a load test.
+func audioSentAt(payload []byte) (time.Time, bool) {
+	if len(payload) < audioStampEnd {
+		return time.Time{}, false
+	}
+	nanos := binary.BigEndian.Uint64(payload[audioStampStart:audioStampEnd])
+	if nanos == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, int64(nanos)), true
 }

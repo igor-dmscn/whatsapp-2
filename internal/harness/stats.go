@@ -2,6 +2,8 @@ package harness
 
 import (
 	"fmt"
+	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -39,11 +41,30 @@ type Arrivals struct {
 	firstAt     time.Time
 	joinedAt    time.Time
 	timeToFirst time.Duration
+	// timeToFirstKeyframe is when video first became watchable rather than merely present.
+	//
+	// The distinction is the whole of NF-3. Packets arriving is not a picture: a decoder
+	// joining mid-stream has no reference frame and shows nothing until a keyframe, so
+	// timing the first packet measures the transport and flatters the requirement. What
+	// makes this number small is the server asking the publisher for a keyframe the moment
+	// somebody has joined, and a measurement that cannot see that is not measuring NF-3.
+	timeToFirstKeyframe time.Duration
+
+	// latencies is send-to-receive for every stamped audio packet, which is NF-4.
+	//
+	// Every sample kept rather than a running summary, because the claim is about a
+	// percentile and a percentile cannot be computed from a mean. Bounded, because a load
+	// run is fifty packets a second per peer for as long as somebody leaves it running.
+	latencies []time.Duration
 }
 
 func newArrivals(kind string, joinedAt time.Time) *Arrivals {
 	return &Arrivals{kind: kind, seen: make(map[uint16]bool), joinedAt: joinedAt}
 }
+
+// maxLatencySamples bounds the slice above. Ten thousand audio packets is over three
+// minutes at 20 ms each, which is longer than any run that has a reason to be timed.
+const maxLatencySamples = 10_000
 
 // record takes one packet.
 func (a *Arrivals) record(packet *rtp.Packet, at time.Time) {
@@ -61,8 +82,10 @@ func (a *Arrivals) record(packet *rtp.Packet, at time.Time) {
 	a.packets++
 	a.bytes += len(packet.Payload)
 
+	duplicate := a.seen[packet.SequenceNumber]
+
 	switch {
-	case a.seen[packet.SequenceNumber]:
+	case duplicate:
 		a.duplicates++
 	case newer(packet.SequenceNumber, a.highest):
 		// Anything skipped between the last highest and this one is missing for now.
@@ -84,6 +107,19 @@ func (a *Arrivals) record(packet *rtp.Packet, at time.Time) {
 
 	if a.kind == "video" && isKeyframePacket(packet.Payload) {
 		a.keyframes++
+		if a.timeToFirstKeyframe == 0 {
+			a.timeToFirstKeyframe = at.Sub(a.joinedAt)
+		}
+	}
+
+	// Not duplicates. A second copy of a packet is a retransmission, and timing it as
+	// though it were the original reports the cost of recovering from loss as the cost of
+	// the path — which is how a latency number ends up describing something nobody asked
+	// about.
+	if a.kind == "audio" && !duplicate && len(a.latencies) < maxLatencySamples {
+		if sentAt, stamped := audioSentAt(packet.Payload); stamped {
+			a.latencies = append(a.latencies, at.Sub(sentAt))
+		}
 	}
 }
 
@@ -120,6 +156,52 @@ type Report struct {
 	Duplicates  int
 	Duration    time.Duration
 	TimeToFirst time.Duration
+	// TimeToFirstKeyframe is when video became watchable, and is zero for audio and for
+	// video that never carried one. This is what NF-3 is read from.
+	TimeToFirstKeyframe time.Duration
+	// Latencies is send-to-receive per audio packet, sorted. NF-4 is its p95.
+	//
+	// Handed over as samples rather than as a summary, so that a caller aggregating several
+	// tracks can put them together and take one percentile — which is the only correct way
+	// to do it. Percentiles of percentiles are not percentiles.
+	Latencies []time.Duration
+}
+
+// LatencyAt returns the given percentile of this report's audio latency, or zero if there
+// are no samples.
+//
+// Nearest-rank, on sorted samples: the smallest sample at or above the given share of the
+// distribution. No interpolation, because interpolating between two measurements invents a
+// value that was never observed, and these are used to check a stated limit.
+func (r Report) LatencyAt(percentile float64) time.Duration {
+	return percentileOf(r.Latencies, percentile)
+}
+
+// percentileOf takes the nearest-rank percentile of already-sorted samples.
+func percentileOf(sorted []time.Duration, percentile float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+
+	rank := int(math.Ceil(percentile/100*float64(len(sorted)))) - 1
+	if rank < 0 {
+		rank = 0
+	}
+	if rank >= len(sorted) {
+		rank = len(sorted) - 1
+	}
+	return sorted[rank]
+}
+
+// Percentile returns the nearest-rank percentile of samples in any order.
+//
+// Exported because the measurements NF-3 and NF-4 are both percentiles, and one of them —
+// join to first media — is a distribution across peers rather than within a track, so it is
+// collected by the caller and has nowhere else to be computed.
+func Percentile(samples []time.Duration, percentile float64) time.Duration {
+	sorted := append([]time.Duration(nil), samples...)
+	slices.Sort(sorted)
+	return percentileOf(sorted, percentile)
 }
 
 // Bitrate is what arrived, in bits per second, or zero if too little arrived to say.
@@ -131,9 +213,19 @@ func (r Report) Bitrate() int {
 }
 
 func (r Report) String() string {
-	return fmt.Sprintf("%s: %d packets, %d keyframes, %d gaps, %d reordered, %d kbit/s, first in %s",
+	line := fmt.Sprintf("%s: %d packets, %d keyframes, %d gaps, %d reordered, %d kbit/s, first in %s",
 		r.Kind, r.Packets, r.Keyframes, r.Gaps, r.Reordered, r.Bitrate()/1000,
 		r.TimeToFirst.Round(time.Millisecond))
+
+	if r.TimeToFirstKeyframe > 0 {
+		line += fmt.Sprintf(", watchable in %s", r.TimeToFirstKeyframe.Round(time.Millisecond))
+	}
+	if len(r.Latencies) > 0 {
+		line += fmt.Sprintf(", latency p50 %s p95 %s over %d",
+			r.LatencyAt(50).Round(time.Microsecond),
+			r.LatencyAt(95).Round(time.Microsecond), len(r.Latencies))
+	}
+	return line
 }
 
 // Report returns a snapshot.
@@ -141,15 +233,22 @@ func (a *Arrivals) Report() Report {
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 
+	// Copied and sorted here, so a report is a value a caller can hold while the track keeps
+	// arriving. Handing over the live slice would be a race the caller could not see.
+	latencies := append([]time.Duration(nil), a.latencies...)
+	slices.Sort(latencies)
+
 	return Report{
-		Kind:        a.kind,
-		Packets:     a.packets,
-		Bytes:       a.bytes,
-		Keyframes:   a.keyframes,
-		Gaps:        a.gaps,
-		Reordered:   a.reordered,
-		Duplicates:  a.duplicates,
-		Duration:    a.last.Sub(a.first),
-		TimeToFirst: a.timeToFirst,
+		Kind:                a.kind,
+		Packets:             a.packets,
+		Bytes:               a.bytes,
+		Keyframes:           a.keyframes,
+		Gaps:                a.gaps,
+		Reordered:           a.reordered,
+		Duplicates:          a.duplicates,
+		Duration:            a.last.Sub(a.first),
+		TimeToFirst:         a.timeToFirst,
+		TimeToFirstKeyframe: a.timeToFirstKeyframe,
+		Latencies:           latencies,
 	}
 }

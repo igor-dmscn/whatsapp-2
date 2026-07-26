@@ -26,9 +26,18 @@ import (
 
 func main() {
 	var (
-		url        = flag.String("url", "", "signalling base URL; empty starts a local stub")
-		peers      = flag.Int("peers", 4, "how many participants to simulate")
-		publishers = flag.Int("publishers", 1, "how many of them publish")
+		url = flag.String("url", "", "signalling base URL; empty starts a local stub")
+		// node points at cmd/sfu rather than at the stub, and is what NF-14 is measured
+		// against: a capacity claim about a deployed process cannot be answered by driving
+		// something else. The two flags are separate rather than one flag with a mode,
+		// because they speak different protocols and confusing them produces a 404 rather
+		// than a wrong number.
+		node = flag.String("node", "",
+			"media node base URL, e.g. http://localhost:8090; takes precedence over -url")
+		calls = flag.Int("calls", 1,
+			"how many concurrent calls to spread the peers across; requires -node")
+		peers      = flag.Int("peers", 4, "how many participants to simulate, per call")
+		publishers = flag.Int("publishers", 1, "how many of them publish, per call")
 		duration   = flag.Duration("for", 10*time.Second, "how long to run")
 		bitrate    = flag.Int("bitrate", 600_000, "each publisher's target bits per second")
 		framerate  = flag.Int("framerate", 30, "each publisher's frames per second")
@@ -44,6 +53,8 @@ func main() {
 
 	if err := run(ctx, logger, options{
 		url:        *url,
+		node:       *node,
+		calls:      *calls,
 		peers:      *peers,
 		publishers: *publishers,
 		duration:   *duration,
@@ -62,6 +73,8 @@ const publishSettle = 500 * time.Millisecond
 
 type options struct {
 	url        string
+	node       string
+	calls      int
 	peers      int
 	publishers int
 	duration   time.Duration
@@ -78,8 +91,15 @@ func run(ctx context.Context, logger *slog.Logger, options options) error {
 		options.publishers = options.peers
 	}
 
+	if options.calls < 1 {
+		options.calls = 1
+	}
+	if options.calls > 1 && options.node == "" {
+		return errors.New("several calls need -node: the stub has no notion of a call")
+	}
+
 	url := options.url
-	if url == "" {
+	if options.node == "" && url == "" {
 		// A local stub, so the harness is runnable — and measurable — with nothing else
 		// deployed. This is what establishes the floor: whatever it costs here is what the
 		// harness costs, and anything worse against a real server belongs to the server.
@@ -90,13 +110,14 @@ func run(ctx context.Context, logger *slog.Logger, options options) error {
 		logger.Info("started a local stub", slog.String("url", url))
 	}
 
-	// Publishers first, and a pause before the receivers: neither the stub nor a
-	// first-cut SFU renegotiates, so a receiver that joins before a publisher's tracks
-	// exist sees nothing and the measurement would be of an empty call.
+	// Publishers first, and a pause before the receivers: the stub does not renegotiate, so
+	// a receiver that joins before a publisher's tracks exist sees nothing and the
+	// measurement would be of an empty call. The real node does renegotiate and does not
+	// need this, but it costs half a second and keeps one code path.
 	//
 	// A sleep rather than a wait on the server's state, because this points at a remote
 	// server whose internals it cannot see. The tests, which own the stub, wait properly.
-	peers := make([]*harness.Peer, 0, options.peers)
+	peers := make([]*harness.Peer, 0, options.peers*options.calls)
 	defer func() {
 		closing, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -106,32 +127,47 @@ func run(ctx context.Context, logger *slog.Logger, options options) error {
 	}()
 
 	started := time.Now()
-	for index := range options.peers {
-		publishing := index < options.publishers
-		peer, err := harness.NewPeer(ctx, harness.NewHTTPSignaller(url), harness.PeerOptions{
-			Name:    naming(publishing, index),
-			Publish: publishing,
-			Logger:  logger,
-			Source: harness.SourceOptions{
-				Bitrate: options.bitrate, Framerate: options.framerate,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("peer %d: %w", index, err)
-		}
-		peers = append(peers, peer)
+	for call := range options.calls {
+		// One identifier per call, stable and readable, so a node's logs can be matched to a
+		// run. The node creates a call on first join and forgets it when the last
+		// participant leaves, so nothing has to exist beforehand.
+		callID := fmt.Sprintf("capacity-%d", call)
 
-		if index == options.publishers-1 {
-			logger.Info("publishers joined",
-				slog.Int("count", options.publishers),
-				slog.Duration("took", time.Since(started)))
-			time.Sleep(publishSettle)
+		for index := range options.peers {
+			publishing := index < options.publishers
+			name := naming(publishing, index)
+			if options.calls > 1 {
+				name = fmt.Sprintf("call-%d-%s", call, name)
+			}
+
+			peer, err := harness.NewPeer(ctx, signaller(options, url, callID, name, logger),
+				harness.PeerOptions{
+					Name:    name,
+					Publish: publishing,
+					Logger:  logger,
+					Source: harness.SourceOptions{
+						Bitrate: options.bitrate, Framerate: options.framerate,
+					},
+				})
+			if err != nil {
+				return fmt.Errorf("%s: %w", name, err)
+			}
+			peers = append(peers, peer)
+
+			if index == options.publishers-1 {
+				time.Sleep(publishSettle)
+			}
 		}
+		logger.Info("call joined",
+			slog.String("call", callID),
+			slog.Int("peers", options.peers),
+			slog.Duration("elapsed", time.Since(started).Round(time.Millisecond)))
 	}
 	joined := time.Since(started)
 
 	logger.Info("all peers joined",
-		slog.Int("peers", options.peers),
+		slog.Int("calls", options.calls),
+		slog.Int("peers", len(peers)),
 		slog.Duration("took", joined),
 		slog.Duration("for", options.duration))
 
@@ -212,6 +248,18 @@ func report(logger *slog.Logger, peers []*harness.Peer, joined time.Duration) {
 		slog.Int("video_packets", total),
 		slog.Int("gaps", gaps),
 	)
+}
+
+// signaller picks how this peer reaches the server: a real media node, or the stub.
+func signaller(
+	options options,
+	url, callID, participantID string,
+	logger *slog.Logger,
+) harness.Signaller {
+	if options.node != "" {
+		return harness.NewNodeSignaller(options.node, callID, participantID, logger)
+	}
+	return harness.NewHTTPSignaller(url)
 }
 
 func naming(publishing bool, index int) string {

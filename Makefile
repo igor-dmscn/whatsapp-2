@@ -1,4 +1,4 @@
-.PHONY: help up down migrate build lint test check clean web web-check e2e load
+.PHONY: help up down migrate build lint test check clean web web-check e2e load capacity
 
 # Loaded so make targets see the same values the binaries do.
 ifneq (,$(wildcard .env))
@@ -32,10 +32,6 @@ lint: ## Vet, check architectural boundaries, and run golangci-lint if present
 		&& golangci-lint run \
 		|| echo "golangci-lint not installed, skipping (see .golangci.yml)"
 
-# Known flake, in the media tests rather than in this target: roughly one run in
-# five, a three-party call ends with one participant receiving nothing. Pre-existing,
-# reproduces on internal/calling/internal/sfu alone under -count=10, and names a
-# different test each time. Diagnosed as far as it has been in docs/plan.md phase 10.
 test: ## Run all tests
 	go test ./...
 
@@ -46,9 +42,14 @@ web-check: ## Typecheck the browser client and run its unit tests
 	cd web && npm install --silent && npm run build && npm test
 
 # The media load script. Points at a local stub by default, so it is runnable with
-# nothing deployed; -url points it at a real server. See internal/harness.
+# nothing deployed; -url points it at a real server, -node at cmd/sfu. See internal/harness.
 load: ## Drive a media server with simulated participants (PEERS=20 FOR=10s)
 	go run ./cmd/harness -peers $(or $(PEERS),8) -for $(or $(FOR),10s) $(HARNESS_FLAGS)
+
+# NF-14, measured against the real forwarding process under a CPU limit rather than
+# against a stub sharing this one. Starts and stops its own node.
+capacity: ## Measure concurrent call capacity (CALLS=3 PEERS=4 FOR=20s)
+	./scripts/capacity.sh $(or $(CALLS),3) $(or $(PEERS),4) $(or $(FOR),20s)
 
 # Separate from check because it starts four processes and drives a real browser.
 # It needs `make up` and `make migrate` first, and a Chromium — see web/README.md.

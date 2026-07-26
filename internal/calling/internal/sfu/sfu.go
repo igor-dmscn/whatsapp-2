@@ -203,6 +203,16 @@ func (s *Server) Join(callID, participantID, offer string) (string, error) {
 		id:         participantID,
 		connection: connection,
 		receiving:  make(map[string]bool),
+		// An exchange is already in flight — the offer and answer below — and saying so
+		// here rather than afterwards is the point.
+		//
+		// This participant goes into the call's map before its own exchange finishes, so
+		// another publisher's track arriving in that window starts a renegotiation with it:
+		// CreateOffer and SetLocalDescription on a connection sitting in have-remote-offer,
+		// which Pion rejects with "invalid proposed signaling state transition". Found at 64
+		// peers, where the window is hit often enough to see; at four it is invisible and
+		// the bug is exactly as present.
+		negotiating: true,
 	}
 
 	held := s.callFor(callID)
@@ -230,7 +240,32 @@ func (s *Server) Join(callID, participantID, offer string) (string, error) {
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
 			s.release(callID, participantID)
 		}
+
+		// A keyframe for the joiner, as soon as it can receive one.
+		//
+		// Not when the tracks are added, which is a few hundred milliseconds earlier and
+		// before this transport exists — a keyframe produced then is forwarded into a
+		// connection that cannot carry it yet and is simply lost, leaving the joiner waiting
+		// for the publisher's next scheduled one. Which is what it did: NF-3 measured 1.57 s
+		// against a limit of 2, and the number was the publisher's keyframe interval rather
+		// than anything about this server. With this it is 110 ms.
+		//
+		// On its own goroutine because this is a Pion callback, and because WriteRTCP to
+		// several publishers has no business happening on one.
+		if state == webrtc.PeerConnectionStateConnected {
+			go s.requestKeyframesFor(callID, joining)
+		}
 	})
+
+	// A join that fails leaves nothing behind. Without this the participant stays in the
+	// call holding a connection nobody will use and a negotiating flag nobody will clear,
+	// so the client's retry — which is the only remedy it has — would find a stale twin.
+	answered := false
+	defer func() {
+		if !answered {
+			s.release(callID, participantID)
+		}
+	}()
 
 	// The offer first, then the tracks. Reversing these negotiates cleanly and delivers
 	// nothing: a track added before the remote description exists creates a transceiver of
@@ -265,7 +300,32 @@ func (s *Server) Join(callID, participantID, offer string) (string, error) {
 	}
 	s.waitForGathering(gathered, participantID)
 
+	answered = true
+	// The exchange is over, so the next one may start — including any that was asked for
+	// while this was in flight, which is the common case: a call of four has three other
+	// people publishing into it while the fourth is still negotiating.
+	s.finishedExchange(callID, joining)
+
 	return connection.LocalDescription().SDP, nil
+}
+
+// finishedExchange records that a participant's negotiation is complete, and starts the next
+// one if something asked for it while this was in flight.
+//
+// Shared by the two places an exchange ends: the answer to a client's join, and a client's
+// answer to one of this server's offers. They were the same nine lines, and the reason they
+// have to be the same is that a participant with negotiating left set never receives another
+// track for the rest of the call.
+func (s *Server) finishedExchange(callID string, of *participant) {
+	of.mutex.Lock()
+	of.negotiating = false
+	again := of.pending
+	of.pending = false
+	of.mutex.Unlock()
+
+	if again {
+		s.renegotiateWith(callID, of)
+	}
 }
 
 // waitForGathering waits for ICE gathering, but not forever.
@@ -331,18 +391,10 @@ func (s *Server) Answer(callID, participantID, answer string) error {
 		return fmt.Errorf("set remote description: %w", err)
 	}
 
-	joined.mutex.Lock()
-	joined.negotiating = false
-	again := joined.pending
-	joined.pending = false
-	joined.mutex.Unlock()
-
-	// Something arrived while that exchange was in flight. Renegotiated now rather than
-	// left for the next join, because "the next join" may never come and the participant
-	// would simply be missing somebody.
-	if again {
-		s.renegotiateWith(callID, joined)
-	}
+	// Anything that arrived while that exchange was in flight is renegotiated now rather
+	// than left for the next join, because "the next join" may never come and the
+	// participant would simply be missing somebody.
+	s.finishedExchange(callID, joined)
 	return nil
 }
 
@@ -479,6 +531,26 @@ func (s *Server) relayFeedback(sender *webrtc.RTPSender, track *published) {
 				// means something different there. This is CL-6's retransmission, and it
 				// works because the server buffers rather than because the publisher does.
 			}
+		}
+	}
+}
+
+// requestKeyframesFor asks every publisher this participant receives for a fresh start.
+//
+// The other half of the keyframe-on-join behaviour. forward covers the case where a track
+// appears while somebody is already watching; this covers the reverse and much more common
+// one, where somebody joins a call whose publishers have been sending for a while. Without it
+// a joiner sees packets it cannot decode until the next scheduled keyframe, which is the
+// difference between NF-3 being met by a wide margin and met by luck.
+func (s *Server) requestKeyframesFor(callID string, to *participant) {
+	held := s.callFor(callID)
+	held.mutex.RLock()
+	others := held.others(to.id)
+	held.mutex.RUnlock()
+
+	for _, other := range others {
+		for _, track := range other.publishedTracks() {
+			s.requestKeyframe(track.publisher, track.ssrc)
 		}
 	}
 }

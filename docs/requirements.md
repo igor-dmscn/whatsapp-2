@@ -63,8 +63,8 @@ Terminology is defined in the [context map](../CONTEXT-MAP.md) and the per-conte
 |----|-------------|
 | NF-1 | Send to receipt on a connected recipient's device: p95 under 300 ms, same region. |
 | NF-2 | Gap sync of 1 000 entries: p95 under 1 second. |
-| NF-3 | Call join to first media: p95 under 2 seconds. |
-| NF-4 | One-way audio latency through the SFU: p95 under 200 ms, same region. |
+| NF-3 | Call join to first media: p95 under 2 seconds. Measured at **109 ms** — and "first media" means the first keyframe, because packets arriving are not a picture. |
+| NF-4 | One-way audio latency through the SFU: p95 under 200 ms, same region. Measured at **431 µs** on loopback, which is the code's share of the budget and not a deployment's. |
 | NF-5 | Cold client start with a populated local store renders the conversation list in under 500 ms, without network. |
 
 ### Consistency
@@ -86,7 +86,7 @@ Designed for the first figure, deployed at the second. Both are stated because p
 | NF-11 | Actually deployed for fewer than 100 accounts. Load must therefore be demonstrated by a load-test harness, not by production traffic. |
 | NF-12 | Write cost per entry is independent of member count. A channel broadcast to 50 000 members performs the same number of writes as a direct message. |
 | NF-13 | Groups are capped at 256 members. Channels are uncapped for readers. |
-| NF-14 | One SFU node supports at least 3 concurrent 4-participant video calls on 4 vCPUs. Multi-node cascading is out of scope. |
+| NF-14 | One SFU node supports at least 3 concurrent 4-participant video calls on 4 vCPUs. Multi-node cascading is out of scope. Measured with `scripts/capacity.sh`: **16 calls and 64 participants** on 4 vCPUs with no loss, so the stated limit has room rather than being the ceiling. |
 
 ### Operability
 

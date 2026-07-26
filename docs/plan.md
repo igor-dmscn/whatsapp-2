@@ -292,10 +292,27 @@ Step 2 is a shippable product on its own. If schedule pressure arrives, stop aft
 
 Two things came out of it. The node address now defaults per process, so the mismatch is loud instead of silent. And a browser pair on *one* node proves the whole media path, while a pair across *two* nodes proves the shared one — that second test asserted a refusal when it was written, because an in-process media plane could not do better, and `cmd/sfu` is what turned the assertion around.
 
+- **The measurements**, all three met, and two of them only after the measuring found something.
+
+  | | Requirement | Measured |
+  |---|---|---|
+  | NF-3 | join to first media, p95 under 2 s | **109 ms** p95 over 20 calls |
+  | NF-4 | one-way audio latency, p95 under 200 ms | **431 µs** p95 over ~150 packets each way |
+  | NF-14 | 3 concurrent 4-participant video calls on 4 vCPUs | **16 calls, 64 participants**, no loss |
+
+  Loopback on a developer's machine, so what they establish is that the code is not the reason a limit would be missed. NF-3 and NF-4 are Go tests; NF-14 is `scripts/capacity.sh`, because a capacity claim about a deployed process cannot be answered by a test sharing its machine with the load — it runs the real `cmd/sfu` under `GOMAXPROCS=4` and drives it with the phase-8 harness over the node's own HTTP wire.
+
+  **The first NF-3 measurement was wrong, and finding out why was the point.** Timing the first packet gave 109 ms and passed. But video packets are not a picture: a decoder joining mid-stream has no reference frame and shows nothing until a keyframe. Timing the first *keyframe* — which is what a person waits for — gave **1.573 s** against a limit of 2, and the number was not about this server at all. It was the publisher's keyframe interval.
+
+  The cause was a gap in the keyframe-on-join behaviour. The media plane asked a publisher for a keyframe when a *new track* appeared while somebody was watching, and not when somebody *joined* a publisher who had been sending for a while — which is the common case. Three lines, in the right place: not when the tracks are added, which is a few hundred milliseconds before the joiner's transport exists and a keyframe produced then is forwarded into a connection that cannot carry it, but when the transport reports connected. **1.573 s → 109 ms.**
+
+  **NF-14 found a race that only exists at scale.** At 64 participants the node logged Pion refusing a renegotiation — `have-remote-offer -> SetLocal(offer)` — twice, alongside three ICE gathers that never completed. A participant is in the call's map before its own offer/answer finishes, so another publisher's track arriving in that window started a second exchange on a connection mid-join. The participant was then left with its negotiation flag set and never received another track for the rest of the call.
+
+  Fixed by treating the join as the exchange it is. What that did to the same 64-peer run: join time 24.7 s → **9.4 s**, slowest first packet 5.08 s → **193 ms**, five warnings → **none**.
+
 **Not done.**
 
 - **Simulcast (CL-5)** — step 3, which the plan itself says to stop before under pressure.
-- **The measurements** NF-3 (join to first media), NF-4 (audio latency) and NF-14 (three concurrent 4-way calls), all of which want media between real clients first.
 
 **Two decisions, both forced by running it.**
 
@@ -312,7 +329,7 @@ Three findings:
 
 **Verify:** two browsers plus the harness hold a group call. Drop 5% of packets and confirm video recovers rather than freezing beyond 2 seconds (CL-6). Throttle one participant with the phase-8 harness and assert the SFU switches that receiver's layer down and back up. Call join to first media under 2 seconds (NF-3). One-way audio latency under 200 ms (NF-4). Three concurrent 4-way calls on 4 vCPUs (NF-14).
 
-Of those: two browsers hold a call on one node and across two nodes, and a three-party call forwards in every direction under the harness. Keyframe recovery is measured at 21 ms against CL-6's two seconds, but *packet loss* is not — the harness can throttle and cannot yet drop. Layer switching needs simulcast. NF-3, NF-4 and NF-14 are unmeasured.
+Of those: two browsers hold a call on one node and across two nodes, and a three-party call forwards in every direction under the harness. NF-3 is 109 ms, NF-4 is 431 µs, NF-14 has four times the headroom the requirement asks for. Keyframe recovery is measured at 21 ms against CL-6's two seconds, but *packet loss* is not — the harness can throttle and cannot yet drop. Layer switching needs simulcast.
 
 ---
 
@@ -328,17 +345,19 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
 - Backpressure: what happens to a slow socket consumer, and what happens when Redis or Kafka is unavailable.
 - A service worker, so the browser client's offline cold start is genuinely offline. Noted in phase 6 and still owed: the database survives a restart, the page it is loaded by does not.
 - A dead-letter topic for records a consumer skips as permanently unprocessable. They are logged today, which is a record nobody reads.
-- **A flake in the media tests, bounded but not found.** Somewhere around one run in five, a three-party call ends with one participant receiving nothing.
+- **A flake in the media tests. Found, and it was the same bug NF-14 exposed** — worth recording because of how it was found, which was not by looking for it.
 
-  What is known, and each of these cost a run to establish:
+  The symptom was a hang: roughly one run in three, `go test ./...` sat at `<-gathered` inside `Join` until Go's ten-minute panic, naming a different test each time. It reproduced on `internal/calling/internal/sfu` alone under `-count=5`, and on the commit before any of the node work, so it was pre-existing and not the node work.
 
-  - **It is not the node work.** `go test -count=10 ./internal/calling/internal/sfu/` fails on the commit before any of it, and on the commit before phase 9's browser fix.
-  - **It is not one test.** Four different tests have been the victim across seven reproductions, which is what says it is not a test's own logic.
-  - **It presented as a hang, and that part is fixed.** Every reproduction before the fix sat at `<-gathered` in `Join` until Go's ten-minute panic. The server now waits ten seconds and answers with what it has, so the same flake costs 85 seconds and prints which participant received nothing, instead of 450 seconds and a goroutine dump. That is worth having on its own terms — an unbounded wait there is a client's join never returning — and it is the reason the rest of this list could be established at all.
-  - **It is not slow gathering.** With the wait bounded and logged, ten runs produced no timeout and no slow-gather warning, and still failed. So gathering completing is not the missing piece; something after it is.
-  - **One candidate, unproven.** The phase-8 stub drops an offer when its four-deep channel is full and reports success, so a lost offer leaves the server believing an exchange is in flight. The server's grace period now recovers that after fifteen seconds, which is longer than a test's patience. Worth testing before anything more elaborate.
+  Three things happened in order, and only the third was a fix:
 
-  Not chased further, because it is pre-existing, it is now loud instead of silent, and the cost of guessing at it is another hour like the one phase 9 already spent guessing at a symptom.
+  1. **Bounding the wait made it legible.** An unbounded wait for ICE gathering is a client's join that never returns, which is wrong on its own terms. Capped at five seconds and logged, the same flake became an 85-second failure naming the participant who received nothing, instead of 450 seconds and a goroutine dump.
+  2. **That ruled out the obvious explanation.** Ten runs produced no gathering timeout at all and still failed — so a slow gather was not it, and it was not one test's own logic either.
+  3. **NF-14 named it.** Driving the real node with 64 participants logged Pion refusing a renegotiation twice — `have-remote-offer -> SetLocal(offer)` — because a participant is in the call's map before its own exchange finishes. Two `SetLocalDescription` calls interleaving on one connection is also exactly what leaves a `GatheringCompletePromise` unresolved, which is the hang.
+
+  After the fix: 33 consecutive runs of that package clean, where `-count=5` had hung twice out of two attempts. Not proof, and a race is never disproved by passing runs — but the mechanism accounts for all three symptoms, which guessing never did.
+
+  The lesson is the same one phase 9 keeps teaching. The flake was in the test suite and looked like a test-suite problem; the cause was a production race that a load measurement found while asking about something else. What made it findable was making the server say what it was doing — the gathering timeout and the refusal both had to be logged before either meant anything.
 
 **Verify:** a load test at target concurrency meets NF-1 and NF-2. Kill Redis: sends still succeed, delivery falls back to gap sync on reconnect. Kill Kafka: sends still succeed, the outbox drains on recovery, nothing is lost (NF-6). A deliberately slow client is disconnected rather than being allowed to consume unbounded memory.
 

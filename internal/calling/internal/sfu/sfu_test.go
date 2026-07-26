@@ -381,3 +381,87 @@ func TestCallsAreIsolated(t *testing.T) {
 	}
 	_ = insider
 }
+
+// TestEverybodyJoiningAtOnceStillSeesEverybody is the concurrency case, and it is the normal
+// one rather than an exotic one: a full call's worth of people pressing join at the same
+// moment. Eight, because eight is the participant limit, so this is the largest real call.
+//
+// Written after a bug that this test does not catch, and saying so is more useful than
+// implying otherwise. A participant is in the call's map before its own offer/answer exchange
+// finishes, so another publisher's track arriving in that window started a renegotiation
+// against a connection sitting in have-remote-offer; Pion refused it and the participant was
+// left never receiving another track for the rest of the call. The fix is in Join.
+//
+// Restoring the bug and running this eight-way race four times passes every time, because
+// signalling here is a function call: Join returns in microseconds and the window barely
+// exists. What found it was scripts/capacity.sh, where signalling is HTTP and sixty-four
+// peers were joining — the window is milliseconds wide there, and the node logged the
+// refusal twice.
+//
+// It is kept because nothing else in this suite joins concurrently at all, so a coarser
+// regression in the same area would have nowhere else to be caught. What it is not is
+// evidence about that bug.
+func TestEverybodyJoiningAtOnceStillSeesEverybody(t *testing.T) {
+	t.Parallel()
+	room := newRoom(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	names := []string{"quinn", "rosa", "sam", "tess", "ugo", "vera", "wes", "xena"}
+
+	// Concurrently, which is the whole point: the sequential helper cannot reach the window
+	// because each join is finished before the next one starts.
+	var joining sync.WaitGroup
+	peers := make([]*harness.Peer, len(names))
+	failures := make([]error, len(names))
+	for index, name := range names {
+		joining.Add(1)
+		go func() {
+			defer joining.Done()
+			signaller := newDirect(room.server, "call-8", name)
+			room.mutex.Lock()
+			room.signallers[name] = signaller
+			room.mutex.Unlock()
+
+			// Not room.join, because that calls t.Fatalf and doing so off the test's own
+			// goroutine is undefined. Collected and reported below instead.
+			peer, err := harness.NewPeer(ctx, signaller, harness.PeerOptions{
+				Name: name, Publish: true, Logger: quiet(),
+			})
+			peers[index], failures[index] = peer, err
+		}()
+	}
+	joining.Wait()
+
+	for index, err := range failures {
+		if err != nil {
+			t.Fatalf("%s could not join: %v", names[index], err)
+		}
+		t.Cleanup(func() { _ = peers[index].Close(context.Background()) })
+	}
+
+	// Everybody receiving everybody else: seven video tracks each, in a call of eight. One
+	// short would mean a renegotiation was refused and never retried.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		incomplete := ""
+		for index, peer := range peers {
+			if videoTracks(peer) < len(names)-1 {
+				incomplete = names[index]
+				break
+			}
+		}
+		if incomplete == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			for index, peer := range peers {
+				t.Logf("%s is receiving %d of %d video tracks",
+					names[index], videoTracks(peer), len(names)-1)
+			}
+			t.Fatalf("%s never received everybody", incomplete)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
