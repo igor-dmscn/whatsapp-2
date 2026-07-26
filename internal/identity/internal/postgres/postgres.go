@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"comms/internal/platform/database"
+
 	"comms/internal/identity/internal/domain"
 )
 
@@ -23,18 +25,26 @@ import (
 // because Go permits only one method of a given name.
 type (
 	// AccountRepository stores Account aggregates, credentials included.
-	AccountRepository struct{ db *sql.DB }
+	AccountRepository struct{ db database.Conn }
 
 	// DeviceRepository stores Device aggregates.
-	DeviceRepository struct{ db *sql.DB }
+	DeviceRepository struct{ db database.Conn }
 
 	// SessionRepository stores Session aggregates.
-	SessionRepository struct{ db *sql.DB }
+	SessionRepository struct{ db database.Conn }
 )
 
-func NewAccountRepository(db *sql.DB) *AccountRepository { return &AccountRepository{db} }
-func NewDeviceRepository(db *sql.DB) *DeviceRepository   { return &DeviceRepository{db} }
-func NewSessionRepository(db *sql.DB) *SessionRepository { return &SessionRepository{db} }
+func NewAccountRepository(db *sql.DB) *AccountRepository {
+	return &AccountRepository{database.NewConn(db)}
+}
+
+func NewDeviceRepository(db *sql.DB) *DeviceRepository {
+	return &DeviceRepository{database.NewConn(db)}
+}
+
+func NewSessionRepository(db *sql.DB) *SessionRepository {
+	return &SessionRepository{database.NewConn(db)}
+}
 
 var (
 	_ domain.AccountRepository = (*AccountRepository)(nil)
@@ -62,48 +72,40 @@ const uniqueViolation = "23505"
 // removed or edited, so deleting and reinserting would churn the table and lose
 // created_at for no reason.
 func (r *AccountRepository) Save(ctx context.Context, account *domain.Account) error {
-	transaction, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
-	}
-	defer func() { _ = transaction.Rollback() }()
-
-	_, err = transaction.ExecContext(ctx,
-		`INSERT INTO accounts (id, handle, email, created_at)
-		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (id) DO UPDATE SET handle = EXCLUDED.handle, email = EXCLUDED.email`,
-		string(account.ID()), string(account.Handle()), string(account.Email()), account.CreatedAt(),
-	)
-	if err != nil {
-		switch constraintName(err) {
-		case handleIndex:
-			return domain.ErrHandleTaken
-		case emailIndex:
-			return domain.ErrEmailTaken
-		}
-		return fmt.Errorf("upsert account: %w", err)
-	}
-
-	for _, credential := range account.Credentials() {
-		_, err = transaction.ExecContext(ctx,
-			`INSERT INTO credentials (id, account_id, kind, material, created_at)
-			 VALUES ($1, $2, $3, $4, $5)
-			 ON CONFLICT (id) DO NOTHING`,
-			string(credential.ID()), string(credential.AccountID()), string(credential.Kind()),
-			credential.Material(), credential.CreatedAt(),
+	return r.db.InTransaction(ctx, func(ctx context.Context) error {
+		_, err := r.db.ExecContext(ctx,
+			`INSERT INTO accounts (id, handle, email, created_at)
+			 VALUES ($1, $2, $3, $4)
+			 ON CONFLICT (id) DO UPDATE SET handle = EXCLUDED.handle, email = EXCLUDED.email`,
+			string(account.ID()), string(account.Handle()), string(account.Email()), account.CreatedAt(),
 		)
 		if err != nil {
-			if constraintName(err) == passwordIndex {
-				return domain.ErrPasswordAlreadySet
+			switch constraintName(err) {
+			case handleIndex:
+				return domain.ErrHandleTaken
+			case emailIndex:
+				return domain.ErrEmailTaken
 			}
-			return fmt.Errorf("upsert credential: %w", err)
+			return fmt.Errorf("upsert account: %w", err)
 		}
-	}
 
-	if err := transaction.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
-	}
-	return nil
+		for _, credential := range account.Credentials() {
+			_, err = r.db.ExecContext(ctx,
+				`INSERT INTO credentials (id, account_id, kind, material, created_at)
+				 VALUES ($1, $2, $3, $4, $5)
+				 ON CONFLICT (id) DO NOTHING`,
+				string(credential.ID()), string(credential.AccountID()), string(credential.Kind()),
+				credential.Material(), credential.CreatedAt(),
+			)
+			if err != nil {
+				if constraintName(err) == passwordIndex {
+					return domain.ErrPasswordAlreadySet
+				}
+				return fmt.Errorf("upsert credential: %w", err)
+			}
+		}
+		return nil
+	})
 }
 
 func (r *AccountRepository) ByHandle(ctx context.Context, normalisedHandle string) (*domain.Account, error) {

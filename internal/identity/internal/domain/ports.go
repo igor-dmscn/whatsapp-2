@@ -107,3 +107,13 @@ type IDs interface {
 	NewDeviceID() DeviceID
 	NewSessionID() SessionID
 }
+
+// Transactor runs work atomically.
+//
+// Declared because the application layer owns transaction boundaries (ADR-0010),
+// and the transactional outbox depends on it: an event row must commit with the
+// state change it describes, so the use case decides what "together" means rather
+// than each repository deciding for itself.
+type Transactor interface {
+	InTransaction(ctx context.Context, work func(context.Context) error) error
+}

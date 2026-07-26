@@ -24,6 +24,7 @@ import (
 	"comms/internal/identity/internal/app"
 	"comms/internal/identity/internal/hashing"
 	"comms/internal/identity/internal/postgres"
+	"comms/internal/platform/database"
 	"comms/internal/platform/database/testdb"
 	"comms/internal/platform/httpx"
 	"comms/internal/platform/id"
@@ -61,6 +62,7 @@ func newHarness(t *testing.T) (*harness, *clock) {
 		postgres.NewSessionRepository(db),
 		hashing.NewArgon2Hasher(cheap),
 		events,
+		database.NewConn(db),
 		app.IDs{},
 		testClock.now,
 	)

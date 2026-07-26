@@ -24,6 +24,7 @@ import (
 	"comms/internal/identity/internal/app"
 	"comms/internal/identity/internal/hashing"
 	"comms/internal/identity/internal/postgres"
+	"comms/internal/platform/database"
 )
 
 // Module is a wired Identity context.
@@ -41,7 +42,10 @@ func New(db *sql.DB, logger *slog.Logger) *Module {
 		postgres.NewDeviceRepository(db),
 		postgres.NewSessionRepository(db),
 		hashing.NewArgon2Hasher(hashing.DefaultArgon2Params()),
-		app.NewLoggingPublisher(logger),
+		// Events go to the outbox, in the same transaction as the change they
+		// describe (ADR-0003). The relay in cmd/worker publishes them to Kafka.
+		postgres.NewOutboxPublisher(db),
+		database.NewConn(db),
 		app.IDs{},
 		time.Now,
 	)

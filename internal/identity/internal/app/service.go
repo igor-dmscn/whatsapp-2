@@ -21,13 +21,14 @@ type Clock func() time.Time
 
 // Service carries out identity use cases.
 type Service struct {
-	accounts domain.AccountRepository
-	devices  domain.DeviceRepository
-	sessions domain.SessionRepository
-	hasher   domain.Hasher
-	events   domain.EventPublisher
-	ids      domain.IDs
-	now      Clock
+	accounts   domain.AccountRepository
+	devices    domain.DeviceRepository
+	sessions   domain.SessionRepository
+	hasher     domain.Hasher
+	events     domain.EventPublisher
+	transactor domain.Transactor
+	ids        domain.IDs
+	now        Clock
 }
 
 // NewService wires a Service. Passing nil for now defaults to time.Now.
@@ -37,13 +38,14 @@ func NewService(
 	sessions domain.SessionRepository,
 	hasher domain.Hasher,
 	events domain.EventPublisher,
+	transactor domain.Transactor,
 	ids domain.IDs,
 	now Clock,
 ) *Service {
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{accounts, devices, sessions, hasher, events, ids, now}
+	return &Service{accounts, devices, sessions, hasher, events, transactor, ids, now}
 }
 
 // Session is what a client receives on register, login or refresh.
@@ -93,10 +95,14 @@ func (s *Service) Register(ctx context.Context, handle, email, passphrase, devic
 		return nil, Session{}, err
 	}
 
-	if err := s.accounts.Save(ctx, account); err != nil {
-		return nil, Session{}, fmt.Errorf("save account: %w", err)
+	if err := s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.accounts.Save(ctx, account); err != nil {
+			return err
+		}
+		return s.publish(ctx, account.TakeEvents())
+	}); err != nil {
+		return nil, Session{}, err
 	}
-	s.publish(ctx, account.TakeEvents())
 
 	session, err := s.startDeviceSession(ctx, account.ID(), deviceName, now)
 	if err != nil {
@@ -174,10 +180,14 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (Session, er
 	if err != nil {
 		return Session{}, err
 	}
-	if err := s.sessions.Save(ctx, session); err != nil {
-		return Session{}, fmt.Errorf("save session: %w", err)
+	if err := s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.sessions.Save(ctx, session); err != nil {
+			return err
+		}
+		return s.publish(ctx, session.TakeEvents())
+	}); err != nil {
+		return Session{}, err
 	}
-	s.publish(ctx, session.TakeEvents())
 
 	return newSession(device.ID(), secrets), nil
 }
@@ -228,14 +238,21 @@ func (s *Service) RevokeDevice(ctx context.Context, accountID domain.AccountID, 
 		return nil
 	}
 
-	if err := s.devices.Save(ctx, device); err != nil {
-		return fmt.Errorf("save device: %w", err)
-	}
-	if err := s.sessions.DeleteForDevice(ctx, device.ID()); err != nil {
-		return fmt.Errorf("delete device sessions: %w", err)
-	}
-	s.publish(ctx, device.TakeEvents())
-	return nil
+	// All three together, and this is the use case where it matters most. ID-4
+	// promises revocation takes effect within thirty seconds; Messaging keeps that
+	// promise for already-open sockets by reacting to identity.device_revoked. A
+	// crash between saving the device and recording the event would revoke the
+	// device in the database while leaving its sockets connected, and nothing
+	// afterwards would notice.
+	return s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.devices.Save(ctx, device); err != nil {
+			return fmt.Errorf("save device: %w", err)
+		}
+		if err := s.sessions.DeleteForDevice(ctx, device.ID()); err != nil {
+			return fmt.Errorf("delete device sessions: %w", err)
+		}
+		return s.publish(ctx, device.TakeEvents())
+	})
 }
 
 // Devices lists an account's devices, revoked ones included — a device that
@@ -303,11 +320,12 @@ func (s *Service) AddCredential(ctx context.Context, accountID domain.AccountID,
 	if err := account.AddCredential(s.ids.NewCredentialID(), kind, material, s.now()); err != nil {
 		return err
 	}
-	if err := s.accounts.Save(ctx, account); err != nil {
-		return fmt.Errorf("save account: %w", err)
-	}
-	s.publish(ctx, account.TakeEvents())
-	return nil
+	return s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.accounts.Save(ctx, account); err != nil {
+			return err
+		}
+		return s.publish(ctx, account.TakeEvents())
+	})
 }
 
 // PurgeExpiredSessions deletes sessions that can no longer be refreshed. Expiry
@@ -330,32 +348,52 @@ func (s *Service) startDeviceSession(ctx context.Context, accountID domain.Accou
 	if err != nil {
 		return Session{}, err
 	}
-	if err := s.devices.Save(ctx, device); err != nil {
-		return Session{}, fmt.Errorf("save device: %w", err)
-	}
-	s.publish(ctx, device.TakeEvents())
-
 	session, secrets, err := domain.StartSession(s.ids.NewSessionID(), device.ID(), now)
 	if err != nil {
 		return Session{}, err
 	}
-	if err := s.sessions.Save(ctx, session); err != nil {
-		return Session{}, fmt.Errorf("save session: %w", err)
+
+	// One transaction for both. A device saved without its session is a device
+	// nobody can use and nothing will clean up.
+	if err := s.atomically(ctx, func(ctx context.Context) error {
+		if err := s.devices.Save(ctx, device); err != nil {
+			return fmt.Errorf("save device: %w", err)
+		}
+		if err := s.publish(ctx, device.TakeEvents()); err != nil {
+			return err
+		}
+		if err := s.sessions.Save(ctx, session); err != nil {
+			return fmt.Errorf("save session: %w", err)
+		}
+		return s.publish(ctx, session.TakeEvents())
+	}); err != nil {
+		return Session{}, err
 	}
-	s.publish(ctx, session.TakeEvents())
 
 	return newSession(device.ID(), secrets), nil
 }
 
-// publish hands recorded events to the publisher.
+// atomically runs work in one transaction.
 //
-// A publish failure does not fail the use case: the state change is already
-// committed, and refusing a successful registration because a log line could not
-// be written would be worse than a missing event. Phase 3 removes the choice by
-// writing events in the same transaction as the aggregate.
-func (s *Service) publish(ctx context.Context, events []domain.Event) {
+// Every use case that changes state and records events uses it, because the outbox
+// only means anything if the event row and the state change commit together.
+func (s *Service) atomically(ctx context.Context, work func(context.Context) error) error {
+	return s.transactor.InTransaction(ctx, work) //nolint:wrapcheck // the closure's error is the caller's own.
+}
+
+// publish records events for publication, in the caller's transaction.
+//
+// A failure here now fails the use case, which is the opposite of what the interim
+// publisher did and is the point of the change. Committing a state change whose
+// event could not be recorded is how an unread badge goes permanently missing — and
+// worse, how a revoked device keeps its sockets. If the fact cannot be recorded, the
+// change must not happen.
+func (s *Service) publish(ctx context.Context, events []domain.Event) error {
 	if len(events) == 0 {
-		return
+		return nil
 	}
-	_ = s.events.Publish(ctx, events)
+	if err := s.events.Publish(ctx, events); err != nil {
+		return fmt.Errorf("publish events: %w", err)
+	}
+	return nil
 }
