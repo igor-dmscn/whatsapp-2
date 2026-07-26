@@ -53,6 +53,33 @@ export type CallOptions = {
   media?: () => Promise<MediaStream>
 }
 
+/** constraints are what to capture: whatever the device offers.
+ *
+ *  No resolution asked for, and that was tried. The ladder below encodes the same frame at a
+ *  half and a quarter of its width, and how many of those a browser actually runs depends on
+ *  the resolution it captured — Chrome runs three at around 720p and fewer below. So asking
+ *  for 720p looked like the way to get three layers. It did not change the layer count at all,
+ *  and it cost enough encoding to time out unrelated parts of the browser suite. How many
+ *  layers result is the browser's decision, and paying for a bigger capture to influence it is
+ *  a trade to make against a measurement rather than a hope. */
+const constraints: MediaStreamConstraints = { audio: true, video: true }
+
+/** layers is the quality ladder this client publishes.
+ *
+ *  Three, with the names browsers conventionally use: q for quarter, h for half, f for full.
+ *  The server identifies a layer by that name — it arrives in an RTP header extension — so
+ *  they are part of the wire rather than a local label.
+ *
+ *  `scaleResolutionDownBy` is what actually makes the layers differ: the browser encodes the
+ *  same camera at a third and a quarter of its width. `maxBitrate` alone would give three
+ *  encodings of the same resolution, which costs nearly as much to send and buys a receiver
+ *  much less than a smaller picture would. */
+const layers: RTCRtpEncodingParameters[] = [
+  { rid: 'q', scaleResolutionDownBy: 4, maxBitrate: 100_000 },
+  { rid: 'h', scaleResolutionDownBy: 2, maxBitrate: 300_000 },
+  { rid: 'f', scaleResolutionDownBy: 1, maxBitrate: 900_000 },
+]
+
 /** iceServers is empty on purpose.
  *
  *  Everything here is on one network, and a public STUN lookup would add a round trip to
@@ -99,13 +126,33 @@ export class Call {
   async join(conversationID: string): Promise<void> {
     if (this.connection) return
 
-    const capture = this.options.media ?? (() => navigator.mediaDevices.getUserMedia({ audio: true, video: true }))
+    const capture = this.options.media ?? (() => navigator.mediaDevices.getUserMedia(constraints))
     const local = await capture()
 
     const connection = new RTCPeerConnection({ iceServers })
     this.connection = connection
 
-    for (const track of local.getTracks()) connection.addTrack(track, local)
+    for (const track of local.getTracks()) {
+      if (track.kind !== 'video') {
+        connection.addTrack(track, local)
+        continue
+      }
+
+      // Video goes up as three qualities at once, so the server has something to choose
+      // between per receiver (CL-5). A transceiver rather than addTrack, because encodings
+      // can only be declared when the transceiver is created — set afterwards through
+      // setParameters, a browser will accept the call and quietly send one layer.
+      //
+      // The cost is real and is the trade simulcast makes: this uploads roughly a third more
+      // than the top layer alone, and it is paid by the person with the *worst* connection in
+      // any call where somebody else needs the small layer. It buys the alternative not being
+      // "everybody drops to the worst participant's bitrate".
+      connection.addTransceiver(track, {
+        direction: 'sendrecv',
+        streams: [local],
+        sendEncodings: layers,
+      })
+    }
 
     connection.ontrack = (event) => this.receive(event)
     connection.onconnectionstatechange = () => {

@@ -251,7 +251,7 @@ Three findings, all from running it:
 
 ---
 
-## Phase 9 — SFU — **steps 1 and 2 done; simulcast and the measurements remain**
+## Phase 9 — SFU — **complete**
 
 **Goal:** live audio and video calls. The largest and riskiest phase ([ADR-0006](./adr/0006-custom-pion-sfu-with-simulcast.md)).
 
@@ -310,9 +310,35 @@ Two things came out of it. The node address now defaults per process, so the mis
 
   Fixed by treating the join as the exchange it is. What that did to the same 64-peer run: join time 24.7 s → **9.4 s**, slowest first packet 5.08 s → **193 ms**, five warnings → **none**.
 
+- **Simulcast (CL-5)**, step 3 — the step this plan said to stop before under pressure, and the item ADR-0006 called the largest in the project. One publisher's three qualities, one chosen **per receiver**, and the choice revisited as receivers report what they can take.
+
+  Measured, in one call with one publisher sending a ladder of 75 / 200 / 600 kbit/s:
+
+  | Receiver | Says it can take | Is sent |
+  |---|---|---|
+  | says nothing | — | **591 kbit/s** |
+  | reports 150 kbit/s | 150 kbit/s | **73 kbit/s** |
+  | then reports recovery | 10 Mbit/s | **591 kbit/s** again |
+
+  Three things carry it, and all three are load-bearing:
+
+  - **A switch happens only on a keyframe.** A decoder resolves each frame against the previous one, so handing it the middle of a different encode produces the smear people describe as "the video broke".
+  - **Sequence numbers and timestamps are rewritten.** Each layer numbers its own packets from its own start, so forwarding them unchanged reads to a receiver as catastrophic loss at the moment of every switch. An offset per subscription, rebased at each switch, is what makes it invisible — and it is why a subscription now owns a track rather than sharing one per source.
+  - **A keyframe is asked for, not waited for.** Otherwise the switch lands whenever the publisher's next scheduled keyframe does: up to two seconds of continuing to send a layer the receiver has just said it cannot take. The same lesson NF-3 taught at join.
+
+  **Selection is a periodic decision, not an event handler**, and the first version got that wrong. Reacting only to bandwidth reports meant a client that sends none — most of them — stayed forever on whichever layer happened to deliver the first keyframe: a receiver on a fast link watching the smallest encoding, with nothing anywhere reporting a problem.
+
+  Two more findings worth the space:
+
+  - **Pion cannot publish simulcast.** It receives it, but its sender never stamps the stream identifier into the RTP header extension that tells layers apart — Pion's own simulcast test writes that extension by hand, which is as clear a statement as exists. So the harness packetises its own video and stamps its own headers, and the sample-based publish path is gone.
+  - **The empty string is a real RID.** It is what a single-layer publisher uses, and using it internally to mean "no layer chosen yet" made every single-layer stream re-enter the not-chosen-yet branch on every packet. Only keyframes were forwarded: two packets in two seconds, video that technically arrived, and every existing assertion still passing.
+
+  **The browser publishes layers too**, since a server that can choose between them is worth nothing if no real client sends them. Chrome sends two per camera here rather than the three the ladder asks for — it decides how many VP8 encodings are worth running from the capture resolution, and a headless fake device is below the threshold for three. Asking for 720p to get the third was tried: it changed the layer count not at all and cost enough encoding to time out unrelated tests, so it is not in the client.
+
 **Not done.**
 
-- **Simulcast (CL-5)** — step 3, which the plan itself says to stop before under pressure.
+- **Layer starvation**, named as an accepted cost in ADR-0006 and still not addressed: a publisher whose upload cannot sustain three encodings starves the top one, and this server would keep selecting a layer that has stopped arriving. It needs a liveness check per layer — measured bitrate is already there to build it from.
+- **Server-side bandwidth estimation.** Selection runs on what receivers report. A receiver that says nothing gets the best layer, which is right until it is not; inferring congestion without being told needs a congestion controller and a real constrained path to test it on.
 
 **Two decisions, both forced by running it.**
 
@@ -329,7 +355,7 @@ Three findings:
 
 **Verify:** two browsers plus the harness hold a group call. Drop 5% of packets and confirm video recovers rather than freezing beyond 2 seconds (CL-6). Throttle one participant with the phase-8 harness and assert the SFU switches that receiver's layer down and back up. Call join to first media under 2 seconds (NF-3). One-way audio latency under 200 ms (NF-4). Three concurrent 4-way calls on 4 vCPUs (NF-14).
 
-Of those: two browsers hold a call on one node and across two nodes, and a three-party call forwards in every direction under the harness. NF-3 is 109 ms, NF-4 is 431 µs, NF-14 has four times the headroom the requirement asks for. Keyframe recovery is measured at 21 ms against CL-6's two seconds, but *packet loss* is not — the harness can throttle and cannot yet drop. Layer switching needs simulcast.
+Of those: two browsers hold a call on one node and across two nodes, and a three-party call forwards in every direction under the harness. NF-3 is 109 ms, NF-4 is 431 µs, NF-14 has four times the headroom the requirement asks for. Keyframe recovery is measured at 21 ms against CL-6's two seconds, but *packet loss* is not — the harness can throttle and cannot yet drop. A receiver that reports less bandwidth is switched down a layer and back up, per receiver, which is the layer-switching assertion — provoked by the report the server reacts to rather than by a shaped network.
 
 ---
 

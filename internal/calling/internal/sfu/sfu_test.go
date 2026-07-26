@@ -135,17 +135,34 @@ func newRoom(t *testing.T) *room {
 // join adds a peer to a call.
 func (r *room) join(t *testing.T, ctx context.Context, callID, name string, publish bool) *harness.Peer {
 	t.Helper()
+	return r.joining(t, ctx, harness.PeerOptions{Name: name, Publish: publish, Logger: quiet()}, callID)
+}
 
-	signaller := newDirect(r.server, callID, name)
+// joinSimulcast adds a peer publishing three quality layers, which is what CL-5 selects
+// between.
+func (r *room) joinSimulcast(t *testing.T, ctx context.Context, callID, name string) *harness.Peer {
+	t.Helper()
+	return r.joining(t, ctx, harness.PeerOptions{
+		Name: name, Publish: true, Simulcast: true, Logger: quiet(),
+	}, callID)
+}
+
+func (r *room) joining(
+	t *testing.T,
+	ctx context.Context,
+	options harness.PeerOptions,
+	callID string,
+) *harness.Peer {
+	t.Helper()
+
+	signaller := newDirect(r.server, callID, options.Name)
 	r.mutex.Lock()
-	r.signallers[name] = signaller
+	r.signallers[options.Name] = signaller
 	r.mutex.Unlock()
 
-	peer, err := harness.NewPeer(ctx, signaller, harness.PeerOptions{
-		Name: name, Publish: publish, Logger: quiet(),
-	})
+	peer, err := harness.NewPeer(ctx, signaller, options)
 	if err != nil {
-		t.Fatalf("%s: %v", name, err)
+		t.Fatalf("%s: %v", options.Name, err)
 	}
 	t.Cleanup(func() { _ = peer.Close(context.Background()) })
 	return peer
@@ -464,4 +481,108 @@ func TestEverybodyJoiningAtOnceStillSeesEverybody(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// TestALayerIsChosenPerReceiver is CL-5.
+//
+// One publisher sending three qualities, two receivers wanting different things. The one that
+// says it has little bandwidth must be moved down, the one that says nothing must stay on the
+// best layer, and neither may notice anything other than the bitrate changing — a switch that
+// costs a freeze is a switch nobody wants.
+//
+// Driven by a receiver's own bandwidth report rather than by a shaped network, for the reason
+// phase 8 recorded when it built the lever: real throttling means a traffic shaper, which is
+// privileged, platform-specific and flaky, and what the server reacts to is the message. What
+// this does not test is the estimator that would produce that message in a browser.
+func TestALayerIsChosenPerReceiver(t *testing.T) {
+	t.Parallel()
+	room := newRoom(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*budget)
+	defer cancel()
+
+	publisher := room.joinSimulcast(t, ctx, "call-9", "broadcaster")
+	generous := room.join(t, ctx, "call-9", "generous", false)
+	frugal := room.join(t, ctx, "call-9", "frugal", false)
+
+	for name, peer := range map[string]*harness.Peer{"generous": generous, "frugal": frugal} {
+		if err := peer.WaitForWatchableVideo(ctx); err != nil {
+			t.Fatalf("%s saw nothing: %v", name, err)
+		}
+	}
+
+	// A second of measurement before anything is chosen, because selection compares a
+	// receiver's estimate against what each layer is actually carrying and neither number
+	// exists yet. This wait is the price of measuring rather than trusting the SDP.
+	time.Sleep(measured)
+
+	// The frugal receiver can take a little more than the smallest layer and much less than
+	// the largest. The publisher's ladder is bitrate/8, bitrate/3 and bitrate, so this sits
+	// between the bottom two rungs and the answer is unambiguous.
+	const frugalEstimate = 150_000
+	if err := frugal.ReportBandwidth(frugalEstimate); err != nil {
+		t.Fatalf("frugal reporting bandwidth: %v", err)
+	}
+
+	// Measured after the report rather than across it: what matters is the rate while the
+	// choice is in effect, and averaging over the switch would blend the two layers.
+	time.Sleep(measured * 3)
+	before := map[string]int{
+		"generous": rateOver(t, ctx, generous, measured*2),
+		"frugal":   rateOver(t, ctx, frugal, measured*2),
+	}
+	t.Logf("after the frugal receiver reported %d bit/s: generous %d bit/s, frugal %d bit/s",
+		frugalEstimate, before["generous"], before["frugal"])
+
+	if before["frugal"] > frugalEstimate {
+		t.Fatalf("the frugal receiver is being sent %d bit/s after asking for %d",
+			before["frugal"], frugalEstimate)
+	}
+	// Per receiver, which is the whole claim. A server that dropped everybody to the small
+	// layer would satisfy the line above and fail this one.
+	if before["generous"] <= before["frugal"]*2 {
+		t.Fatalf("both receivers are getting the same layer: generous %d, frugal %d",
+			before["generous"], before["frugal"])
+	}
+
+	// And back up, because a layer selection that only goes down is a call that never
+	// recovers from one bad second.
+	if err := frugal.ReportBandwidth(10_000_000); err != nil {
+		t.Fatalf("frugal reporting recovery: %v", err)
+	}
+	time.Sleep(measured * 3)
+	recovered := rateOver(t, ctx, frugal, measured*2)
+	t.Logf("after reporting recovery: frugal %d bit/s", recovered)
+
+	if recovered <= before["frugal"]*2 {
+		t.Fatalf("the frugal receiver is still on the small layer: %d bit/s, was %d",
+			recovered, before["frugal"])
+	}
+
+	// One track throughout. Three layers arriving must not become three tracks on a
+	// receiver, or every client would have to know what simulcast is.
+	for name, peer := range map[string]*harness.Peer{"generous": generous, "frugal": frugal} {
+		if tracks := videoTracks(peer); tracks != 1 {
+			t.Fatalf("%s is receiving %d video tracks, want 1", name, tracks)
+		}
+	}
+	_ = publisher
+}
+
+// measured is the server's bitrate measurement window, which selection cannot act before.
+const measured = time.Second
+
+// rateOver returns the bitrate a peer receives over a window, from its own counters.
+func rateOver(t *testing.T, ctx context.Context, peer *harness.Peer, window time.Duration) int {
+	t.Helper()
+
+	start := peer.Received("video")
+	select {
+	case <-ctx.Done():
+		t.Fatalf("measuring %s: %v", peer.Name(), ctx.Err())
+	case <-time.After(window):
+	}
+	end := peer.Received("video")
+
+	return int(float64((end.Bytes-start.Bytes)*8) / window.Seconds())
 }

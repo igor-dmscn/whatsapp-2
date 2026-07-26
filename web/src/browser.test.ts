@@ -1242,6 +1242,40 @@ describe.skipIf(!live)('calls', () => {
     }
   }, timeout * 2)
 
+  it('publishes several video layers for the server to choose between', async () => {
+    // CL-5 from the client's side, which is the half that cannot be assumed. The server's
+    // layer selection is worth nothing if no real client sends layers, and whether Chrome
+    // honoured `sendEncodings` is not something the SDP settles — a browser will accept the
+    // call and quietly send one encoding if the encodings were declared too late.
+    //
+    // Asserted on the *excess* of layers over sources, because every source contributes one
+    // layer whether it is simulcast or not: four sources here — two cameras and two
+    // microphones — so any excess at all is a camera sending more than one quality. Asserting
+    // the total would pass with no simulcast whatsoever, which is how the first version of
+    // this was wrong.
+    //
+    // Two per camera rather than the three the ladder asks for, and that is Chrome rather
+    // than a bug: it decides how many VP8 encodings are worth running from the capture
+    // resolution, and a headless fake device gives less than the 720p at which it will run
+    // three. What the requirement asks for is several layers and a server that chooses
+    // between them; three specifically is the harness's job, where the publisher is ours.
+    const media = await fetch(`${sfuURL}/health`).then((response) => response.json())
+    const excess = media.layers - media.sources
+    if (excess < 2) {
+      throw new Error(
+        `only ${excess} layers beyond one per source: ${media.sources} sources, ` +
+          `${media.layers} layers, ${media.subscriptions} subscriptions`,
+      )
+    }
+
+    // And grouped: three qualities of one camera must reach a receiver as one track, or every
+    // client would have to know what simulcast is. Two people in the call, so one remote tile
+    // each — three would mean the layers leaked through as separate tracks.
+    for (const person of [caller, callee]) {
+      expect(await person.page.locator('.tiles video').count()).toBe(2)
+    }
+  }, timeout)
+
   it('mutes locally without renegotiating', async () => {
     // Disabled rather than removed, so nothing about the connection changes — which is why
     // this asserts on the button rather than on anything about the media.

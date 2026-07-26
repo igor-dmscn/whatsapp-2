@@ -59,6 +59,12 @@ func (n *MediaNode) Calls() int { return n.server.Calls() }
 // Participants reports how many transports a call holds on this node.
 func (n *MediaNode) Participants(callID string) int { return n.server.Participants(callID) }
 
+// Forwarding reports what this node is carrying: sources, the layers they arrive as, and the
+// subscriptions those are forwarded to.
+func (n *MediaNode) Forwarding() (sources, layers, subscriptions int) {
+	return n.server.Forwarding()
+}
+
 // OfferSubscribers reports how many api nodes are listening for this node's offers.
 //
 // Worth reporting on its own rather than folded into a status word: zero means every call on

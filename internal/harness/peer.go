@@ -13,6 +13,9 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 )
@@ -66,8 +69,12 @@ type PeerOptions struct {
 	// Publish is whether this peer sends. A receive-only peer is the other half of every
 	// forwarding assertion, and the shape a viewer in a broadcast takes.
 	Publish bool
-	Source  SourceOptions
-	Logger  *slog.Logger
+	// Simulcast makes this peer publish three video layers instead of one, which is what
+	// CL-5 needs something to choose between. Off by default: most runs are not about
+	// layers, and three of them is three times the bytes.
+	Simulcast bool
+	Source    SourceOptions
+	Logger    *slog.Logger
 }
 
 // Peer is one simulated participant.
@@ -75,11 +82,15 @@ type Peer struct {
 	name       string
 	connection *webrtc.PeerConnection
 	signaller  Signaller
-	source     *Source
+	options    PeerOptions
 	logger     *slog.Logger
 
-	video *webrtc.TrackLocalStaticSample
-	audio *webrtc.TrackLocalStaticSample
+	// video is one entry per published layer, each with its own source: the point of
+	// simulcast is that the layers differ, so they cannot share a frame generator.
+	video []*layer
+	// videoSender carries every layer, because they are encodings of one sender.
+	videoSender *webrtc.RTPSender
+	audio       *webrtc.TrackLocalStaticSample
 
 	mutex    sync.Mutex
 	received map[string]*Arrivals
@@ -100,6 +111,20 @@ func NewPeer(ctx context.Context, signaller Signaller, options PeerOptions) (*Pe
 	engine := &webrtc.MediaEngine{}
 	if err := engine.RegisterDefaultCodecs(); err != nil {
 		return nil, fmt.Errorf("register codecs: %w", err)
+	}
+
+	// The extensions simulcast is carried by, and they have to be registered on the
+	// *publisher* as well as on the server. Pion offers `a=simulcast:send` and puts the
+	// stream identifier in an RTP header extension only if its media engine knows the
+	// extension; without it three layers go out with nothing to tell them apart and the
+	// server logs "failed Simulcast probing" while OnTrack never fires. RegisterDefaultCodecs
+	// does not bring them, which is easy to assume and wrong.
+	for _, extension := range []string{sdp.SDESMidURI, sdp.SDESRTPStreamIDURI} {
+		if err := engine.RegisterHeaderExtension(
+			webrtc.RTPHeaderExtensionCapability{URI: extension}, webrtc.RTPCodecTypeVideo,
+		); err != nil {
+			return nil, fmt.Errorf("register %s: %w", extension, err)
+		}
 	}
 
 	// The interceptors a real client has: NACK generation so lost packets are asked for,
@@ -130,7 +155,7 @@ func NewPeer(ctx context.Context, signaller Signaller, options PeerOptions) (*Pe
 		name:       options.Name,
 		connection: connection,
 		signaller:  signaller,
-		source:     NewSource(options.Source),
+		options:    options,
 		logger:     logger.With(slog.String("peer", options.Name)),
 		received:   make(map[string]*Arrivals),
 		stop:       make(chan struct{}),
@@ -215,29 +240,211 @@ func (p *Peer) answer(signaller Renegotiable, offer string) error {
 }
 
 func (p *Peer) addTracks() error {
-	var err error
-	p.video, err = webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, "video", "harness-"+p.name)
-	if err != nil {
-		return fmt.Errorf("new video track: %w", err)
-	}
-	p.audio, err = webrtc.NewTrackLocalStaticSample(
+	audio, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "audio", "harness-"+p.name)
 	if err != nil {
 		return fmt.Errorf("new audio track: %w", err)
 	}
+	p.audio = audio
 
-	for _, track := range []*webrtc.TrackLocalStaticSample{p.video, p.audio} {
+	// Video, as one layer or several. Several is what a browser does when asked, and what
+	// CL-5 is about: the same camera encoded at three qualities so the server can choose one
+	// per receiver without asking the publisher to change anything.
+	//
+	// All of them on *one* sender, which is what makes it simulcast rather than three
+	// cameras: they share a media section and are told apart by an RTP header extension
+	// carrying the stream identifier. Three separate senders would negotiate three tracks
+	// and every receiver would get all three.
+	for index, quality := range p.qualities() {
+		options := []func(*webrtc.TrackLocalStaticRTP){}
+		if quality.rid != "" {
+			options = append(options, webrtc.WithRTPStreamID(quality.rid))
+		}
+
+		track, err := webrtc.NewTrackLocalStaticRTP(
+			webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
+			"video", "harness-"+p.name, options...)
+		if err != nil {
+			return fmt.Errorf("new video track %s: %w", quality.rid, err)
+		}
+		p.video = append(p.video, &layer{
+			rid: quality.rid, track: track, source: NewSource(quality.source),
+		})
+
+		if index > 0 {
+			// AddEncoding rather than AddTrack: it attaches this layer to the sender the
+			// first one created. Pion refuses it if the first was not created with a stream
+			// identifier, which is the one ordering constraint here.
+			if err := p.videoSender.AddEncoding(track); err != nil {
+				return fmt.Errorf("add encoding %s: %w", quality.rid, err)
+			}
+			continue
+		}
+
 		sender, err := p.connection.AddTrack(track)
 		if err != nil {
-			return fmt.Errorf("add track: %w", err)
+			return fmt.Errorf("add video track: %w", err)
 		}
+		p.videoSender = sender
+	}
+
+	senders := []*webrtc.RTPSender{p.videoSender}
+	audioSender, err := p.connection.AddTrack(p.audio)
+	if err != nil {
+		return fmt.Errorf("add audio track: %w", err)
+	}
+	senders = append(senders, audioSender)
+
+	for _, sender := range senders {
 		// Feedback has to be read or it accumulates in the transport, and a peer that
 		// ignores PLI never sends the keyframe a new receiver is waiting for — which
 		// looks exactly like a broken SFU.
 		go p.readFeedback(sender)
 	}
 	return nil
+}
+
+// quality is one video layer this peer will publish.
+type quality struct {
+	rid    string
+	source SourceOptions
+}
+
+// layer is a published video layer: the track it goes out on, what generates its frames, and
+// the RTP state a publisher has to keep for itself.
+//
+// Raw RTP rather than samples, and that is forced rather than chosen. A simulcast publisher has
+// to stamp the stream identifier into an RTP header extension on every packet, because that is
+// the only thing telling three layers sharing one media section apart — and Pion's sender does
+// not do it. Its own simulcast test writes the extension by hand, which is the clearest
+// possible statement that the sample path cannot. So the frame is packetised here, and the
+// sequence numbers and timestamps are this peer's own business.
+type layer struct {
+	rid    string
+	track  *webrtc.TrackLocalStaticRTP
+	source *Source
+
+	payloader codecs.VP8Payloader
+	sequence  uint16
+	timestamp uint32
+}
+
+// videoClockRate is VP8's, and is what a frame duration is expressed in.
+const videoClockRate = 90000
+
+// rtpMTU is how much of a frame goes in one packet. 1200 bytes leaves room for the RTP header,
+// the extensions, and SRTP's overhead inside a 1500-byte path.
+const rtpMTU = 1200
+
+// write packetises one frame and sends it, stamped so the server can tell which layer it is.
+func (l *layer) write(frame Frame, extensions videoExtensions) error {
+	payloads := l.payloader.Payload(rtpMTU, frame.Data)
+
+	for index, payload := range payloads {
+		header := rtp.Header{
+			Version: 2,
+			// The last packet of a frame, which is how a receiver knows the frame is
+			// complete. Getting this wrong makes every frame look truncated.
+			Marker:         index == len(payloads)-1,
+			SequenceNumber: l.sequence,
+			Timestamp:      l.timestamp,
+		}
+		l.sequence++
+
+		if l.rid != "" {
+			header.Extension = true
+			header.ExtensionProfile = oneByteExtensionProfile
+			if err := header.SetExtension(extensions.midID, []byte(extensions.mid)); err != nil {
+				return fmt.Errorf("set mid extension: %w", err)
+			}
+			if err := header.SetExtension(extensions.ridID, []byte(l.rid)); err != nil {
+				return fmt.Errorf("set rid extension: %w", err)
+			}
+		}
+
+		if err := l.track.WriteRTP(&rtp.Packet{Header: header, Payload: payload}); err != nil {
+			return fmt.Errorf("write rtp: %w", err)
+		}
+	}
+
+	// Advanced once per frame, not once per packet: every packet of one frame carries the
+	// same timestamp, which is how a receiver knows they belong together.
+	l.timestamp += uint32(frame.Duration.Seconds() * videoClockRate)
+	return nil
+}
+
+// oneByteExtensionProfile is the RTP one-byte header extension form, which is what the
+// identifiers negotiated in SDP are numbered for.
+const oneByteExtensionProfile = 0x1000
+
+// videoExtensions are the negotiated identifiers a simulcast publisher stamps packets with.
+//
+// Negotiated, so they cannot be constants: the numbers are assigned per connection in the SDP,
+// and stamping the wrong one produces packets the server reads as some other extension.
+type videoExtensions struct {
+	mid   string
+	midID uint8
+	ridID uint8
+}
+
+// videoExtensions reads the identifiers this connection agreed on.
+//
+// Empty when there is nothing to stamp — a single-layer publisher, or a peer whose transceiver
+// has no mid yet — and write skips the extensions in that case.
+func (p *Peer) videoExtensions() videoExtensions {
+	if p.videoSender == nil {
+		return videoExtensions{}
+	}
+
+	var found videoExtensions
+	for _, extension := range p.videoSender.GetParameters().HeaderExtensions {
+		switch extension.URI {
+		case sdp.SDESMidURI:
+			found.midID = uint8(extension.ID) //nolint:gosec // extension ids are small by definition.
+		case sdp.SDESRTPStreamIDURI:
+			found.ridID = uint8(extension.ID) //nolint:gosec // as above.
+		}
+	}
+
+	for _, transceiver := range p.connection.GetTransceivers() {
+		if transceiver.Sender() == p.videoSender {
+			found.mid = transceiver.Mid()
+			break
+		}
+	}
+	return found
+}
+
+// qualities is the layers to publish, from lowest to highest.
+//
+// One layer unless asked for more, because most of what the harness is used for — is this
+// forwarded, how many peers can one node carry — is not about layers, and three layers would
+// triple the bytes every one of those runs pushes through.
+//
+// The names are the convention browsers use: q for quarter, h for half, f for full.
+func (p *Peer) qualities() []quality {
+	base := p.options.Source
+	if !p.options.Simulcast {
+		return []quality{{rid: "", source: base}}
+	}
+
+	// Each step down is a quarter of the bitrate and half the frame rate, which is roughly
+	// what a browser's default three-layer ladder produces. The exact numbers matter less
+	// than that they are far enough apart to be told apart by measurement.
+	bitrate := base.Bitrate
+	if bitrate <= 0 {
+		bitrate = defaultBitrate
+	}
+	framerate := base.Framerate
+	if framerate <= 0 {
+		framerate = defaultFramerate
+	}
+
+	return []quality{
+		{rid: "q", source: SourceOptions{Bitrate: bitrate / 8, Framerate: framerate / 2}},
+		{rid: "h", source: SourceOptions{Bitrate: bitrate / 3, Framerate: framerate}},
+		{rid: "f", source: SourceOptions{Bitrate: bitrate, Framerate: framerate}},
+	}
 }
 
 // negotiate does the whole exchange: offer, gather, answer.
@@ -271,21 +478,31 @@ func (p *Peer) negotiate(ctx context.Context) error {
 	return nil
 }
 
-// publish starts the send loops.
+// publish starts the send loops: one per video layer, and one for audio.
 func (p *Peer) publish() {
-	p.sending.Add(2)
-	go func() {
-		defer p.sending.Done()
-		p.sendVideo()
-	}()
+	// Read once, here, because the identifiers are only assigned once negotiation has
+	// finished and they do not change for the life of the connection.
+	extensions := p.videoExtensions()
+
+	for _, sending := range p.video {
+		p.sending.Add(1)
+		go func() {
+			defer p.sending.Done()
+			p.sendVideo(sending, extensions)
+		}()
+	}
+
+	p.sending.Add(1)
 	go func() {
 		defer p.sending.Done()
 		p.sendAudio()
 	}()
 }
 
-func (p *Peer) sendVideo() {
-	ticker := time.NewTicker(p.source.Interval())
+// sendVideo drives one layer. One goroutine per layer, because they run at different frame
+// rates and a shared loop would have to send the slow ones at the fast one's rate.
+func (p *Peer) sendVideo(sending *layer, extensions videoExtensions) {
+	ticker := time.NewTicker(sending.source.Interval())
 	defer ticker.Stop()
 
 	for {
@@ -293,16 +510,16 @@ func (p *Peer) sendVideo() {
 		case <-p.stop:
 			return
 		case <-ticker.C:
-			frame := p.source.Next()
-			if err := p.video.WriteSample(media.Sample{
-				Data: frame.Data, Duration: frame.Duration,
-			}); err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				p.logger.Debug("write video", slog.Any("error", err))
+			frame := sending.source.Next()
+			if err := sending.write(frame, extensions); err != nil &&
+				!errors.Is(err, io.ErrClosedPipe) {
+				p.logger.Debug("write video",
+					slog.String("rid", sending.rid), slog.Any("error", err))
 				return
 			}
 			// The interval is re-read every frame so Throttle takes effect mid-run
 			// rather than at the next reconnection.
-			ticker.Reset(p.source.Interval())
+			ticker.Reset(sending.source.Interval())
 		}
 	}
 }
@@ -352,9 +569,16 @@ func (p *Peer) readFeedback(sender *webrtc.RTPSender) {
 			if _, ok := packet.(*rtcp.PictureLossIndication); ok {
 				// A receiver cannot decode and needs a fresh start. Honouring this is
 				// what makes CL-6's "decoder desync recovered by keyframe request" true
-				// from the publisher's side, and it is the assertion phase 9 will make
-				// when a layer switches.
-				p.source.DemandKeyframe()
+				// from the publisher's side, and it is what lets a layer switch happen
+				// promptly instead of at the next scheduled keyframe.
+				//
+				// Every layer, because RTCP arriving on this sender does not say which
+				// encoding it was about — and a keyframe on a layer nobody is watching
+				// costs one frame. Asking the wrong layer and not the right one would cost
+				// the switch.
+				for _, sending := range p.video {
+					sending.source.DemandKeyframe()
+				}
 			}
 		}
 	}
@@ -435,8 +659,28 @@ func (p *Peer) Received(kind string) Report {
 	return total
 }
 
+// Name is what this peer is called, for reports and failure messages.
+func (p *Peer) Name() string { return p.name }
+
 // Source is the media this peer publishes, so a test can throttle it mid-run.
-func (p *Peer) Source() *Source { return p.source }
+//
+// The highest layer, which is the one worth throttling: a publisher that drops its best
+// encoding is the case a server has to react to. Returns nil for a peer that does not publish.
+func (p *Peer) Source() *Source {
+	if len(p.video) == 0 {
+		return nil
+	}
+	return p.video[len(p.video)-1].source
+}
+
+// Sources is every layer's generator, lowest quality first.
+func (p *Peer) Sources() []*Source {
+	sources := make([]*Source, 0, len(p.video))
+	for _, sending := range p.video {
+		sources = append(sources, sending.source)
+	}
+	return sources
+}
 
 // ReportBandwidth tells the server this peer can only receive so much.
 //

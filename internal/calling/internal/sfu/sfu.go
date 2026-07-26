@@ -22,6 +22,8 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -54,6 +56,10 @@ type Server struct {
 	// because the thing that delivers it is the signalling layer and that needs this
 	// server to exist first.
 	renegotiate Renegotiator
+
+	// done stops the layer selection loop when the server closes.
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // New returns a server.
@@ -86,6 +92,23 @@ func New(options Options) (*Server, error) {
 		return nil, fmt.Errorf("register opus: %w", err)
 	}
 
+	// The two extensions simulcast is made of, and without them a publisher's layers are
+	// indistinguishable. A simulcast sender puts the stream identifier in an RTP header
+	// extension rather than in the SDP, because all the layers share one media section; if
+	// this server does not offer to receive that extension, three layers arrive as three
+	// unlabelled streams and there is no way to say which is which. The MID extension goes
+	// with it — Pion uses the pair to associate a stream with the transceiver it belongs to.
+	//
+	// Registered explicitly because the media engine here is built by hand rather than with
+	// RegisterDefaultCodecs, which is what would otherwise have brought them in.
+	for _, extension := range []string{sdp.SDESMidURI, sdp.SDESRTPStreamIDURI} {
+		if err := engine.RegisterHeaderExtension(
+			webrtc.RTPHeaderExtensionCapability{URI: extension}, webrtc.RTPCodecTypeVideo,
+		); err != nil {
+			return nil, fmt.Errorf("register %s: %w", extension, err)
+		}
+	}
+
 	registry := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(engine, registry); err != nil {
 		return nil, fmt.Errorf("register interceptors: %w", err)
@@ -106,7 +129,7 @@ func New(options Options) (*Server, error) {
 		logger = slog.New(slog.DiscardHandler)
 	}
 
-	return &Server{
+	server := &Server{
 		api: webrtc.NewAPI(
 			webrtc.WithMediaEngine(engine),
 			webrtc.WithInterceptorRegistry(registry),
@@ -114,7 +137,12 @@ func New(options Options) (*Server, error) {
 		),
 		logger: logger,
 		calls:  make(map[string]*call),
-	}, nil
+		done:   make(chan struct{}),
+	}
+
+	go server.selectLayers()
+
+	return server, nil
 }
 
 // Renegotiator is how the server reaches a participant it needs to re-offer to.
@@ -161,10 +189,13 @@ type participant struct {
 	connection *webrtc.PeerConnection
 
 	mutex sync.Mutex
-	// published is what this participant sends, so a later joiner can be given it.
-	published []*published
-	// receiving is what has already been added to this participant's connection, so a
-	// second pass does not add a track twice.
+	// sources is what this participant sends, by source key, so a later joiner can be given
+	// it. One entry per camera or microphone rather than per track: a camera sending three
+	// simulcast layers is one source with three layers, and a receiver subscribes to the
+	// source (see layers.go).
+	sources map[string]*source
+	// receiving is which sources have already been added to this participant's connection,
+	// so a second pass does not add a track twice.
 	receiving map[string]bool
 	// negotiating guards against two renegotiations overlapping. A second offer sent
 	// before the first is answered puts the connection in a state neither side can
@@ -177,15 +208,16 @@ type participant struct {
 	exchange int
 }
 
-// published is one forwarded track and what is needed to send feedback to its publisher.
-type published struct {
-	key   string
-	track *webrtc.TrackLocalStaticRTP
-	// publisher and ssrc are how a receiver's keyframe request reaches whoever can
-	// answer it: feedback travels the opposite way to media, and the SSRC means something
-	// different on each connection.
-	publisher *webrtc.PeerConnection
-	ssrc      uint32
+// sourceList returns this participant's sources. Callers must not hold its lock.
+func (p *participant) sourceList() []*source {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	held := make([]*source, 0, len(p.sources))
+	for _, published := range p.sources {
+		held = append(held, published)
+	}
+	return held
 }
 
 // Join accepts a participant's offer and returns this node's answer.
@@ -202,6 +234,7 @@ func (s *Server) Join(callID, participantID, offer string) (string, error) {
 	joining := &participant{
 		id:         participantID,
 		connection: connection,
+		sources:    make(map[string]*source),
 		receiving:  make(map[string]bool),
 		// An exchange is already in flight — the offer and answer below — and saying so
 		// here rather than afterwards is the point.
@@ -278,8 +311,8 @@ func (s *Server) Join(callID, participantID, offer string) (string, error) {
 	}
 
 	for _, other := range others {
-		for _, track := range other.publishedTracks() {
-			if err := s.deliver(joining, track); err != nil {
+		for _, published := range other.sourceList() {
+			if err := s.deliver(joining, published); err != nil {
 				s.logger.Warn("add existing track", slog.Any("error", err))
 			}
 		}
@@ -405,109 +438,149 @@ func (s *Server) Leave(callID, participantID string) {
 
 // forward copies one published track to every other participant.
 func (s *Server) forward(callID string, from *participant, remote *webrtc.TrackRemote) {
-	local, err := webrtc.NewTrackLocalStaticRTP(
-		remote.Codec().RTPCodecCapability, remote.ID(), remote.StreamID())
-	if err != nil {
-		s.logger.Error("new forwarding track", slog.Any("error", err))
-		return
-	}
-
-	track := &published{
-		key:       from.id + ":" + remote.ID(),
-		track:     local,
-		publisher: from.connection,
-		ssrc:      uint32(remote.SSRC()),
-	}
+	// One source per camera or microphone, however many layers it arrives as. Pion calls
+	// OnTrack once per simulcast layer, all of them naming the same track, so the first one
+	// creates the source and the rest join it — and only the first causes a renegotiation,
+	// because a client is subscribed to the source and does not know layers exist.
+	key := from.id + ":" + remote.ID()
 
 	from.mutex.Lock()
-	from.published = append(from.published, track)
+	published, existing := from.sources[key]
+	if !existing {
+		published = newSource(key, remote, from)
+		from.sources[key] = published
+	}
 	from.mutex.Unlock()
+
+	forwarding := published.add(remote.RID(), uint32(remote.SSRC()))
+	defer published.remove(remote.RID())
 
 	held := s.callFor(callID)
 	held.mutex.RLock()
 	others := held.others(from.id)
 	held.mutex.RUnlock()
 
-	for _, other := range others {
-		if err := s.deliver(other, track); err != nil {
-			s.logger.Warn("deliver track", slog.Any("error", err))
-			continue
+	if !existing {
+		for _, other := range others {
+			if err := s.deliver(other, published); err != nil {
+				s.logger.Warn("deliver track", slog.Any("error", err))
+				continue
+			}
+			// Everyone already in the call needs an offer: they negotiated before this
+			// source existed. This is the renegotiation that makes a two-way call work.
+			//
+			// On its own goroutine, and that is not a detail. This function runs on Pion's
+			// OnTrack callback, and the read loop below does not start until it returns —
+			// so renegotiating inline means waiting for ICE gathering and a client's answer
+			// before forwarding a single packet. With two participants it merely delays the
+			// first frame; with three it wedges, because each new publisher blocks behind
+			// the previous one's exchange.
+			go s.renegotiateWith(callID, other)
 		}
-		// Everyone already in the call needs an offer: they negotiated before this track
-		// existed. This is the renegotiation that makes a two-way call work at all.
-		//
-		// On its own goroutine, and that is not a detail. This function runs on Pion's
-		// OnTrack callback, and the read loop below does not start until it returns —
-		// so renegotiating inline means waiting for ICE gathering and a client's answer
-		// before forwarding a single packet. With two participants it merely delays the
-		// first frame; with three it wedges, because each new publisher blocks behind the
-		// previous one's exchange.
-		go s.renegotiateWith(callID, other)
+	} else {
+		s.logger.Debug("another layer",
+			slog.String("call", callID), slog.String("participant", from.id),
+			slog.String("rid", remote.RID()), slog.Int("layers", published.layerCount()))
 	}
 
 	// A keyframe as soon as there is anyone to send it to, so a joiner does not wait for
 	// the publisher's next scheduled one — up to two seconds of nothing, which is the
 	// difference between NF-3 being met and missed.
 	if len(others) > 0 {
-		s.requestKeyframe(from.connection, track.ssrc)
+		s.requestKeyframe(from.connection, forwarding.ssrc)
 	}
-
-	defer func() {
-		from.mutex.Lock()
-		remaining := make([]*published, 0, len(from.published))
-		for _, held := range from.published {
-			if held.key != track.key {
-				remaining = append(remaining, held)
-			}
-		}
-		from.published = remaining
-		from.mutex.Unlock()
-	}()
 
 	// Whole RTP packets, not samples: an SFU forwards and does not re-packetise.
 	// Re-packetising would discard the payload descriptor a receiver needs to find frame
-	// boundaries, which is the one part of the payload this server does read.
+	// boundaries, which is the one part of the payload this server does read — and with
+	// simulcast it reads it for a second reason, since a layer switch may only happen on a
+	// keyframe.
+	video := remote.Kind() == webrtc.RTPCodecTypeVideo
+	rid := remote.RID()
 	buffer := make([]byte, 1500)
+	var packet rtp.Packet
+
 	for {
 		count, _, err := remote.Read(buffer)
 		if err != nil {
 			return
 		}
-		if _, err := local.Write(buffer[:count]); err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			s.logger.Debug("forward packet", slog.Any("error", err))
-			return
+		if err := packet.Unmarshal(buffer[:count]); err != nil {
+			s.logger.Debug("unparseable packet", slog.Any("error", err))
+			continue
+		}
+
+		now := time.Now()
+		forwarding.record(count, now)
+		keyframe := video && startsKeyframe(packet.Payload)
+
+		for _, receiving := range published.subscriptions() {
+			if err := receiving.write(rid, &packet, keyframe); err != nil &&
+				!errors.Is(err, io.ErrClosedPipe) {
+				s.logger.Debug("forward packet", slog.Any("error", err))
+			}
 		}
 	}
 }
 
-// deliver adds a forwarded track to a participant, once.
-func (s *Server) deliver(to *participant, track *published) error {
+// subscriptions returns everyone receiving this source.
+func (s *source) subscriptions() []*subscription {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	held := make([]*subscription, 0, len(s.subscribers))
+	for _, receiving := range s.subscribers {
+		held = append(held, receiving)
+	}
+	return held
+}
+
+// deliver subscribes a participant to a source, once.
+func (s *Server) deliver(to *participant, from *source) error {
 	to.mutex.Lock()
-	if to.receiving[track.key] {
+	if to.receiving[from.key] {
 		to.mutex.Unlock()
 		return nil
 	}
-	to.receiving[track.key] = true
+	to.receiving[from.key] = true
 	to.mutex.Unlock()
 
-	sender, err := to.connection.AddTrack(track.track)
-	if err != nil {
+	undo := func() {
 		to.mutex.Lock()
-		delete(to.receiving, track.key)
+		delete(to.receiving, from.key)
 		to.mutex.Unlock()
+	}
+
+	receiving, err := newSubscription(from, to)
+	if err != nil {
+		undo()
+		return err
+	}
+
+	sender, err := to.connection.AddTrack(receiving.track)
+	if err != nil {
+		undo()
 		return fmt.Errorf("add track: %w", err)
 	}
+
+	from.mutex.Lock()
+	from.subscribers[to.id] = receiving
+	from.mutex.Unlock()
 
 	// The sender has to be read for its RTCP to exist at all. Without this a receiver's
 	// keyframe request fills a queue nobody drains and the publisher never hears — which
 	// presents as a receiver stuck on a grey rectangle, nothing to do with feedback.
-	// Phase 8 found this against the stub.
-	go s.relayFeedback(sender, track)
+	// Phase 8 found this against the stub. With simulcast it carries the bandwidth report
+	// that layer selection runs on, so it is now two things arriving on one path.
+	go s.relayFeedback(sender, receiving)
 	return nil
 }
 
-// relayFeedback carries a receiver's keyframe requests back to the publisher.
-func (s *Server) relayFeedback(sender *webrtc.RTPSender, track *published) {
+// relayFeedback acts on what a receiver says about the stream it is being sent.
+//
+// Three kinds of message arrive here and each is handled differently, which is most of what
+// distinguishes an SFU from a relay.
+func (s *Server) relayFeedback(sender *webrtc.RTPSender, receiving *subscription) {
 	buffer := make([]byte, 1500)
 	for {
 		count, _, err := sender.Read(buffer)
@@ -520,19 +593,129 @@ func (s *Server) relayFeedback(sender *webrtc.RTPSender, track *published) {
 			continue
 		}
 		for _, packet := range packets {
-			switch packet.(type) {
+			switch report := packet.(type) {
 			case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
-				// Relayed, because only the publisher can produce a keyframe.
-				s.requestKeyframe(track.publisher, track.ssrc)
+				// Relayed, because only the publisher can produce a keyframe — and only for
+				// the layer this receiver is actually being sent, since a keyframe on the
+				// other two would help nobody and cost the publisher its bitrate budget.
+				s.requestCurrentKeyframe(receiving)
+
 			case *rtcp.TransportLayerNack:
-				// Not relayed. A NACK is answered from this server's own send buffer by
-				// the responder interceptor, which is where the packet actually is —
-				// forwarding it to the publisher would ask for a sequence number that
-				// means something different there. This is CL-6's retransmission, and it
-				// works because the server buffers rather than because the publisher does.
+				// Not relayed. A NACK is answered from this server's own send buffer by the
+				// responder interceptor, which is where the packet actually is — forwarding
+				// it to the publisher would ask for a sequence number that means something
+				// different there, and with simulcast it might not exist on that layer at
+				// all. This is CL-6's retransmission, and it works because the server
+				// buffers rather than because the publisher does.
+
+			case *rtcp.ReceiverEstimatedMaximumBitrate:
+				// What CL-5 selects on: the receiver saying how much it can take. Recorded
+				// and acted on at once, because a receiver that has just said it cannot
+				// take the current layer should not keep being sent it for another second.
+				receiving.reported(int(report.Bitrate))
+				s.reselect(receiving)
 			}
 		}
 	}
+}
+
+// reselect moves a receiver to the best layer its latest estimate allows.
+//
+// Most calls decide nothing: choose returns the layer already being forwarded and want says so.
+// The work only happens when the answer changes, which for a stable connection is never.
+func (s *Server) reselect(receiving *subscription) {
+	_, estimate, _ := receiving.state()
+
+	wanted := receiving.source.choose(estimate)
+	if wanted == nil {
+		return
+	}
+	if !receiving.want(wanted.rid) {
+		return
+	}
+
+	current, _, switches := receiving.state()
+	s.logger.Info("switching layer",
+		slog.String("participant", receiving.receiver.id),
+		slog.String("source", receiving.source.key),
+		slog.String("from", current), slog.String("to", wanted.rid),
+		slog.Int("estimate_bits", estimate), slog.Int("layer_bits", wanted.bitrate()),
+		slog.Int("switches", switches))
+
+	// A keyframe on the layer being moved to, because a switch may only happen on one. Left
+	// alone the change waits for the publisher's next scheduled keyframe — up to two seconds
+	// of continuing to send a layer the receiver has just said it cannot take, which is the
+	// interval during which the call feels broken.
+	s.requestKeyframe(receiving.source.publisher.connection, wanted.ssrc)
+}
+
+// selectLayers reconsiders every receiver's layer, on a tick.
+//
+// On a tick and not only on feedback, which the first version got wrong. Selection compares a
+// receiver's estimate against what each layer is actually carrying, and neither number exists
+// for the first second of a call — so the layer a receiver starts on is whichever one delivered
+// a keyframe first. Reacting only to feedback then means a client that sends none, which is
+// most of them, stays on that arbitrary layer for the whole call: a receiver on a fast link
+// watching the smallest encoding, with nothing anywhere reporting a problem.
+//
+// One goroutine for the server rather than one per subscription. There are at most a few dozen
+// subscriptions and the decision is arithmetic on numbers already computed.
+func (s *Server) selectLayers() {
+	ticker := time.NewTicker(measurementWindow)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			for _, receiving := range s.everySubscription() {
+				s.reselect(receiving)
+			}
+		}
+	}
+}
+
+// everySubscription is every receiver's view of every source, across every call on this node.
+func (s *Server) everySubscription() []*subscription {
+	s.mutex.RLock()
+	calls := make([]*call, 0, len(s.calls))
+	for _, held := range s.calls {
+		calls = append(calls, held)
+	}
+	s.mutex.RUnlock()
+
+	found := make([]*subscription, 0, len(calls))
+	for _, held := range calls {
+		held.mutex.RLock()
+		participants := make([]*participant, 0, len(held.participants))
+		for _, joined := range held.participants {
+			participants = append(participants, joined)
+		}
+		held.mutex.RUnlock()
+
+		for _, joined := range participants {
+			for _, published := range joined.sourceList() {
+				found = append(found, published.subscriptions()...)
+			}
+		}
+	}
+	return found
+}
+
+// requestCurrentKeyframe asks for a keyframe on whichever layer a receiver is being sent.
+func (s *Server) requestCurrentKeyframe(receiving *subscription) {
+	current, _, _ := receiving.state()
+
+	receiving.source.mutex.Lock()
+	sending, found := receiving.source.layers[current]
+	publisher := receiving.source.publisher.connection
+	receiving.source.mutex.Unlock()
+
+	if !found {
+		return
+	}
+	s.requestKeyframe(publisher, sending.ssrc)
 }
 
 // requestKeyframesFor asks every publisher this participant receives for a fresh start.
@@ -549,8 +732,15 @@ func (s *Server) requestKeyframesFor(callID string, to *participant) {
 	held.mutex.RUnlock()
 
 	for _, other := range others {
-		for _, track := range other.publishedTracks() {
-			s.requestKeyframe(track.publisher, track.ssrc)
+		for _, published := range other.sourceList() {
+			// Every layer, because which one this participant will end up receiving is not
+			// decided yet: selection needs a second of measurement, and the first keyframe
+			// to arrive is what starts the stream.
+			published.mutex.Lock()
+			for _, sending := range published.layers {
+				s.requestKeyframe(published.publisher.connection, sending.ssrc)
+			}
+			published.mutex.Unlock()
 		}
 	}
 }
@@ -764,8 +954,45 @@ func (s *Server) Calls() int {
 	return len(s.calls)
 }
 
+// Forwarding reports what this node is carrying: sources, the layers they arrive as, and the
+// subscriptions those are being forwarded to.
+//
+// Three numbers rather than one because they answer different questions. Layers well above
+// sources means publishers are sending simulcast, which is what makes selection possible at
+// all; equal to sources means every publisher is sending one quality and every receiver is
+// getting whatever that is. Subscriptions is the fan-out, and the thing that actually costs.
+func (s *Server) Forwarding() (sources, layers, subscriptions int) {
+	subscriptions = len(s.everySubscription())
+
+	s.mutex.RLock()
+	calls := make([]*call, 0, len(s.calls))
+	for _, held := range s.calls {
+		calls = append(calls, held)
+	}
+	s.mutex.RUnlock()
+
+	for _, held := range calls {
+		held.mutex.RLock()
+		participants := make([]*participant, 0, len(held.participants))
+		for _, joined := range held.participants {
+			participants = append(participants, joined)
+		}
+		held.mutex.RUnlock()
+
+		for _, joined := range participants {
+			for _, published := range joined.sourceList() {
+				sources++
+				layers += published.layerCount()
+			}
+		}
+	}
+	return sources, layers, subscriptions
+}
+
 // Close releases every call.
 func (s *Server) Close() {
+	s.doneOnce.Do(func() { close(s.done) })
+
 	s.mutex.Lock()
 	calls := s.calls
 	s.calls = make(map[string]*call)
@@ -790,12 +1017,6 @@ func (c *call) others(except string) []*participant {
 		}
 	}
 	return others
-}
-
-func (p *participant) publishedTracks() []*published {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	return append([]*published(nil), p.published...)
 }
 
 // ErrParticipantNotFound means the named participant has no transport on this node.

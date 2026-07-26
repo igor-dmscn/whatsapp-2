@@ -52,7 +52,7 @@ Terminology is defined in the [context map](../CONTEXT-MAP.md) and the per-conte
 | CL-2 | A conversation has at most one active call. Starting a second returns the existing one. |
 | CL-3 | A call ends when its last participant leaves. |
 | CL-4 | All participants in a call connect to the same SFU node. |
-| CL-5 | Participants publish multiple quality layers; the SFU selects per receiver. |
+| CL-5 | Participants publish multiple quality layers; the SFU selects per receiver. Done: a receiver reporting 150 kbit/s is sent 73 while another on the same publisher is sent 591, and it returns to 591 when it reports recovery. Selection runs on a tick rather than only on feedback, because a client that reports nothing must not be stuck on whichever layer arrived first. |
 | CL-6 | Lost packets are recovered by retransmission, and decoder desync by keyframe request. Neither may leave video frozen for more than 2 seconds. |
 
 ## Non-functional

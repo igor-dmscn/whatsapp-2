@@ -65,9 +65,19 @@ func run(ctx context.Context, logger *slog.Logger) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		sources, layers, subscriptions := node.Forwarding()
+
 		httpx.WriteJSON(w, logger, http.StatusOK, map[string]any{
 			"status": "ok",
 			"calls":  node.Calls(),
+			// What is being forwarded, in the three numbers that mean different things.
+			// Layers above sources is publishers sending simulcast, which is what makes
+			// per-receiver selection possible; equal to sources is every publisher sending
+			// one quality, so every receiver gets whatever that is. Subscriptions is the
+			// fan-out, and the number that actually costs CPU.
+			"sources":       sources,
+			"layers":        layers,
+			"subscriptions": subscriptions,
 			// Zero here with calls above zero is the one failure this process can have
 			// that looks like health: it forwards media and cannot tell anybody about a
 			// new publisher, so every call is stuck at whoever negotiated first.

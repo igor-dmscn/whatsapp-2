@@ -65,6 +65,14 @@ type SourceOptions struct {
 	KeyframeEvery int
 }
 
+const (
+	// defaultBitrate is 600 kbit/s: a plausible middle simulcast layer, and small enough
+	// that twenty peers on one machine are not measuring the harness.
+	defaultBitrate = 600_000
+	// defaultFramerate is what a camera sends.
+	defaultFramerate = 30
+)
+
 // NewSource returns a source producing frames at roughly the given bitrate.
 func NewSource(options SourceOptions) *Source {
 	source := &Source{
@@ -74,12 +82,10 @@ func NewSource(options SourceOptions) *Source {
 		keyframeRatio: 6,
 	}
 	if source.bitrate <= 0 {
-		// 600 kbit/s: a plausible middle simulcast layer, and small enough that twenty
-		// peers on one machine are not measuring the harness.
-		source.bitrate = 600_000
+		source.bitrate = defaultBitrate
 	}
 	if source.framerate <= 0 {
-		source.framerate = 30
+		source.framerate = defaultFramerate
 	}
 	if source.keyframeEvery == 0 {
 		// Two seconds. Short enough that a receiver joining mid-stream does not wait
