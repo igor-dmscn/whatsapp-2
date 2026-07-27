@@ -17,6 +17,18 @@ export default defineConfig({
   optimizeDeps: { exclude: ['@sqlite.org/sqlite-wasm'] },
   server: {
     port: 5173,
+    // Hosts this dev server will answer to. The check exists to stop a page on another
+    // site from resolving its own name to 127.0.0.1 and talking to your dev server, so it
+    // is not one to switch off wholesale — a tunnel's domain is named instead, and the
+    // leading dot covers the random subdomain ngrok assigns each run. Without this, every
+    // request through a tunnel is a 403 reading "this host is not allowed".
+    //
+    // PUBLIC_HOST is for the others: a Tailscale name, or a domain of your own.
+    allowedHosts: [
+      '.ngrok-free.app',
+      '.ngrok.app',
+      ...(process.env.PUBLIC_HOST ? [process.env.PUBLIC_HOST] : []),
+    ],
     proxy: {
       '/v1': {
         target: process.env.API_URL ?? 'http://localhost:8080',
