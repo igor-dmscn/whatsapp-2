@@ -126,6 +126,16 @@ export class Call {
   async join(conversationID: string): Promise<void> {
     if (this.connection) return
 
+    // Said plainly, because the browser does not: outside a secure context there is no
+    // navigator.mediaDevices at all, so the honest message is about the address bar rather
+    // than "cannot read properties of undefined", which is what this used to report.
+    if (!this.options.media && !navigator.mediaDevices) {
+      throw new Error(
+        'the camera is only available over https or on localhost — this page is on ' +
+          window.location.origin,
+      )
+    }
+
     const capture = this.options.media ?? (() => navigator.mediaDevices.getUserMedia(constraints))
     const local = await capture()
 

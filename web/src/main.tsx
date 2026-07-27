@@ -1,8 +1,50 @@
-import { StrictMode } from 'react'
+import { Component, StrictMode, type ReactNode } from 'react'
 import { createRoot } from 'react-dom/client'
 
 import { App } from './App'
 import './styles.css'
+
+/**
+ * Boundary turns a crash into a message.
+ *
+ * Without one, React unmounts the whole tree and the page goes white — which is what a
+ * `crypto.randomUUID is not a function` in the composer looked like from the outside, and it
+ * carries no information at all. The person seeing it cannot tell a bug from a lost
+ * connection from a bad address, and neither can anyone they report it to.
+ *
+ * It catches errors thrown while rendering, which is deliberately not everything: a rejected
+ * fetch still belongs to the code that awaited it, and those already have handling. This is
+ * for the ones with nowhere else to go.
+ */
+class Boundary extends Component<{ children: ReactNode }, { failure: Error | null }> {
+  state = { failure: null as Error | null }
+
+  static getDerivedStateFromError(failure: Error) {
+    return { failure }
+  }
+
+  componentDidCatch(failure: Error) {
+    // Still logged. The banner names what broke; the console keeps the stack that says where.
+    console.error('unrecoverable render error', failure)
+  }
+
+  render() {
+    if (!this.state.failure) return this.props.children
+
+    return (
+      <main className="centred">
+        <div className="card">
+          <h1>comms</h1>
+          <p>Something in the interface broke and could not carry on.</p>
+          <p className="muted">{this.state.failure.message}</p>
+          <button type="button" onClick={() => window.location.reload()}>
+            Reload
+          </button>
+        </div>
+      </main>
+    )
+  }
+}
 
 // StrictMode stays on. It double-invokes effects in development, which is exactly
 // the pressure the socket lifecycle should be under: a connection that cannot
@@ -10,7 +52,9 @@ import './styles.css'
 // a reconnect either.
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <Boundary>
+      <App />
+    </Boundary>
   </StrictMode>,
 )
 

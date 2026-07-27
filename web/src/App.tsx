@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 
 import { ApiError, Client, deliveryOf, login, register, SessionExpired } from './api'
 import type { Attachment, Conversation, DeliveryState, Invite, Member, Role, Session } from './api'
+import { clientEntryID } from './ids'
 import { Sync } from './sync'
 import type { PresenceFrame } from './sync'
 import { LocalStore, type Hit } from './store'
@@ -568,11 +569,11 @@ function Workspace({
                 handles={handles}
                 conversation={current}
                 onEdit={async (sequence, text) => {
-                  const entry = await client.revise(selected, sequence, crypto.randomUUID(), text)
+                  const entry = await client.revise(selected, sequence, clientEntryID(), text)
                   sync.accept(entry)
                 }}
                 onDelete={async (sequence) => {
-                  const entry = await client.retract(selected, sequence, crypto.randomUUID())
+                  const entry = await client.retract(selected, sequence, clientEntryID())
                   sync.accept(entry)
                 }}
                 onReact={async (sequence, emoji, mine) => {
@@ -1446,7 +1447,7 @@ function Composer({
   // The identifier belongs to the draft, not to the attempt. A send that fails and is
   // tried again reuses it, so the server recognises the retry and returns the entry the
   // first attempt created rather than writing a second one (MS-2).
-  const [clientEntryID, setClientEntryID] = useState(() => crypto.randomUUID())
+  const [draftID, setDraftID] = useState(clientEntryID)
   const [sending, setSending] = useState(false)
 
   async function submit(event: React.FormEvent) {
@@ -1459,14 +1460,14 @@ function Composer({
     setSending(true)
     try {
       if (chosen) {
-        await onAttach(chosen, clientEntryID, text, setProgress)
+        await onAttach(chosen, draftID, text, setProgress)
         setChosen(null)
         if (chooser.current) chooser.current.value = ''
       } else {
-        await onSend(text, clientEntryID)
+        await onSend(text, draftID)
       }
       setDraft('')
-      setClientEntryID(crypto.randomUUID())
+      setDraftID(clientEntryID())
       // Sent, so no longer typing. Without this the indicator survives the message by
       // its whole window, which reads as a second message coming that never does.
       onTyping(false)
