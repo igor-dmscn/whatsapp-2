@@ -24,6 +24,16 @@ const outboundBuffer = 64
 // this long is not slow, it is gone.
 const writeTimeout = 10 * time.Second
 
+// typingInterval is the shortest gap between two typing claims this server will act on
+// from one connection.
+//
+// A typing frame is cheap to send and expensive to serve — a membership read and two Redis
+// writes — so a client claiming per keystroke turns one small frame into a database query.
+// The browser client already holds itself to this gap; enforcing it here is what makes it
+// true of clients that do not. Well inside a claim's own lifetime, so somebody typing
+// continuously never lapses.
+const typingInterval = time.Second
+
 // Connection is one authenticated WebSocket.
 //
 // It knows which conversations it should hear about and from which position, so
@@ -55,6 +65,8 @@ type Connection struct {
 	// visibility maps each conversation this connection follows to the first
 	// position it may see.
 	visibility map[domain.ConversationID]domain.Sequence
+	// lastTyping is when this connection's last acted-on typing claim arrived.
+	lastTyping time.Time
 }
 
 // NewConnection wraps an authenticated socket.
@@ -98,6 +110,23 @@ func (c *Connection) alreadySees(conversationID domain.ConversationID) bool {
 	defer c.mutex.RUnlock()
 	_, found := c.visibility[conversationID]
 	return found
+}
+
+// claimsTyping reports whether a typing claim should be acted on, recording that it was.
+//
+// time.Now rather than the service's injected clock, because nothing here is being
+// timestamped: no domain fact records this moment, it only bounds how often one socket may
+// cost the server a query. The same reason writeTimeout is a constant in this package.
+func (c *Connection) claimsTyping() bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	now := time.Now()
+	if now.Sub(c.lastTyping) < typingInterval {
+		return false
+	}
+	c.lastTyping = now
+	return true
 }
 
 // Sees reports whether this connection is entitled to an entry at a position.

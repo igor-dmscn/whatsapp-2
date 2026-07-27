@@ -150,6 +150,16 @@ type Broadcaster interface {
 	BroadcastTyping(ctx context.Context, conversationID ConversationID, accountID AccountID, typing bool) error
 }
 
+// DeviceClaim is one device's assertion that it is connected, true only for as long as it
+// keeps being renewed.
+//
+// Plural because that is the shape of the fact: a claim is made by the node holding the
+// socket, and a node holds many at once.
+type DeviceClaim struct {
+	AccountID string
+	DeviceID  string
+}
+
 // Presence is who is connected and who is typing, held only for as long as it is true.
 //
 // Never persisted, and the interface says so by taking the current time on every write: every
@@ -157,9 +167,15 @@ type Broadcaster interface {
 // online at a moment that has passed. See internal/presence for why expiry is also what makes
 // a node dying safe.
 type Presence interface {
-	// Renew records that a device is connected. Called on a heartbeat by whichever node
-	// holds the socket, which is what makes the claim expire when that node stops.
+	// Renew records that a device is connected. Called by the node accepting a socket,
+	// which is what makes the claim expire when that node stops.
 	Renew(ctx context.Context, accountID, deviceID string, now time.Time) error
+
+	// RenewAll renews every claim a node holds, which is what a heartbeat actually is:
+	// one node asserting the whole set of sockets it still has. In bulk for the same
+	// reason OnlineAmong is — the question is never asked about one socket, and one round
+	// trip per socket makes a node's heartbeat cost scale with the sockets it holds.
+	RenewAll(ctx context.Context, claims []DeviceClaim, now time.Time) error
 
 	// Gone forgets a device whose socket closed cleanly.
 	Gone(ctx context.Context, accountID, deviceID string) error
@@ -247,10 +263,54 @@ type MemberStateStore interface {
 
 	// Of returns one member's state, zero-valued if the projection has not caught up.
 	Of(ctx context.Context, conversationID ConversationID, accountID AccountID) (MemberState, error)
+}
 
-	// Others returns the lowest read and delivery marks among the other members,
-	// which is the position through which everyone else is up to date.
-	Others(ctx context.Context, conversationID ConversationID, excluding AccountID) (readThrough Sequence, deliveredThrough Sequence, err error)
+// ConversationSummary is one row of what an account sees when it looks at its conversation
+// list, or tells a reconnecting client what it is following.
+//
+// Values, not aggregates. A Conversation and a Membership are loaded to be changed under an
+// invariant, and neither question here changes anything: this is the screen ADR-0002 built the
+// projection for. Reconstituting a root per conversation to read three scalars off it is the
+// cost that decision exists to avoid, and it puts a write-model concern in a read path where
+// nothing can be written.
+//
+// Mixes the write model's head with the projection's counts, which is deliberate and already
+// what this screen did: NF-7 requires a client to render correctly while the projection is
+// behind, so a head that is ahead of the counts beside it is the normal case, not a fault.
+type ConversationSummary struct {
+	ConversationID ConversationID
+	Kind           Kind
+	Head           Sequence
+	CreatedAt      time.Time
+
+	// Role and VisibleFrom come from the reader's own membership.
+	Role        Role
+	VisibleFrom Sequence
+
+	// The reader's own projected state.
+	Unread           int64
+	ReadThrough      Sequence
+	DeliveredThrough Sequence
+
+	// OthersReadThrough and OthersDeliveredThrough are the lowest marks among the other
+	// members, which is what MS-13's per-entry state is derived from. Zero when the reader is
+	// the only member left — there is nobody whose marks could be lower.
+	OthersReadThrough      Sequence
+	OthersDeliveredThrough Sequence
+}
+
+// SummaryStore answers both questions a client asks about its whole conversation list.
+//
+// A read model beside MemberStateStore and not a repository, for the same reason that one is
+// not: it stores no aggregate and enforces no invariant. It exists because the conversation
+// list and a socket resume are the same query — every conversation this account belongs to,
+// with where it has read to — and asking it per conversation made both cost a round trip per
+// conversation the account had ever joined.
+type SummaryStore interface {
+	// ForAccount returns every conversation an account still belongs to, most recently
+	// active first. Memberships that have ended are excluded rather than returned and
+	// filtered, because "conversations I am in" is the question being asked.
+	ForAccount(ctx context.Context, accountID AccountID) ([]ConversationSummary, error)
 }
 
 // Transactor runs work atomically.

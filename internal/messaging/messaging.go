@@ -17,7 +17,6 @@ import (
 	"comms/internal/messaging/internal/api"
 	"comms/internal/messaging/internal/app"
 	"comms/internal/messaging/internal/broadcast"
-	"comms/internal/messaging/internal/domain"
 	"comms/internal/messaging/internal/postgres"
 	"comms/internal/messaging/internal/presence"
 	"comms/internal/messaging/internal/projection"
@@ -81,6 +80,9 @@ func New(
 		postgres.NewInviteRepository(db),
 		postgres.NewReactionStore(db),
 		postgres.NewMemberStateStore(db),
+		// The read side of the same projection, joined to the log's head in one query. The
+		// conversation list and a socket resume are both this question.
+		postgres.NewSummaryStore(db),
 		// Presence and typing live only in Redis, with expiry, because both are false
 		// within seconds and worthless once stale (see internal/presence).
 		presence.NewStore(redisClient),
@@ -135,12 +137,13 @@ func (m *Module) renewPresence(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for _, held := range m.hub.Connected() {
-				accountID, deviceID := held[0], held[1]
-				if err := m.service.Connected(ctx, domain.AccountID(accountID), deviceID); err != nil {
-					m.logger.Warn("renew presence",
-						slog.String("account_id", accountID), slog.Any("error", err))
-				}
+			held := m.hub.Connected()
+			if len(held) == 0 {
+				continue
+			}
+			if err := m.service.StillConnected(ctx, held); err != nil {
+				m.logger.Warn("renew presence",
+					slog.Int("claims", len(held)), slog.Any("error", err))
 			}
 		}
 	}

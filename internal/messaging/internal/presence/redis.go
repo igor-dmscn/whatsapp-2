@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"comms/internal/messaging/internal/domain"
 )
 
 // Windows.
@@ -74,6 +76,41 @@ func (s *Store) Renew(ctx context.Context, accountID, deviceID string, now time.
 
 	if _, err := pipeline.Exec(ctx); err != nil {
 		return fmt.Errorf("renew presence: %w", err)
+	}
+	return nil
+}
+
+// renewChunk is how many claims go in one pipeline.
+//
+// A node holding ten thousand sockets would otherwise assemble twenty thousand commands into a
+// single buffer and hand Redis the lot. Chunked, the same heartbeat is ten round trips.
+//
+// ponytail: a fixed chunk. A Lua script taking the whole set, if one Exec per thousand ever
+// shows up in a profile.
+const renewChunk = 1000
+
+// RenewAll renews every claim a node holds, in one pipeline per chunk.
+//
+// The heartbeat this serves runs every Heartbeat for every socket on the node, so it is the one
+// presence operation whose cost scales with how busy a node is. One round trip per claim made a
+// node with ten thousand sockets spend half its heartbeat window renewing them, and a node with
+// twenty thousand unable to finish inside the window at all — which does not read as slowness,
+// it reads as everybody blinking offline as the keys expire behind the loop.
+func (s *Store) RenewAll(ctx context.Context, claims []domain.DeviceClaim, now time.Time) error {
+	score := float64(now.Unix())
+
+	for start := 0; start < len(claims); start += renewChunk {
+		end := min(start+renewChunk, len(claims))
+
+		pipeline := s.client.Pipeline()
+		for _, claim := range claims[start:end] {
+			key := onlineKey(claim.AccountID)
+			pipeline.ZAdd(ctx, key, redis.Z{Score: score, Member: claim.DeviceID})
+			pipeline.Expire(ctx, key, 2*Online)
+		}
+		if _, err := pipeline.Exec(ctx); err != nil {
+			return fmt.Errorf("renew %d presence claims: %w", end-start, err)
+		}
 	}
 	return nil
 }

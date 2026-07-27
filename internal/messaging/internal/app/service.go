@@ -28,6 +28,7 @@ type Service struct {
 	invites       domain.InviteRepository
 	reactions     domain.ReactionStore
 	state         domain.MemberStateStore
+	summaries     domain.SummaryStore
 	presence      domain.Presence
 	broadcaster   domain.Broadcaster
 	events        domain.EventPublisher
@@ -45,6 +46,7 @@ func NewService(
 	invites domain.InviteRepository,
 	reactions domain.ReactionStore,
 	state domain.MemberStateStore,
+	summaries domain.SummaryStore,
 	presence domain.Presence,
 	broadcaster domain.Broadcaster,
 	events domain.EventPublisher,
@@ -57,8 +59,8 @@ func NewService(
 		now = time.Now
 	}
 	return &Service{
-		conversations, memberships, entries, invites, reactions, state, presence,
-		broadcaster, events, transactor, ids, now, logger,
+		conversations, memberships, entries, invites, reactions, state, summaries,
+		presence, broadcaster, events, transactor, ids, now, logger,
 	}
 }
 
@@ -189,6 +191,15 @@ func (s *Service) Connected(ctx context.Context, accountID domain.AccountID, dev
 
 func (s *Service) Disconnected(ctx context.Context, accountID domain.AccountID, deviceID string) error {
 	return s.presence.Gone(ctx, string(accountID), deviceID) //nolint:wrapcheck // named where it happens.
+}
+
+// StillConnected renews every claim a node holds, which is what its heartbeat says.
+//
+// One call rather than one per socket. The claims are whatever the node held when it asked; a
+// socket that closes between the ask and this is renewed once too often and expires a window
+// later, which is the same outcome as a heartbeat that had not come round yet.
+func (s *Service) StillConnected(ctx context.Context, claims []domain.DeviceClaim) error {
+	return s.presence.RenewAll(ctx, claims, s.now()) //nolint:wrapcheck // named where it happens.
 }
 
 // maxRangeLimit caps how many entries one fetch returns.
@@ -490,6 +501,21 @@ func (s *Service) Fetch(
 	return entries, nil
 }
 
+// ResumedSession is everything a reconnecting client needs at once: what it is missing, and
+// what it should now be hearing about live.
+//
+// One value rather than two calls, because they are one question asked of one row set. Answering
+// them separately meant listing the account's conversations twice per socket and loading an
+// aggregate per conversation in between — which a deploy turns into a reconnect storm's worth of
+// queries for information the first list already had.
+type ResumedSession struct {
+	// Gaps is what to fetch, one per conversation with something missing.
+	Gaps []domain.Gap
+	// Following is every conversation the client is now entitled to hear about, whether or
+	// not it has a gap: a conversation somebody is current on still needs live delivery.
+	Following []domain.ConversationSummary
+}
+
 // Resume reports what a client is missing, given what it already holds.
 //
 // The heart of the sync protocol (MS-3). Conversations the client is current on
@@ -500,40 +526,24 @@ func (s *Service) Resume(
 	ctx context.Context,
 	reader domain.AccountID,
 	clientHas map[domain.ConversationID]domain.Sequence,
-) ([]domain.Gap, error) {
-	memberships, err := s.memberships.ForAccount(ctx, reader)
+) (ResumedSession, error) {
+	following, err := s.summaries.ForAccount(ctx, reader)
 	if err != nil {
-		return nil, fmt.Errorf("list memberships: %w", err)
+		return ResumedSession{}, fmt.Errorf("list conversations: %w", err)
 	}
 
-	gaps := make([]domain.Gap, 0, len(memberships))
-	for _, membership := range memberships {
-		if !membership.Active() {
-			continue
-		}
-
-		conversation, err := s.conversations.ByID(ctx, membership.ConversationID())
-		if err != nil {
-			return nil, fmt.Errorf("load conversation: %w", err)
-		}
-
+	gaps := make([]domain.Gap, 0, len(following))
+	for _, conversation := range following {
 		// A conversation absent from the client's map yields zero, which means
 		// "nothing yet" — so a new membership is reported as a gap from its
 		// visibility start without needing a separate case.
-		if gap, hasGap := domain.GapFor(membership, conversation.Head(), clientHas[membership.ConversationID()]); hasGap {
+		gap, hasGap := domain.GapBetween(conversation.ConversationID, conversation.VisibleFrom,
+			conversation.Head, clientHas[conversation.ConversationID])
+		if hasGap {
 			gaps = append(gaps, gap)
 		}
 	}
-	return gaps, nil
-}
-
-// Conversations lists the conversations an account belongs to.
-func (s *Service) Conversations(ctx context.Context, accountID domain.AccountID) ([]*domain.Membership, error) {
-	memberships, err := s.memberships.ForAccount(ctx, accountID)
-	if err != nil {
-		return nil, fmt.Errorf("list memberships: %w", err)
-	}
-	return memberships, nil
+	return ResumedSession{Gaps: gaps, Following: following}, nil
 }
 
 // Conversation returns a conversation a caller belongs to.
@@ -626,54 +636,16 @@ func (s *Service) Acknowledge(
 
 // Summary is a conversation as the list screen needs it: the conversation, this
 // member's place in it, and how far everyone else has got.
-type Summary struct {
-	Conversation *domain.Conversation
-	Membership   *domain.Membership
-	State        domain.MemberState
-	// OthersReadThrough and OthersDeliveredThrough are the lowest marks among the
-	// other members, which is what MS-13's per-entry state is derived from.
-	OthersReadThrough      domain.Sequence
-	OthersDeliveredThrough domain.Sequence
-}
-
 // Summaries returns every conversation an account belongs to, with its projected state.
 //
-// This is the screen ADR-0002 rejected computing on read. The projection makes it a
-// handful of indexed lookups instead of an aggregate query over the whole log.
-func (s *Service) Summaries(ctx context.Context, accountID domain.AccountID) ([]Summary, error) {
-	memberships, err := s.memberships.ForAccount(ctx, accountID)
+// This is the screen ADR-0002 rejected computing on read. One query against the projection,
+// rather than a lookup per conversation: an account in fifty conversations was paying a hundred
+// and fifty round trips for one screen, and the cost grew with how much somebody used the
+// product.
+func (s *Service) Summaries(ctx context.Context, accountID domain.AccountID) ([]domain.ConversationSummary, error) {
+	summaries, err := s.summaries.ForAccount(ctx, accountID)
 	if err != nil {
-		return nil, fmt.Errorf("list memberships: %w", err)
-	}
-
-	summaries := make([]Summary, 0, len(memberships))
-	for _, membership := range memberships {
-		if !membership.Active() {
-			continue
-		}
-
-		conversation, err := s.conversations.ByID(ctx, membership.ConversationID())
-		if err != nil {
-			return nil, fmt.Errorf("look up conversation: %w", err)
-		}
-
-		state, err := s.state.Of(ctx, membership.ConversationID(), accountID)
-		if err != nil {
-			return nil, fmt.Errorf("look up member state: %w", err)
-		}
-
-		othersRead, othersDelivered, err := s.state.Others(ctx, membership.ConversationID(), accountID)
-		if err != nil {
-			return nil, fmt.Errorf("look up others' marks: %w", err)
-		}
-
-		summaries = append(summaries, Summary{
-			Conversation:           conversation,
-			Membership:             membership,
-			State:                  state,
-			OthersReadThrough:      othersRead,
-			OthersDeliveredThrough: othersDelivered,
-		})
+		return nil, fmt.Errorf("list conversation summaries: %w", err)
 	}
 	return summaries, nil
 }

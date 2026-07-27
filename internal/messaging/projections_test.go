@@ -161,6 +161,46 @@ func (n *node) summaryOf(token, conversationID string) summaryBody {
 	return summaryBody{}
 }
 
+// TestOthersMarksAreZeroWhenThereAreNoOthers is the edge the summary query has to get right.
+//
+// Others' marks are the lowest read and delivery mark among everybody else, and the query asks
+// for them with an aggregate over the other members. Over nobody, an aggregate returns one NULL
+// row rather than no row — so a conversation where the caller is the only member reaches the
+// scan as NULL and has to arrive as zero. Read as anything else, the sender's own messages would
+// claim to have been read by people who are not there.
+func TestOthersMarksAreZeroWhenThereAreNoOthers(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+	events := newProjections(t)
+	events.catchUp()
+
+	ana, bruno := newAccountID(), newAccountID()
+	anaToken := tokens.issue(ana)
+
+	// A group with only its creator in it. Nobody else has a mark, because nobody else exists.
+	alone := node.startGroup(anaToken)
+	node.send(anaToken, alone.ID, "talking to myself")
+	events.catchUp()
+
+	summary := node.summaryOf(anaToken, alone.ID)
+	if summary.OthersReadThrough != 0 || summary.OthersDeliveredThrough != 0 {
+		t.Errorf("others' marks in a conversation of one are read %d and delivered %d, want 0 and 0",
+			summary.OthersReadThrough, summary.OthersDeliveredThrough)
+	}
+
+	// And with somebody there who has read nothing, still zero — but now because their marks
+	// really are zero, which is the case that would pass either way and is worth pinning beside
+	// the one that would not.
+	shared := node.startGroup(anaToken)
+	node.mustAddMember(anaToken, shared.ID, bruno)
+	node.send(anaToken, shared.ID, "hello")
+	events.catchUp()
+
+	if summary := node.summaryOf(anaToken, shared.ID); summary.OthersReadThrough != 0 {
+		t.Errorf("others' read mark is %d before anybody read, want 0", summary.OthersReadThrough)
+	}
+}
+
 func TestUnreadCountsFollowTheLog(t *testing.T) {
 	tokens := newFakeAuthenticator()
 	node := newNode(t, tokens)
@@ -545,8 +585,4 @@ func (failingStateStore) ForAccount(context.Context, domain.AccountID) ([]domain
 
 func (failingStateStore) Of(context.Context, domain.ConversationID, domain.AccountID) (domain.MemberState, error) {
 	return domain.MemberState{}, errStoreUnavailable
-}
-
-func (failingStateStore) Others(context.Context, domain.ConversationID, domain.AccountID) (domain.Sequence, domain.Sequence, error) {
-	return 0, 0, errStoreUnavailable
 }

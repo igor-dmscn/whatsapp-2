@@ -352,15 +352,15 @@ func (h *Handler) listConversations(w http.ResponseWriter, r *http.Request) {
 	responses := make([]conversationResponse, 0, len(summaries))
 	for _, summary := range summaries {
 		responses = append(responses, conversationResponse{
-			ID:                     string(summary.Conversation.ID()),
-			Kind:                   string(summary.Conversation.Kind()),
-			Head:                   int64(summary.Conversation.Head()),
-			Role:                   string(summary.Membership.Role()),
-			VisibleFrom:            int64(summary.Membership.VisibleFrom()),
-			CreatedAt:              summary.Conversation.CreatedAt(),
-			Unread:                 summary.State.UnreadCount,
-			ReadThrough:            int64(summary.State.ReadSequence),
-			DeliveredThough:        int64(summary.State.DeliveredSequence),
+			ID:                     string(summary.ConversationID),
+			Kind:                   string(summary.Kind),
+			Head:                   int64(summary.Head),
+			Role:                   string(summary.Role),
+			VisibleFrom:            int64(summary.VisibleFrom),
+			CreatedAt:              summary.CreatedAt,
+			Unread:                 summary.Unread,
+			ReadThrough:            int64(summary.ReadThrough),
+			DeliveredThough:        int64(summary.DeliveredThrough),
 			OthersReadThrough:      int64(summary.OthersReadThrough),
 			OthersDeliveredThrough: int64(summary.OthersDeliveredThrough),
 		})

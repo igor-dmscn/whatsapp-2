@@ -261,29 +261,7 @@ func (s *MemberStateStore) Of(
 	return state, nil
 }
 
-// Others returns the marks of every member of a conversation other than one account.
-//
-// What the sender needs for MS-13: the lowest read mark among the others is the
-// position through which everyone has read.
-func (s *MemberStateStore) Others(
-	ctx context.Context,
-	conversationID domain.ConversationID,
-	excluding domain.AccountID,
-) (readThrough domain.Sequence, deliveredThrough domain.Sequence, err error) {
-	// COALESCE inside the min, not outside it. min ignores NULLs, so a member with no
-	// projected row yet would be skipped rather than counted as having read nothing
-	// — and one member's mark would be reported as everyone's.
-	err = s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(min(COALESCE(s.read_sequence, 0)), 0),
-		        COALESCE(min(COALESCE(s.delivered_sequence, 0)), 0)
-		   FROM memberships m
-		   LEFT JOIN conversation_member_state s
-		     ON s.conversation_id = m.conversation_id AND s.account_id = m.account_id
-		  WHERE m.conversation_id = $1 AND m.account_id <> $2 AND m.left_at IS NULL`,
-		string(conversationID), string(excluding),
-	).Scan(&readThrough, &deliveredThrough)
-	if err != nil {
-		return 0, 0, fmt.Errorf("select others' marks: %w", err)
-	}
-	return readThrough, deliveredThrough, nil
-}
+// Others' marks are no longer read one conversation at a time. They are a column of the
+// conversation-list query now (see summaries.go), because they were never wanted on their own —
+// only ever beside everything else about a conversation, once per conversation on a screen.
+// Kept in one place so the two cannot disagree about who counts as a member.

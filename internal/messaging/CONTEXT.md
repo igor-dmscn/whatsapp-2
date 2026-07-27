@@ -86,6 +86,22 @@ _Avoid_: delete, remove, redaction
 Somebody's symbol on an entry, held beside the log rather than in it. Has no sequence number, so it moves no cursor, fills no gap and wakes no client with work to do.
 _Avoid_: like, emoji (the emoji is the symbol; the reaction is the fact somebody applied it)
 
+### Presence
+
+Nothing in this section is ever persisted. Every term names something true for seconds and worthless once stale.
+
+**Claim**:
+One device's assertion that it is connected, made by the node holding its socket and true only while that node keeps renewing it. Per device rather than per account, so one tab closing does not withdraw another's — and expiring rather than deleted, so a node that dies takes its claims with it and leaves nothing to clean up.
+_Avoid_: session, connection record, online flag
+
+**Online**:
+An account with at least one unexpired claim. A derived answer, never stored: asked about a whole screen of accounts at once, never asserted about one.
+_Avoid_: active, present, available
+
+**Typing Claim**:
+An account's assertion that it is composing in a conversation. Per account rather than per device, like a cursor — which device somebody typed on is nobody's business. The weakest thing the server carries: lost claims show nothing and clear themselves.
+_Avoid_: typing indicator, composing state
+
 **Invite**:
 A shareable, revocable permission to join a conversation at a fixed role. Counts its uses rather than being consumed by the first, so a link shared with many people is the ordinary case and single-use is a limit of one.
 _Avoid_: link, join code, token (the token is the secret *inside* an invite, not the invite)

@@ -140,3 +140,68 @@ const (
 	nf2Entries = 1000
 	nf2Limit   = time.Second
 )
+
+// TestConversationListDoesNotSlowDownWithMoreConversations measures the shape of the query
+// rather than its speed.
+//
+// The conversation list used to cost three round trips per conversation plus one: a lookup for
+// the conversation, one for the caller's own marks, one for everybody else's. That is invisible
+// on a test account with two conversations and grows for the rest of somebody's life with the
+// product — the people for whom the screen matters most are the ones it is slowest for.
+//
+// So this compares a small account against a large one instead of asserting a limit. A ratio
+// near one means the cost is in the query and not in the number of rows it returns; the number
+// that must not appear is twelve.
+func TestConversationListDoesNotSlowDownWithMoreConversations(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+
+	timeList := func(token string) time.Duration {
+		samples := make([]time.Duration, 0, listSamples)
+		for range listSamples {
+			started := time.Now()
+			node.summaries(token)
+			samples = append(samples, time.Since(started))
+		}
+		return measure.Percentile(samples, 50)
+	}
+
+	few := tokens.issue(newAccountID())
+	for range listFew {
+		node.startGroup(few)
+	}
+	many := tokens.issue(newAccountID())
+	for range listMany {
+		node.startGroup(many)
+	}
+
+	// Warmed for both, so Postgres planning the statement lands in neither sample.
+	timeList(few)
+	timeList(many)
+
+	small, large := timeList(few), timeList(many)
+	ratio := float64(large) / float64(small)
+	t.Logf("conversation list p50: %s at %d conversations, %s at %d — %.1fx for %.0fx the rows",
+		small.Round(time.Microsecond), listFew, large.Round(time.Microsecond), listMany,
+		ratio, float64(listMany)/float64(listFew))
+
+	if ratio > listRatioLimit {
+		t.Fatalf("listing %d conversations costs %.1fx listing %d, want under %.1fx: the per-conversation work is back",
+			listMany, ratio, listFew, listRatioLimit)
+	}
+}
+
+const (
+	// listFew and listMany are the two account sizes compared. listMany is twelve times
+	// listFew, so a per-conversation round trip shows up as roughly twelve times the cost.
+	listFew  = 5
+	listMany = 60
+	// listSamples is enough for a median to survive one slow scheduling moment.
+	listSamples = 15
+	// listRatioLimit is set between the two implementations rather than tight against the
+	// current one. Twelve times the rows measures at 2.4–3.3x here, because the lateral that
+	// finds everybody else's marks is real per-row work; a round trip per conversation
+	// measured near twelve. Anything under six is the first shape, not the second — and
+	// leaving that much room is what keeps this from failing on a busy machine over nothing.
+	listRatioLimit = 6.0
+)

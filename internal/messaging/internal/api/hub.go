@@ -31,9 +31,11 @@ type Hub struct {
 	// commonly connected from more than one device (a CLI and a browser), and all
 	// of them receive everything — read state is per membership, not per device.
 	connections map[domain.AccountID]map[*Connection]struct{}
-	// listeners counts local connections per conversation, so a subscription is
-	// dropped only when the last interested connection leaves.
-	listeners map[domain.ConversationID]int
+	// followers indexes local connections by conversation, so delivering an entry
+	// costs the followers of that one conversation rather than a walk over every
+	// socket the node holds. Its length per conversation is also the reference
+	// count: a subscription is dropped only when the last follower leaves.
+	followers map[domain.ConversationID]map[*Connection]struct{}
 }
 
 // NewHub returns a hub subscribing through client.
@@ -43,7 +45,7 @@ func NewHub(client *redis.Client, logger *slog.Logger) *Hub {
 		pubsub:      client.Subscribe(context.Background()),
 		logger:      logger,
 		connections: make(map[domain.AccountID]map[*Connection]struct{}),
-		listeners:   make(map[domain.ConversationID]int),
+		followers:   make(map[domain.ConversationID]map[*Connection]struct{}),
 	}
 }
 
@@ -152,15 +154,13 @@ func (h *Hub) deliverEntry(broadcast broadcast.BroadcastMessage) {
 	conversationID := domain.ConversationID(broadcast.ConversationID)
 
 	h.mutex.RLock()
-	targets := make([]*Connection, 0, 8)
-	for _, connections := range h.connections {
-		for connection := range connections {
-			// Visibility is checked per connection: a member who joined at
-			// position 40 must not receive 39, even though their node is
-			// subscribed to the conversation for other members' sake.
-			if connection.Sees(conversationID, domain.Sequence(broadcast.Sequence)) {
-				targets = append(targets, connection)
-			}
+	targets := make([]*Connection, 0, len(h.followers[conversationID]))
+	for connection := range h.followers[conversationID] {
+		// Following the conversation is not the same as being entitled to this
+		// position in it: a member who joined at 40 must not receive 39, even
+		// though their node is subscribed for other members' sake.
+		if connection.Sees(conversationID, domain.Sequence(broadcast.Sequence)) {
+			targets = append(targets, connection)
 		}
 	}
 	h.mutex.RUnlock()
@@ -191,14 +191,12 @@ func (h *Hub) deliverReaction(message broadcast.ReactionMessage) {
 	conversationID := domain.ConversationID(message.ConversationID)
 
 	h.mutex.RLock()
-	targets := make([]*Connection, 0, 8)
-	for _, connections := range h.connections {
-		for connection := range connections {
-			// The same visibility check as an entry, for the same reason: a reaction
-			// on position 39 tells you position 39 exists.
-			if connection.Sees(conversationID, domain.Sequence(message.Sequence)) {
-				targets = append(targets, connection)
-			}
+	targets := make([]*Connection, 0, len(h.followers[conversationID]))
+	for connection := range h.followers[conversationID] {
+		// The same visibility check as an entry, for the same reason: a reaction
+		// on position 39 tells you position 39 exists.
+		if connection.Sees(conversationID, domain.Sequence(message.Sequence)) {
+			targets = append(targets, connection)
 		}
 	}
 	h.mutex.RUnlock()
@@ -224,13 +222,9 @@ func (h *Hub) deliverReaction(message broadcast.ReactionMessage) {
 // must go through deliverEntry instead, where the join point is applied.
 func (h *Hub) deliverToFollowers(conversationID domain.ConversationID, frame any) {
 	h.mutex.RLock()
-	targets := make([]*Connection, 0, 8)
-	for _, connections := range h.connections {
-		for connection := range connections {
-			if connection.alreadySees(conversationID) {
-				targets = append(targets, connection)
-			}
-		}
+	targets := make([]*Connection, 0, len(h.followers[conversationID]))
+	for connection := range h.followers[conversationID] {
+		targets = append(targets, connection)
 	}
 	h.mutex.RUnlock()
 
@@ -258,31 +252,7 @@ func (h *Hub) deliverToFollowers(conversationID domain.ConversationID, frame any
 // Media asks Messaging whether the entry referencing that attachment is visible to the
 // asker. The authorisation lives on the read, where it can be exact.
 func (h *Hub) deliverAttachment(message broadcast.AttachmentMessage) {
-	conversationID := domain.ConversationID(message.ConversationID)
-
-	h.mutex.RLock()
-	targets := make([]*Connection, 0, 8)
-	for _, connections := range h.connections {
-		for connection := range connections {
-			if connection.alreadySees(conversationID) {
-				targets = append(targets, connection)
-			}
-		}
-	}
-	h.mutex.RUnlock()
-
-	if len(targets) == 0 {
-		return
-	}
-
-	encoded, err := json.Marshal(message)
-	if err != nil {
-		h.logger.Error("encode attachment frame", slog.Any("error", err))
-		return
-	}
-	for _, connection := range targets {
-		connection.Send(encoded)
-	}
+	h.deliverToFollowers(domain.ConversationID(message.ConversationID), message)
 }
 
 // handleControl reacts to a message addressed to an account.
@@ -318,8 +288,7 @@ func (h *Hub) Register(ctx context.Context, connection *Connection) {
 
 	newChannels := []string{controlChannelFor(connection.AccountID())}
 	for conversationID := range connection.Visibility() {
-		h.listeners[conversationID]++
-		if h.listeners[conversationID] == 1 {
+		if h.follow(conversationID, connection) {
 			newChannels = append(newChannels, entriesChannelFor(conversationID))
 		}
 	}
@@ -338,9 +307,7 @@ func (h *Hub) Listen(ctx context.Context, connection *Connection, conversationID
 		return
 	}
 	connection.watch(conversationID, visibleFrom)
-
-	h.listeners[conversationID]++
-	subscribe := h.listeners[conversationID] == 1
+	subscribe := h.follow(conversationID, connection)
 	h.mutex.Unlock()
 
 	if subscribe {
@@ -348,6 +315,20 @@ func (h *Hub) Listen(ctx context.Context, connection *Connection, conversationID
 			h.logger.Warn("subscribe conversation", slog.Any("error", err))
 		}
 	}
+}
+
+// follow indexes a connection under a conversation, reporting whether it is the
+// first local follower — which is when the node has to subscribe. Callers hold the
+// mutex. Idempotent, where the reference count it replaced could be inflated by
+// following the same conversation twice.
+func (h *Hub) follow(conversationID domain.ConversationID, connection *Connection) bool {
+	followers := h.followers[conversationID]
+	if followers == nil {
+		followers = make(map[*Connection]struct{}, 1)
+		h.followers[conversationID] = followers
+	}
+	followers[connection] = struct{}{}
+	return len(followers) == 1
 }
 
 // Unregister removes a connection and drops subscriptions nothing local needs.
@@ -362,9 +343,10 @@ func (h *Hub) Unregister(ctx context.Context, connection *Connection) {
 	}
 
 	for conversationID := range connection.Visibility() {
-		h.listeners[conversationID]--
-		if h.listeners[conversationID] <= 0 {
-			delete(h.listeners, conversationID)
+		followers := h.followers[conversationID]
+		delete(followers, connection)
+		if len(followers) == 0 {
+			delete(h.followers, conversationID)
 			stale = append(stale, entriesChannelFor(conversationID))
 		}
 	}
@@ -412,19 +394,22 @@ func (h *Hub) ConnectionCount() int {
 	return count
 }
 
-// Connected returns every account and device this node currently holds a socket for.
+// Connected returns every claim this node currently holds a socket for.
 //
-// What the presence heartbeat renews. A pair per connection rather than per account, because
+// What the presence heartbeat renews. One per connection rather than per account, because
 // presence is claimed per device: two tabs are two claims, and one closing must not withdraw
 // the other's.
-func (h *Hub) Connected() [][2]string {
+func (h *Hub) Connected() []domain.DeviceClaim {
 	h.mutex.RLock()
 	defer h.mutex.RUnlock()
 
-	held := make([][2]string, 0, len(h.connections))
+	held := make([]domain.DeviceClaim, 0, len(h.connections))
 	for accountID, connections := range h.connections {
 		for connection := range connections {
-			held = append(held, [2]string{string(accountID), connection.DeviceID()})
+			held = append(held, domain.DeviceClaim{
+				AccountID: string(accountID),
+				DeviceID:  connection.DeviceID(),
+			})
 		}
 	}
 	return held

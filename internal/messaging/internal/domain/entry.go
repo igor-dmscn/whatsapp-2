@@ -199,12 +199,22 @@ func (g Gap) Count() int64 {
 // membership that joined at position 40 is never offered entries 1 to 39 — the
 // history policy holds even when a client asks for everything.
 func GapFor(membership *Membership, head Sequence, clientHas Sequence) (Gap, bool) {
+	return GapBetween(membership.ConversationID(), membership.VisibleFrom(), head, clientHas)
+}
+
+// GapBetween is GapFor over the two values it actually reads.
+//
+// For callers holding a summary rather than a membership: the conversation list and a socket
+// resume answer this from the read model, and loading an aggregate per conversation to reach two
+// numbers is the cost ADR-0002 exists to avoid. One implementation either way, so the two paths
+// cannot drift on where a joiner's history begins.
+func GapBetween(conversationID ConversationID, visibleFrom, head, clientHas Sequence) (Gap, bool) {
 	from := clientHas.Next()
-	if from < membership.VisibleFrom() {
-		from = membership.VisibleFrom()
+	if from < visibleFrom {
+		from = visibleFrom
 	}
 	if from > head {
 		return Gap{}, false
 	}
-	return Gap{ConversationID: membership.ConversationID(), From: from, To: head}, true
+	return Gap{ConversationID: conversationID, From: from, To: head}, true
 }

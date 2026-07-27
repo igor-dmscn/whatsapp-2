@@ -422,7 +422,7 @@ func (h *Handler) handleResume(ctx context.Context, connection *Connection, raw 
 		held[domain.ConversationID(conversationID)] = domain.Sequence(sequence)
 	}
 
-	gaps, err := h.service.Resume(ctx, connection.AccountID(), held)
+	resumed, err := h.service.Resume(ctx, connection.AccountID(), held)
 	if err != nil {
 		logger.Error("resume", slog.Any("error", err))
 		_ = connection.WriteFrame(ctx, errorFrame{"error", "resume_failed", "could not compute what you are missing"})
@@ -431,20 +431,12 @@ func (h *Handler) handleResume(ctx context.Context, connection *Connection, raw 
 
 	// Every conversation the account belongs to is followed, not only those with a
 	// gap: a conversation the client is current on still needs live delivery.
-	memberships, err := h.service.Conversations(ctx, connection.AccountID())
-	if err != nil {
-		logger.Error("list conversations", slog.Any("error", err))
-		_ = connection.WriteFrame(ctx, errorFrame{"error", "resume_failed", "could not list your conversations"})
-		return
-	}
-	for _, membership := range memberships {
-		if membership.Active() {
-			h.hub.Listen(ctx, connection, membership.ConversationID(), membership.VisibleFrom())
-		}
+	for _, conversation := range resumed.Following {
+		h.hub.Listen(ctx, connection, conversation.ConversationID, conversation.VisibleFrom)
 	}
 
-	response := gapFrame{Type: "gaps", Gaps: make([]gapEntry, 0, len(gaps))}
-	for _, gap := range gaps {
+	response := gapFrame{Type: "gaps", Gaps: make([]gapEntry, 0, len(resumed.Gaps))}
+	for _, gap := range resumed.Gaps {
 		response.Gaps = append(response.Gaps, gapEntry{
 			ConversationID: string(gap.ConversationID),
 			From:           int64(gap.From),
@@ -471,6 +463,17 @@ func (h *Handler) handleTyping(
 	var frame typingFrame
 	if err := json.Unmarshal(raw, &frame); err != nil {
 		_ = connection.WriteFrame(ctx, errorFrame{"error", "malformed_frame", "typing frame was not valid JSON"})
+		return
+	}
+
+	// Only start claims are throttled. A stop must always get through: it is the frame that
+	// clears an indicator, and dropping it leaves somebody typing on every other screen until
+	// the claim expires on its own.
+	//
+	// Dropped before the service, which is where the membership read is. Nothing is recorded or
+	// broadcast for a dropped frame, so there is no claim here for the write rule to refuse —
+	// it still runs on every frame that produces one.
+	if frame.Typing && !connection.claimsTyping() {
 		return
 	}
 

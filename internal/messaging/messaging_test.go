@@ -31,6 +31,7 @@ import (
 	"comms/internal/messaging/internal/api"
 	"comms/internal/messaging/internal/app"
 	"comms/internal/messaging/internal/broadcast"
+	"comms/internal/messaging/internal/domain"
 	"comms/internal/messaging/internal/postgres"
 	"comms/internal/messaging/internal/presence"
 	"comms/internal/messaging/internal/push"
@@ -157,6 +158,7 @@ func newNodeWith(t *testing.T, tokens *fakeAuthenticator, redisClient *redis.Cli
 		postgres.NewInviteRepository(db),
 		postgres.NewReactionStore(db),
 		postgres.NewMemberStateStore(db),
+		postgres.NewSummaryStore(db),
 		// Real Redis, like the broadcaster below: presence is expiry-based, and a double
 		// would agree with whatever this code believes about when a claim lapses.
 		presence.NewStore(redisClient),
@@ -1153,6 +1155,68 @@ func TestPresenceFollowsWhoIsConnected(t *testing.T) {
 	}
 }
 
+// countingRedis counts round trips: one per command sent on its own, one per pipeline
+// executed however many commands it carries.
+type countingRedis struct {
+	singles   int
+	pipelines int
+}
+
+func (h *countingRedis) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h *countingRedis) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.singles++
+		return next(ctx, cmd)
+	}
+}
+
+func (h *countingRedis) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		h.pipelines++
+		return next(ctx, cmds)
+	}
+}
+
+// TestRenewingPresenceCostsRoundTripsPerNodeNotPerSocket is the shape of the heartbeat.
+//
+// A node renews every socket it holds, every ten seconds. One round trip per socket makes that
+// cost scale with how busy the node is: ten thousand sockets became ten thousand sequential
+// round trips, which on a real network does not fit in the window it has to finish inside. What
+// that looks like is not slowness — it is everybody blinking offline as their claims expire
+// behind the loop.
+//
+// Counted rather than timed, because a loopback Redis is fast enough to hide the difference and
+// a deployment is not.
+func TestRenewingPresenceCostsRoundTripsPerNodeNotPerSocket(t *testing.T) {
+	client := openRedis(t)
+	counting := &countingRedis{}
+	client.AddHook(counting)
+	store := presence.NewStore(client)
+
+	const sockets = 2000
+	claims := make([]domain.DeviceClaim, 0, sockets)
+	for range sockets {
+		claims = append(claims, domain.DeviceClaim{AccountID: newAccountID(), DeviceID: id.New()})
+	}
+
+	if err := store.RenewAll(t.Context(), claims, time.Now()); err != nil {
+		t.Fatalf("renew all: %v", err)
+	}
+
+	t.Logf("%d claims renewed in %d pipelines and %d single commands",
+		sockets, counting.pipelines, counting.singles)
+
+	if counting.singles != 0 {
+		t.Errorf("%d claims went one command at a time", counting.singles)
+	}
+	// Two chunks' worth, plus slack. The number that must not appear here is 2000.
+	if counting.pipelines > 4 {
+		t.Errorf("renewing %d claims took %d round trips; a heartbeat costs the node a handful, not one per socket",
+			sockets, counting.pipelines)
+	}
+}
+
 // TestTypingReachesTheOtherSideAndCanBeAskedFor is both halves of a typing indicator.
 //
 // The push is what makes it appear immediately for somebody already looking. The record is what
@@ -1206,6 +1270,58 @@ func TestTypingReachesTheOtherSideAndCanBeAskedFor(t *testing.T) {
 	if who := strings_(late.ask(conversation.ID), "typing"); contains(who, ana) {
 		t.Fatalf("ana is still recorded as typing after stopping: %v", who)
 	}
+}
+
+// TestTypingClaimsAreThrottledButStopsAreNot guards the asymmetry.
+//
+// A typing frame is cheap to send and expensive to serve — a membership read and two Redis
+// writes — so a client claiming per keystroke would turn every keystroke into a database query.
+// The browser client already paces itself; this is what makes it true of clients that do not.
+//
+// The stop is deliberately exempt. It is the frame that clears an indicator, and a throttle that
+// swallowed it would leave somebody typing on every other screen until the claim expired.
+func TestTypingClaimsAreThrottledButStopsAreNot(t *testing.T) {
+	tokens := newFakeAuthenticator()
+	node := newNode(t, tokens)
+
+	ana, bruno := newAccountID(), newAccountID()
+	anaToken, brunoToken := tokens.issue(ana), tokens.issue(bruno)
+	conversation := node.startDirect(anaToken, bruno)
+
+	watching := node.dial(t)
+	watching.authenticate(brunoToken)
+	watching.resume(nil)
+
+	typing := node.dial(t)
+	typing.authenticate(anaToken)
+	typing.resume(nil)
+
+	// Twenty claims as fast as the socket will take them, well inside one interval.
+	for range 20 {
+		typing.write(map[string]any{
+			"type": "typing", "conversation_id": conversation.ID, "typing": true,
+		})
+	}
+
+	if pushed := watching.readOfType("typing"); pushed["typing"] != true {
+		t.Fatal("first claim was not broadcast")
+	}
+
+	// A stop immediately after, still well inside the interval, must land anyway.
+	typing.write(map[string]any{
+		"type": "typing", "conversation_id": conversation.ID, "typing": false,
+	})
+
+	// One assertion for both halves. Unthrottled, nineteen more claims are queued ahead of
+	// the stop and the next frame says typing; throttled, they never reached the service and
+	// the stop is next.
+	stopped := watching.readOfType("typing")
+	if stopped["typing"] != false {
+		t.Fatal("the next frame after the stop still claims typing: extra claims were served, or the stop was throttled")
+	}
+
+	// Nothing queued behind it either. Terminal: a timed-out read closes the socket.
+	watching.expectNothing()
 }
 
 // TestSomebodyElsesConversationHasNoPresence: presence is information about people, and which
