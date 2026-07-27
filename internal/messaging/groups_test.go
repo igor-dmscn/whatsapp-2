@@ -516,9 +516,9 @@ func TestSendWriteCountDoesNotGrowWithMemberCount(t *testing.T) {
 			node.mustAddMember(anaToken, group.ID, newAccountID())
 		}
 
-		before := insertedRows(t, db)
+		before := rowsFor(t, db, group.ID)
 		node.send(anaToken, group.ID, "one message")
-		return insertedRows(t, db) - before
+		return rowsFor(t, db, group.ID) - before
 	}
 
 	small := measure(2)
@@ -553,15 +553,31 @@ func TestSendWriteCountDoesNotGrowWithMemberCount(t *testing.T) {
 // Counted directly rather than read from pg_stat: the statistics collector updates
 // asynchronously, so a test that reads it immediately after a write measures whenever
 // the collector last got round to it. Two exact counts are slower and correct.
-func insertedRows(t *testing.T, db *sql.DB) int64 {
+// rowsFor counts every row belonging to one conversation, across the tables a send touches.
+//
+// Scoped to the conversation, which it was not at first: counting the whole of each table made
+// this test read a number every other package's tests were also moving. Media writes outbox rows,
+// `go test ./...` runs packages in parallel against one Postgres, and the result was a test that
+// passed alone and failed roughly one full-suite run in three — blaming ADR-0002 for somebody
+// else's attachment.
+//
+// The outbox is keyed by conversation for entries, which is what makes this scoping possible at
+// all: it is the same key that gives per-conversation ordering.
+func rowsFor(t *testing.T, db *sql.DB, conversationID string) int64 {
 	t.Helper()
 
 	var entries, outbox, memberships, state int64
 	err := db.QueryRowContext(context.Background(),
-		`SELECT (SELECT count(*) FROM entries),
-		        (SELECT count(*) FROM outbox),
-		        (SELECT count(*) FROM memberships),
-		        (SELECT count(*) FROM conversation_member_state)`,
+		// The same value twice, as two parameters, because it is compared against a uuid
+		// column and a text one — the outbox key is text by design, since that table treats
+		// it as opaque. Postgres resolves one type per parameter, so a single $1 is inferred
+		// as uuid from the first comparison and then refuses `text = uuid`; a cast does not
+		// help, because the cast is what fixes the inference.
+		`SELECT (SELECT count(*) FROM entries WHERE conversation_id = $1),
+		        (SELECT count(*) FROM outbox WHERE key = $2),
+		        (SELECT count(*) FROM memberships WHERE conversation_id = $1),
+		        (SELECT count(*) FROM conversation_member_state WHERE conversation_id = $1)`,
+		conversationID, conversationID,
 	).Scan(&entries, &outbox, &memberships, &state)
 	if err != nil {
 		t.Fatalf("count rows: %v", err)

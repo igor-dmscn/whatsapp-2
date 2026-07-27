@@ -2,13 +2,14 @@ package harness
 
 import (
 	"fmt"
-	"math"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
+
+	"comms/internal/platform/measure"
 )
 
 // Arrivals is what one received track looks like from the outside.
@@ -174,34 +175,16 @@ type Report struct {
 // distribution. No interpolation, because interpolating between two measurements invents a
 // value that was never observed, and these are used to check a stated limit.
 func (r Report) LatencyAt(percentile float64) time.Duration {
-	return percentileOf(r.Latencies, percentile)
+	return measure.Percentile(r.Latencies, percentile)
 }
 
-// percentileOf takes the nearest-rank percentile of already-sorted samples.
-func percentileOf(sorted []time.Duration, percentile float64) time.Duration {
-	if len(sorted) == 0 {
-		return 0
-	}
-
-	rank := int(math.Ceil(percentile/100*float64(len(sorted)))) - 1
-	if rank < 0 {
-		rank = 0
-	}
-	if rank >= len(sorted) {
-		rank = len(sorted) - 1
-	}
-	return sorted[rank]
-}
-
-// Percentile returns the nearest-rank percentile of samples in any order.
+// Percentile is re-exported so a test measuring across peers has one name to call.
 //
-// Exported because the measurements NF-3 and NF-4 are both percentiles, and one of them —
-// join to first media — is a distribution across peers rather than within a track, so it is
-// collected by the caller and has nowhere else to be computed.
-func Percentile(samples []time.Duration, percentile float64) time.Duration {
-	sorted := append([]time.Duration(nil), samples...)
-	slices.Sort(sorted)
-	return percentileOf(sorted, percentile)
+// The arithmetic lives in internal/platform/measure, because four different things in this
+// project are now measured as percentiles and a percentile written twice is a percentile that
+// will be written differently the third time.
+func Percentile(samples []time.Duration, share float64) time.Duration {
+	return measure.Percentile(samples, share)
 }
 
 // Bitrate is what arrived, in bits per second, or zero if too little arrived to say.

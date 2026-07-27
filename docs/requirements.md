@@ -61,8 +61,8 @@ Terminology is defined in the [context map](../CONTEXT-MAP.md) and the per-conte
 
 | ID | Requirement |
 |----|-------------|
-| NF-1 | Send to receipt on a connected recipient's device: p95 under 300 ms, same region. |
-| NF-2 | Gap sync of 1 000 entries: p95 under 1 second. |
+| NF-1 | Send to receipt on a connected recipient's device: p95 under 300 ms, same region. Measured at **4 ms** p95 across two nodes on loopback — the code's share of the budget, not a deployment's. |
+| NF-2 | Gap sync of 1 000 entries: p95 under 1 second. Measured at **13 ms**, paged in five hundreds as a client pages. |
 | NF-3 | Call join to first media: p95 under 2 seconds. Measured at **109 ms** — and "first media" means the first keyframe, because packets arriving are not a picture. |
 | NF-4 | One-way audio latency through the SFU: p95 under 200 ms, same region. Measured at **431 µs** on loopback, which is the code's share of the budget and not a deployment's. |
 | NF-5 | Cold client start with a populated local store renders the conversation list in under 500 ms, without network. |

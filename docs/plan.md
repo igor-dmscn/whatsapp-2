@@ -359,7 +359,7 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
 
 ---
 
-## Phase 10 — Hardening
+## Phase 10 — Hardening — **complete**
 
 **Goal:** the things that make it survivable, none of which are features.
 
@@ -434,6 +434,21 @@ Of those: two browsers hold a call on one node and across two nodes, and a three
   The lesson is the same one phase 9 keeps teaching. The flake was in the test suite and looked like a test-suite problem; the cause was a production race that a load measurement found while asking about something else. What made it findable was making the server say what it was doing — the gathering timeout and the refusal both had to be logged before either meant anything.
 
 **Verify:** a load test at target concurrency meets NF-1 and NF-2. Kill Redis: sends still succeed, delivery falls back to gap sync on reconnect. Kill Kafka: sends still succeed, the outbox drains on recovery, nothing is lost (NF-6). A deliberately slow client is disconnected rather than being allowed to consume unbounded memory.
+
+**All four, and the two measurements are new:**
+
+| | Requirement | Measured |
+|---|---|---|
+| NF-1 | send to receipt on a connected device, p95 under 300 ms | **4 ms** p95 over 50 messages, across two nodes |
+| NF-2 | gap sync of 1 000 entries, p95 under 1 s | **13 ms**, paged as a client pages |
+
+NF-1 is timed across *two* nodes, which is the only honest way: ADR-0005 exists because the recipient's socket is almost never on the node that accepted the write, so a single-node measurement would leave out the Redis hop every real delivery makes. It is timed from before the HTTP request until the frame arrives on the other socket — a server-side measurement would omit the dispatch and the socket write, which are the parts a person experiences.
+
+NF-2 is one sample rather than a distribution, and the test says so rather than implying otherwise: a thousand entries take long enough to seed that fifty repetitions would be minutes of setup to sharpen a number already two orders of magnitude inside its limit.
+
+Loopback on one machine, so what these establish is that the *code* is not the reason a limit would be missed. A deployment puts a network between every arrow and has to be measured where it runs.
+
+Killing Redis, killing Kafka and dropping a slow client are covered above under backpressure — including the discovery that the slow-client test was passing for the wrong reason.
 
 ---
 
