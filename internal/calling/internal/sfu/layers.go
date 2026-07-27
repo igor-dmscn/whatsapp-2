@@ -53,12 +53,21 @@ type source struct {
 	codec     webrtc.RTPCodecCapability
 	publisher *participant
 
-	mutex sync.Mutex
+	// RWMutex rather than Mutex because of snapshot below: with simulcast there is a forward
+	// goroutine per layer, all reading this source, and an exclusive lock per packet would
+	// serialise three of them against each other for a read.
+	mutex sync.RWMutex
 	// layers by RID. A publisher sending one layer has a single entry under the empty
 	// string, which is what makes every non-simulcast client work unchanged.
 	layers map[string]*layer
 	// subscribers by receiving participant.
 	subscribers map[string]*subscription
+	// snapshot is subscribers as a slice, rebuilt whenever that map changes.
+	//
+	// The forward loop reads this once per packet — the hottest path in the process — and
+	// building the list there meant an allocation per packet per source. Copy-on-write and
+	// never mutated in place, so a reader may hold it after releasing the lock.
+	snapshot []*subscription
 }
 
 func newSource(key string, remote *webrtc.TrackRemote, publisher *participant) *source {
@@ -72,6 +81,35 @@ func newSource(key string, remote *webrtc.TrackRemote, publisher *participant) *
 		layers:      make(map[string]*layer),
 		subscribers: make(map[string]*subscription),
 	}
+}
+
+// subscribe adds a receiver, and unsubscribe removes one. Both rebuild the snapshot the
+// forward loop reads, which is the only reason they exist rather than the map being written
+// directly: a subscriber added to the map but not to the slice receives nothing, and one
+// removed from the map but not the slice is written to after it has gone.
+func (s *source) subscribe(participantID string, receiving *subscription) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	s.subscribers[participantID] = receiving
+	s.resnapshot()
+}
+
+func (s *source) unsubscribe(participantID string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	delete(s.subscribers, participantID)
+	s.resnapshot()
+}
+
+// resnapshot rebuilds the slice the forward loop reads. Callers hold the lock.
+func (s *source) resnapshot() {
+	held := make([]*subscription, 0, len(s.subscribers))
+	for _, receiving := range s.subscribers {
+		held = append(held, receiving)
+	}
+	s.snapshot = held
 }
 
 // layer is one quality of one source.

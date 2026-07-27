@@ -371,6 +371,61 @@ func TestLeavingReleasesTheTransportAndForgetsAnEmptyCall(t *testing.T) {
 	}
 }
 
+// TestLeavingStopsBeingForwardedTo is the half of leaving that closing a transport does not do.
+//
+// A departing receiver stays in every publisher's subscriber list unless it is taken out, and
+// nothing complains: the write to its closed track fails with ErrClosedPipe, which forward
+// ignores on purpose because a receiver going away is not a publisher's problem. So the cost is
+// silent and permanent — one wasted write per departed receiver per packet, for as long as the
+// call lasts, growing every time somebody drops and rejoins.
+//
+// Three publishers, because two cannot tell the difference: with one left there is nobody to
+// still be forwarding to.
+func TestLeavingStopsBeingForwardedTo(t *testing.T) {
+	t.Parallel()
+	room := newRoom(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	alice := room.join(t, ctx, "call-9", "alice", true)
+	bob := room.join(t, ctx, "call-9", "bob", true)
+	carol := room.join(t, ctx, "call-9", "carol", true)
+
+	for name, peer := range map[string]*harness.Peer{"alice": alice, "bob": bob, "carol": carol} {
+		if err := peer.WaitForMedia(ctx, "video", "audio"); err != nil {
+			t.Fatalf("%s received nothing: %v", name, err)
+		}
+	}
+
+	// Three publishers of video and audio, each source reaching the other two: 3 × 2 × 2.
+	// Waited for rather than asserted, because the last renegotiation may still be in flight
+	// and a low count here would make the comparison below meaningless.
+	const established = 12
+	deadline := time.Now().Add(5 * time.Second)
+	for room.server.Subscriptions("call-9") < established && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := room.server.Subscriptions("call-9"); got != established {
+		t.Fatalf("the call is forwarding to %d receivers before anybody left, want %d", got, established)
+	}
+
+	if err := carol.Close(ctx); err != nil {
+		t.Fatalf("carol leaving: %v", err)
+	}
+
+	// Alice and bob still publish two sources each, now reaching one receiver apiece. Carol's
+	// own sources go with her participant, so they count for nothing either way — leaving her
+	// subscriptions to alice and bob as the only difference this can measure.
+	if got := room.server.Subscriptions("call-9"); got != 4 {
+		t.Fatalf("the call is forwarding to %d receivers after one of three left, want 4: carol is still being written to on every packet",
+			got)
+	}
+	if got := room.server.Participants("call-9"); got != 2 {
+		t.Fatalf("the node holds %d participants after one left, want 2", got)
+	}
+}
+
 // TestCallsAreIsolated: two calls on one node must not hear each other. It is one map
 // lookup away from being wrong, and the failure is the worst kind a call system can have.
 func TestCallsAreIsolated(t *testing.T) {

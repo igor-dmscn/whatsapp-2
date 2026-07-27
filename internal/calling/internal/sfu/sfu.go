@@ -524,15 +524,14 @@ func (s *Server) forward(callID string, from *participant, remote *webrtc.TrackR
 }
 
 // subscriptions returns everyone receiving this source.
+//
+// The snapshot rather than a fresh slice, because this is called once per packet. Safe to hold
+// past the unlock: the slice is replaced on change, never written into.
 func (s *source) subscriptions() []*subscription {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 
-	held := make([]*subscription, 0, len(s.subscribers))
-	for _, receiving := range s.subscribers {
-		held = append(held, receiving)
-	}
-	return held
+	return s.snapshot
 }
 
 // deliver subscribes a participant to a source, once.
@@ -563,9 +562,7 @@ func (s *Server) deliver(to *participant, from *source) error {
 		return fmt.Errorf("add track: %w", err)
 	}
 
-	from.mutex.Lock()
-	from.subscribers[to.id] = receiving
-	from.mutex.Unlock()
+	from.subscribe(to.id, receiving)
 
 	// The sender has to be read for its RTCP to exist at all. Without this a receiver's
 	// keyframe request fills a queue nobody drains and the publisher never hears — which
@@ -911,8 +908,20 @@ func (s *Server) release(callID, participantID string) {
 	held.mutex.Lock()
 	leaving, present := held.participants[participantID]
 	delete(held.participants, participantID)
+	remaining := held.others(participantID)
 	empty := len(held.participants) == 0
 	held.mutex.Unlock()
+
+	// Taken off every source still being published, or the forward loops keep writing to a
+	// transport that has gone. Closing the connection is not enough on its own: the write fails
+	// with ErrClosedPipe, which forward deliberately ignores because a receiver going away is
+	// not a publisher's problem — so the cost would be silent and permanent, one wasted write
+	// per departed receiver per packet, growing for as long as the call lasts.
+	for _, other := range remaining {
+		for _, published := range other.sourceList() {
+			published.unsubscribe(participantID)
+		}
+	}
 
 	if present {
 		_ = leaving.connection.Close()
@@ -931,6 +940,37 @@ func (s *Server) release(callID, participantID string) {
 		}
 		s.mutex.Unlock()
 	}
+}
+
+// Subscriptions reports how many receivers a call is forwarding to, counted across every source
+// still being published.
+//
+// For health and for tests, like Participants, and it answers a different question: how much
+// work a packet costs. A receiver who left without being unsubscribed is invisible in the
+// participant count and still present in this one — which is exactly what a forward loop
+// writing to a departed transport looks like from outside.
+func (s *Server) Subscriptions(callID string) int {
+	s.mutex.RLock()
+	held, found := s.calls[callID]
+	s.mutex.RUnlock()
+	if !found {
+		return 0
+	}
+
+	held.mutex.RLock()
+	participants := make([]*participant, 0, len(held.participants))
+	for _, joined := range held.participants {
+		participants = append(participants, joined)
+	}
+	held.mutex.RUnlock()
+
+	var count int
+	for _, joined := range participants {
+		for _, published := range joined.sourceList() {
+			count += len(published.subscriptions())
+		}
+	}
+	return count
 }
 
 // Participants reports how many transports a call holds, for health and for tests.
