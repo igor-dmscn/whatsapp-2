@@ -31,6 +31,22 @@ thumbnails never update — which looks like data loss and is not.
 it signals to `make sfu` instead — the configuration in which two api nodes can share a
 call. `make check` runs lint and both test suites; `make build` puts binaries in `bin/`.
 
+### From another device on the same network
+
+```sh
+make all LAN=1        # then http://<your-lan-address>:5173 from the other device
+```
+
+`ip -4 -o addr show scope global` gives the address — the one on your wifi or ethernet
+interface, not the `172.x` Docker bridges. `api` already listens on every interface, so
+`LAN=1` adding `--host` to the dev server is the only change needed; nothing about
+`ALLOWED_ORIGINS`, because the dev server proxies `/v1` and keeps the browser's `Host`, so
+the socket's same-origin check sees one origin and passes.
+
+**Messaging works this way. Calls do not.** `getUserMedia` requires a secure context, and
+browsers grant that to `localhost` but not to `http://192.168.x.x`, so the camera is
+refused before any of this code runs. Calling another device needs the certificate below.
+
 ### Calling someone on another machine
 
 The steps above are localhost only, and calling somebody else needs three things that

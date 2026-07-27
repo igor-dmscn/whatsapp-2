@@ -86,8 +86,12 @@ worker: ## Run the outbox relay, projections and media processing
 sfu: ## Run call media forwarding as its own process (needs SFU_URL set for api)
 	go run ./cmd/sfu
 
-web: ## Run the browser client against a local api on :8080
-	cd web && npm install --silent && npm run dev
+# LAN=1 adds --host, which is what lets another device on the network open this. Opt-in
+# rather than the default because --host binds every interface, and a dev server with the
+# project's dependencies behind it is not something to expose without meaning to. `api`
+# already listens on all interfaces, so this flag is the only thing in the way.
+web: ## Run the browser client against a local api on :8080 (LAN=1 to expose it)
+	cd web && npm install --silent && npm run dev -- $(if $(LAN),--host,)
 
 web-check: ## Typecheck the browser client and run its unit tests
 	cd web && npm install --silent && npm run build && npm test
