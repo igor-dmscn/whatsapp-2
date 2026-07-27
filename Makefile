@@ -1,4 +1,4 @@
-.PHONY: help up down migrate build lint test check clean web web-check e2e load capacity
+.PHONY: help up down migrate build lint test check clean api worker sfu web web-check e2e load capacity
 
 # Loaded so make targets see the same values the binaries do.
 ifneq (,$(wildcard .env))
@@ -7,7 +7,7 @@ export
 endif
 
 help: ## Show available targets
-	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
+	@grep -hE '^[a-z0-9-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
 
 up: ## Start dependencies and wait until they are healthy
 	docker compose up -d --wait
@@ -34,6 +34,18 @@ lint: ## Vet, check architectural boundaries, and run golangci-lint if present
 
 test: ## Run all tests
 	go test ./...
+
+# These exist because nothing in the Go code reads .env — the include above is the only
+# thing that does. `go run ./cmd/api` in a bare shell fails on DATABASE_URL, so running
+# it through make is the difference between a working start and a confusing one.
+api: ## Run the HTTP and WebSocket node on :8080
+	go run ./cmd/api
+
+worker: ## Run the outbox relay, projections and media processing
+	go run ./cmd/worker
+
+sfu: ## Run call media forwarding as its own process (needs SFU_URL set for api)
+	go run ./cmd/sfu
 
 web: ## Run the browser client against a local api on :8080
 	cd web && npm install --silent && npm run dev

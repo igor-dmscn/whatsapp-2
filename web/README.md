@@ -2,14 +2,15 @@
 
 A Vite single-page app ([ADR-0012](../docs/adr/0012-vite-spa-for-the-browser-client.md)). It grows one phase at a time along with the backend, so at any commit it does exactly what the server can support and no more.
 
-**Phase 2, what exists now:** sign in, one direct conversation, send and receive. State is in memory — a reload refetches. The local store, the conversation list with unread badges, media and calls arrive in phases 6, 3, 7 and 9.
+**What exists now:** sign in, direct conversations, groups and channels, the conversation list with unread badges, replies, reactions, edits and deletes, photo and video sharing, presence and typing, local persistence with offline search, a service worker for an offline cold start, and video calls.
 
 ## Running it
 
 ```sh
 make up && make migrate    # from the repository root
-go run ./cmd/api           # in another terminal
-make web                   # in a third; serves http://localhost:5173
+make api                   # in another terminal
+make worker                # in a third — read models and thumbnails
+make web                   # in a fourth; serves http://localhost:5173
 ```
 
 The dev server proxies `/v1` to the api rather than pointing the client at port 8080 directly, so the browser talks to one origin in development exactly as it will in production. Nothing has to be configured to permit it, and no CORS policy exists to drift out of step.

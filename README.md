@@ -12,16 +12,54 @@ Requires Go 1.26 and Docker.
 cp .env.example .env
 make up        # Postgres, Redis, Kafka, MinIO — returns when all are healthy
 make migrate   # apply schema
-make check     # lint + tests, backend and frontend
-make build     # binaries into bin/
-
-go run ./cmd/api   # then, in another terminal:
-make web           # browser client on http://localhost:5173
 ```
 
-`go run ./cmd/api` forwards call media itself, which is all one machine needs. Set
-`SFU_URL` and it signals to `go run ./cmd/sfu` instead — the configuration in which
-two api nodes can share a call.
+Then three terminals, because each of these runs in the foreground:
+
+```sh
+make api       # HTTP and WebSocket on :8080
+make worker    # outbox relay, projections, thumbnails, notifications
+make web       # browser client on http://localhost:5173
+```
+
+Run them through `make`, not `go run`: the Makefile is the only thing that loads `.env`,
+and the binaries fail on a missing `DATABASE_URL` rather than guessing one.
+
+`make worker` is not optional. It publishes the outbox and builds the read models, so
+without it messages still send and arrive live but conversation lists, unread counts,
+receipts and thumbnails never update — which looks like data loss and is not.
+
+`make api` forwards call media itself, which is all one machine needs. Set `SFU_URL` and
+it signals to `make sfu` instead — the configuration in which two api nodes can share a
+call. `make check` runs lint and both test suites; `make build` puts binaries in `bin/`.
+
+### Calling someone on another machine
+
+The steps above are localhost only, and calling somebody else needs three things that
+localhost gives away for free. None of them are code; all three are worth knowing before
+spending an evening on it.
+
+**HTTPS, not optional.** `getUserMedia` and the service worker both require a secure
+context. Browsers exempt `localhost`, so a call works on your own machine and the same
+build over `http://192.168.1.20:5173` silently has no camera. Anybody else reaching this
+needs a real certificate.
+
+**A media address they can reach.** ICE candidates advertise the address the node sees on
+its own interface, which is private. Set `SFU_PUBLIC_IP` to what the outside world sees
+and forward the `SFU_UDP_PORT_MIN`–`MAX` range to it.
+
+**A path for UDP.** This is where an HTTP tunnel — ngrok, `cloudflared` — will
+disappoint: it carries the signalling perfectly, both people appear in the call, and no
+media ever arrives, because the tunnel only carries TCP. `iceServers` in
+`web/src/call.ts` is empty for the same reason it is honest to say so here: on one
+network nothing needs STUN, and across the internet a node behind a symmetric NAT needs
+TURN, which is a relay to deploy rather than a line to add.
+
+Two arrangements that do work: a VPS with a public IP, a TLS-terminating proxy serving
+`web/dist` and passing `/v1` to `api`, and the UDP range open; or a Tailscale tailnet,
+where `tailscale serve` provides the certificate and media flows directly between
+machines. Either way, set `ALLOWED_ORIGINS` — the WebSocket is same-origin by default,
+and once the client is not served by the dev server's proxy it is a different origin.
 
 `make help` lists every target. `make e2e` runs the browser suite against two api
 nodes and one media node — see [web/README.md](./web/README.md) for what that proves
