@@ -101,9 +101,13 @@ echo "starting the worker"
 pids+=($!)
 
 echo "starting two dev servers"
-(cd web && API_URL=http://localhost:8080 npx vite --port 5173 --strictPort >"$logs/web-5173.log" 2>&1) &
+# exec, and vite's own binary rather than npx, so the recorded pid is the server itself.
+# Both matter: without exec the pid is the subshell, and through npx it is a wrapper — and
+# cleanup killing either of those leaves the real node process holding the port. Two dev
+# servers were left on 5173 and 5174 for nine hours that way, which the next run cannot bind.
+(cd web && exec env API_URL=http://localhost:8080 ./node_modules/.bin/vite --port 5173 --strictPort >"$logs/web-5173.log" 2>&1) &
 pids+=($!)
-(cd web && API_URL=http://localhost:8081 npx vite --port 5174 --strictPort >"$logs/web-5174.log" 2>&1) &
+(cd web && exec env API_URL=http://localhost:8081 ./node_modules/.bin/vite --port 5174 --strictPort >"$logs/web-5174.log" 2>&1) &
 pids+=($!)
 
 waitFor http://localhost:5173/

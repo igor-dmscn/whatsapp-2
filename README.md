@@ -10,24 +10,22 @@ Requires Go 1.26 and Docker.
 
 ```sh
 cp .env.example .env
-make up        # Postgres, Redis, Kafka, MinIO — returns when all are healthy
-make migrate   # apply schema
+make all       # everything, in this terminal; Ctrl-C stops all of it
 ```
 
-Then three terminals, because each of these runs in the foreground:
+That starts Postgres, Redis, Kafka and MinIO, applies migrations, and then runs the api,
+the worker and the browser client together on <http://localhost:5173>. Their logs are
+interleaved, which is the cost of one terminal instead of four.
 
-```sh
-make api       # HTTP and WebSocket on :8080
-make worker    # outbox relay, projections, thumbnails, notifications
-make web       # browser client on http://localhost:5173
-```
+To watch one of them on its own, the same pieces are separate targets — `make up`,
+`make migrate`, then `make api`, `make worker` and `make web` in a terminal each.
 
-Run them through `make`, not `go run`: the Makefile is the only thing that loads `.env`,
-and the binaries fail on a missing `DATABASE_URL` rather than guessing one.
+Run these through `make` rather than `go run`: the Makefile is the only thing that loads
+`.env`, and the binaries fail on a missing `DATABASE_URL` rather than guessing one.
 
-`make worker` is not optional. It publishes the outbox and builds the read models, so
-without it messages still send and arrive live but conversation lists, unread counts,
-receipts and thumbnails never update — which looks like data loss and is not.
+The worker is not optional. It publishes the outbox and builds the read models, so without
+it messages still send and arrive live but conversation lists, unread counts, receipts and
+thumbnails never update — which looks like data loss and is not.
 
 `make api` forwards call media itself, which is all one machine needs. Set `SFU_URL` and
 it signals to `make sfu` instead — the configuration in which two api nodes can share a

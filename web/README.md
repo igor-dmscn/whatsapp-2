@@ -7,11 +7,10 @@ A Vite single-page app ([ADR-0012](../docs/adr/0012-vite-spa-for-the-browser-cli
 ## Running it
 
 ```sh
-make up && make migrate    # from the repository root
-make api                   # in another terminal
-make worker                # in a third — read models and thumbnails
-make web                   # in a fourth; serves http://localhost:5173
+make all    # from the repository root: dependencies, api, worker and this, together
 ```
+
+Or `make web` alone, against an api already running on :8080.
 
 The dev server proxies `/v1` to the api rather than pointing the client at port 8080 directly, so the browser talks to one origin in development exactly as it will in production. Nothing has to be configured to permit it, and no CORS policy exists to drift out of step.
 

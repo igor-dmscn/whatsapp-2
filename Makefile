@@ -1,4 +1,9 @@
-.PHONY: help up down migrate build lint test check clean api worker sfu web web-check e2e load capacity
+.PHONY: help all up down migrate build lint test check clean api worker sfu web web-check e2e load capacity
+
+# Nothing here gains from parallelism, and `all` depends on migrate running after up —
+# which under -j, or a -j someone has in MAKEFLAGS, would be goose against a Postgres that
+# is not listening yet.
+.NOTPARALLEL:
 
 # Loaded so make targets see the same values the binaries do.
 ifneq (,$(wildcard .env))
@@ -8,6 +13,40 @@ endif
 
 help: ## Show available targets
 	@grep -hE '^[a-z0-9-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  %-10s %s\n", $$1, $$2}'
+
+# Everything, in one terminal. Depends on up and migrate so a clean clone needs one
+# command, and both are cheap to repeat: compose returns immediately when the containers
+# are already healthy, and goose does nothing when the schema is current.
+#
+# `kill 0` signals the process group rather than the three recorded pids, because `go run`
+# compiles and then execs a separate child: killing the go process leaves that child
+# holding :8080, and the next `make all` fails on an address already in use. Which is a
+# confusing way to learn that the last one never really stopped.
+#
+# Forwarding stays inside api here — one machine does not need cmd/sfu, and a call is
+# joinable from the only node there is. `make sfu` and SFU_URL are for the split.
+# Ctrl-C has to take all three down, and every shorter way of writing this leaks something.
+# Three things the handler is doing, each for a reason found by leaving it out:
+#
+#   kill 0 — the whole process group, not the recorded pids. `go run` compiles and execs a
+#   separate child, and `npm run dev` reaches node through two more; signalling the job
+#   leader leaves the real server holding :8080 or :5173, so the next `make all` fails on an
+#   address in use. That is a confusing way to learn the last one never stopped.
+#
+#   Disarming first — kill 0 signals this shell too, which would re-enter the handler and
+#   kill the group again until the stack ran out. The first version dumped core on Ctrl-C.
+#
+#   No `set -m` — job control would put this shell in its own process group, and the
+#   terminal delivers Ctrl-C to the foreground group only. With it, SIGINT reached make,
+#   make died, and all three servers stayed up. Converting the signal here is also what
+#   gets them to exit at all: a non-interactive shell's background jobs inherit SIGINT
+#   ignored, so Ctrl-C alone never stops them, while the TERM this sends is handled.
+all: up migrate ## Start dependencies, then api, worker and the browser client together
+	@trap 'trap - EXIT INT TERM; kill 0' EXIT INT TERM; \
+	go run ./cmd/api & \
+	go run ./cmd/worker & \
+	$(MAKE) --no-print-directory web & \
+	wait
 
 up: ## Start dependencies and wait until they are healthy
 	docker compose up -d --wait
