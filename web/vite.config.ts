@@ -23,10 +23,18 @@ export default defineConfig({
     // leading dot covers the random subdomain ngrok assigns each run. Without this, every
     // request through a tunnel is a 403 reading "this host is not allowed".
     //
+    // More than one tunnel domain, because reachability is not up to us: ngrok's domains are
+    // widely filtered by carriers, ISPs and DNS blockers — it gets used for malware command
+    // and control, so it is blocked as a category. That presents as a blank tab loading
+    // forever, with no request ever arriving, and it is not something a setting here fixes.
+    // Cloudflare's is the usual way out, being harder to block as a category.
+    //
     // PUBLIC_HOST is for the others: a Tailscale name, or a domain of your own.
     allowedHosts: [
       '.ngrok-free.app',
       '.ngrok.app',
+      '.trycloudflare.com',
+      '.ts.net',
       ...(process.env.PUBLIC_HOST ? [process.env.PUBLIC_HOST] : []),
     ],
     proxy: {
