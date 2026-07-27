@@ -239,6 +239,115 @@ func TestAHandlerFailureLeavesRecordsToBeRedelivered(t *testing.T) {
 	<-recoverDone
 }
 
+// TestATransientFailureIsRetriedByTheSameConsumer is the half its sibling above does not cover.
+//
+// That test kills the failing consumer and starts a new one, which recovers because nothing was
+// committed. This one never restarts anything, and that is the case a database blinking out
+// actually produces: the handler fails once, the same process keeps polling, and the record has
+// to come back.
+//
+// Not committing is not enough to make that happen. The fetch position lives in the client's
+// memory and has already moved past the record, so without a rewind this consumer never sees it
+// again — and the next poll that succeeds commits over it. Three records behind one key, so the
+// two after the failure prove the order survived as well: a cursor advance applied before the
+// entry it refers to is a projection that disagrees with the log.
+func TestATransientFailureIsRetriedByTheSameConsumer(t *testing.T) {
+	addresses := brokers(t)
+	logger := slog.New(slog.DiscardHandler)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	topic := topicFor(t)
+	if err := kafka.EnsureTopics(ctx, addresses, 1, logger, topic); err != nil {
+		t.Fatalf("ensure topics: %v", err)
+	}
+
+	producer, err := kafka.NewProducer(ctx, addresses, logger)
+	if err != nil {
+		t.Fatalf("producer: %v", err)
+	}
+	defer producer.Close()
+
+	// One key, so all three share a partition and therefore an order.
+	key := fmt.Sprintf("conversation-%d", time.Now().UnixNano())
+	messages := make([]kafka.Message, 0, 3)
+	for _, name := range []string{"first", "second", "third"} {
+		messages = append(messages, kafka.Message{
+			Topic: topic,
+			Key:   key,
+			Name:  "messaging.cursor_advanced",
+			Value: []byte(fmt.Sprintf(`{"name":%q,"data":{"Through":1}}`, name)),
+		})
+	}
+	if err := producer.Publish(ctx, messages); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	consumer, err := kafka.NewConsumer(addresses,
+		fmt.Sprintf("test-%d", time.Now().UnixNano()), []string{topic}, logger)
+	if err != nil {
+		t.Fatalf("consumer: %v", err)
+	}
+
+	var (
+		mutex    sync.Mutex
+		applied  []string
+		attempts int
+	)
+	done := make(chan struct{})
+	runCtx, stop := context.WithCancel(ctx)
+	defer stop()
+
+	go func() {
+		defer close(done)
+		consumer.Run(runCtx, func(_ context.Context, record kafka.Record) error {
+			var envelope struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(record.Value, &envelope); err != nil {
+				return err
+			}
+
+			mutex.Lock()
+			defer mutex.Unlock()
+
+			// The first record fails once and succeeds on redelivery, which is a database
+			// that was down for a moment rather than a record that can never be applied.
+			if envelope.Name == "first" {
+				attempts++
+				if attempts == 1 {
+					return errors.New("deliberate transient failure")
+				}
+			}
+			applied = append(applied, envelope.Name)
+			if len(applied) == 3 {
+				stop()
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		mutex.Lock()
+		got := strings.Join(applied, ",")
+		mutex.Unlock()
+		t.Fatalf("timed out with only [%s] applied: after one failure this consumer stopped making progress, and the records behind it are lost", got)
+	}
+
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	if got := strings.Join(applied, ","); got != "first,second,third" {
+		t.Errorf("applied [%s], want first,second,third", got)
+	}
+	if attempts != 2 {
+		t.Errorf("the first record was attempted %d times, want 2: once failing and once on redelivery", attempts)
+	}
+}
+
 // TestASkippedRecordIsKeptRatherThanOnlyLogged is the dead-letter topic.
 //
 // A consumer that cannot apply a record must skip it — retrying forever blocks every record

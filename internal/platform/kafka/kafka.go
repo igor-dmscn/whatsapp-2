@@ -225,8 +225,8 @@ func EnsureTopics(ctx context.Context, brokers []string, partitions int32, logge
 	return nil
 }
 
-// Handler processes one record. Returning an error stops the batch: the offset is
-// not committed, so the record is redelivered.
+// Handler processes one record. Returning an error stops that partition: the offset is not
+// committed and the position is rewound, so the record is delivered again.
 type Handler func(ctx context.Context, record Record) error
 
 // Record is a consumed event.
@@ -278,18 +278,44 @@ func NewConsumer(brokers []string, group string, topics []string, logger *slog.L
 	return &Consumer{client: client, logger: logger, group: group}, nil
 }
 
+// retryDelay bounds how fast a failing partition is retried.
+//
+// Doubling from the first to the last, reset by any poll that fully succeeds. A handler failing
+// because Postgres is unreachable would otherwise re-read and re-fail as fast as the broker can
+// serve it, which turns one outage into two.
+const (
+	retryDelayFirst = 100 * time.Millisecond
+	retryDelayMax   = 5 * time.Second
+)
+
 // Run polls and handles records until ctx is cancelled.
 //
-// A handler error stops that batch without committing, so everything from the
-// failing record on is redelivered. That is at-least-once, deliberately: a
-// projection that skipped a record it could not process would be silently wrong
-// forever, which is worse than processing one twice.
+// A handler error rewinds that partition to the failing record, so it and everything behind it
+// are delivered again. That is at-least-once, deliberately: a projection that skipped a record it
+// could not process would be silently wrong forever, which is worse than processing one twice. A
+// record that can never succeed is the handler's own to skip — each consumer decides that for
+// itself and dead-letters it (see the projector's errUnprocessable), because what is
+// unprocessable is a question about the event, not about Kafka.
+//
+// The rewind is the whole mechanism, and leaving it out is a silent bug rather than a slow one.
+// Not committing is not enough: the fetch position lives in this client's memory and has already
+// moved past the record, so a failure without a rewind means this consumer never sees that record
+// again — and the next poll that succeeds commits over it. That reads in the logs as one handled
+// failure and is in fact a lost event.
 func (c *Consumer) Run(ctx context.Context, handle Handler) {
 	defer c.client.Close()
 
+	var delay time.Duration
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+			}
 		}
 
 		fetches := c.client.PollFetches(ctx)
@@ -306,53 +332,87 @@ func (c *Consumer) Run(ctx context.Context, handle Handler) {
 			continue
 		}
 
-		failed := false
-		fetches.EachRecord(func(record *kgo.Record) {
-			// Everything after a failure in this poll is left uncommitted too:
-			// committing later records would acknowledge past the one that failed
-			// and lose it.
-			if failed {
-				return
-			}
-			held := toRecord(record)
-			// The identifier is put back on the context before the handler runs, so that
-			// everything a projection logs lands under the same identifier as the HTTP
-			// request that caused the event — which is the whole of NF-16 and the half
-			// that was missing. Restored here rather than in each consumer, because a
-			// consumer that forgot would be silently uncorrelated.
-			handlerCtx := ctx
-			if held.CorrelationID != "" {
-				handlerCtx = logging.Correlate(ctx, held.CorrelationID)
-			}
+		var handled []*kgo.Record
+		rewind := make(map[string]map[int32]kgo.EpochOffset)
 
-			// The trace continued rather than begun, which is what makes one send a
-			// single trace across api and worker instead of two unrelated ones.
-			handlerCtx = tracing.Extract(handlerCtx, held.carried)
-			handlerCtx, span := tracing.Start(handlerCtx, "kafka.consume "+held.Topic,
-				attribute.String("messaging.destination.name", held.Topic),
-				attribute.String("messaging.message.name", held.Name))
+		// Per partition rather than per record, because a partition is the unit that has an
+		// order worth keeping. One partition failing says nothing about the others, and
+		// stopping all of them would let one slow projection hold up every other.
+		fetches.EachPartition(func(partition kgo.FetchTopicPartition) {
+			for _, record := range partition.Records {
+				held := toRecord(record)
+				// The identifier is put back on the context before the handler runs, so that
+				// everything a projection logs lands under the same identifier as the HTTP
+				// request that caused the event — which is the whole of NF-16 and the half
+				// that was missing. Restored here rather than in each consumer, because a
+				// consumer that forgot would be silently uncorrelated.
+				handlerCtx := ctx
+				if held.CorrelationID != "" {
+					handlerCtx = logging.Correlate(ctx, held.CorrelationID)
+				}
 
-			err := handle(handlerCtx, held)
-			span.End()
+				// The trace continued rather than begun, which is what makes one send a
+				// single trace across api and worker instead of two unrelated ones.
+				handlerCtx = tracing.Extract(handlerCtx, held.carried)
+				handlerCtx, span := tracing.Start(handlerCtx, "kafka.consume "+held.Topic,
+					attribute.String("messaging.destination.name", held.Topic),
+					attribute.String("messaging.message.name", held.Name))
 
-			if err != nil {
-				logging.With(handlerCtx, c.logger).Error("handle record",
-					slog.String("topic", record.Topic),
-					slog.Int64("offset", record.Offset),
-					slog.Any("error", err),
-				)
-				failed = true
+				err := handle(handlerCtx, held)
+				span.End()
+
+				if err != nil {
+					logging.With(handlerCtx, c.logger).Error("handle record",
+						slog.String("topic", record.Topic),
+						slog.Int("partition", int(record.Partition)),
+						slog.Int64("offset", record.Offset),
+						slog.Any("error", err),
+					)
+					// Back to this record, not past it. Everything after it in this
+					// partition is left unread rather than attempted: they are behind it
+					// in an order that exists to be honoured, and a cursor advance
+					// applied before the entry it refers to is a projection disagreeing
+					// with the log.
+					if rewind[record.Topic] == nil {
+						rewind[record.Topic] = make(map[int32]kgo.EpochOffset)
+					}
+					rewind[record.Topic][record.Partition] = kgo.EpochOffset{
+						Epoch:  record.LeaderEpoch,
+						Offset: record.Offset,
+					}
+					return
+				}
+				handled = append(handled, record)
 			}
 		})
 
-		if failed {
+		// Only what was handled, and by record rather than by "everything fetched". The
+		// distinction is the bug this replaces: committing what was fetched acknowledges
+		// records nothing has looked at.
+		if len(handled) > 0 {
+			if err := c.client.CommitRecords(ctx, handled...); err != nil {
+				// Not fatal: the records will be redelivered and reapplied, which is
+				// what the handlers are built to tolerate.
+				c.logger.Warn("commit offsets", slog.Any("error", err))
+			}
+		}
+
+		if len(rewind) == 0 {
+			delay = 0
 			continue
 		}
-		if err := c.client.CommitUncommittedOffsets(ctx); err != nil {
-			// Not fatal: the records will be redelivered and reapplied, which is
-			// what the handlers are built to tolerate.
-			c.logger.Warn("commit offsets", slog.Any("error", err))
-		}
+
+		// After the commit and outside the poll, which is where franz-go asks for this. A
+		// rebalance in between drops the partitions this no longer owns, and their new owner
+		// starts from the offset just committed — which excludes the failing record, so it is
+		// delivered there instead. The outcome is the same either way.
+		//
+		// ponytail: a rebalance mid-batch is handled by being harmless rather than by being
+		// prevented. BlockRebalanceOnPoll, if this ever needs to be exact rather than
+		// eventually right.
+		c.client.SetOffsets(rewind)
+
+		delay = min(max(2*delay, retryDelayFirst), retryDelayMax)
 	}
 }
 
